@@ -458,46 +458,63 @@ def is_interrupt(error: BaseException | None) -> bool:
     """Whether ``error`` interrupts the program rather than fails work: a ``KeyboardInterrupt`` or ``SystemExit``.
 
     These are what the event loop raises out of ``asyncio.run`` from a callback; it logs and drops any other
-    exception there. Only an ``Exception`` is a failure; any other ``BaseException`` but a cancellation is neither a
-    failure nor an interrupt: it propagates as it is, its reader's to receive.
+    exception there.
     """
     return isinstance(error, KeyboardInterrupt | SystemExit)
 
 
+def is_escape(error: BaseException | None) -> bool:
+    """Whether ``error`` is no failure and no cancellation: the operation's latch's (``OperationLatch``).
+
+    Only an ``Exception`` is a failure. An interrupt (``is_interrupt``) is an escape, and so is any other
+    ``BaseException`` but a cancellation and a ``GeneratorExit`` (a coroutine being closed): it propagates as it is,
+    never caught as a failure, wrapped, ranked or made an outcome.
+    """
+    return error is not None and not isinstance(error, Exception | asyncio.CancelledError | GeneratorExit)
+
+
 class LatchState(Enum):
-    """Where an operation's ``InterruptLatch`` stands: running, ending, or ended."""
+    """Where an operation's ``OperationLatch`` stands: running, ending, or ended."""
 
     # The operation runs: the first interrupt latched wakes its owner, which ends the operation at once.
     ARMED = "armed"
     # The operation is cleaning up: an interrupt latched now is raised at its end, waking nothing (its cleanup runs
     # then, an inline kernel's in the very read a wake would cancel).
     ENDING = "ending"
-    # The interrupt is out: raised at the operation's end, or handed to the event loop as it was latched between
-    # reads. Any other one goes to the event loop.
+    # The end is out: what it raised is raised, and anything latched from now on goes to the event loop.
     CLOSED = "closed"
 
 
-class InterruptLatch:
-    """The first interrupt (``is_interrupt``) an operation saw, wherever its own code caught it.
+class OperationLatch:
+    """Every escape (``is_escape``) an operation's own code caught, wherever it caught it, until its end raises it.
 
-    Library code that first catches a ``BaseException`` in an operation's work latches it (``latch_interrupt``) and
-    goes on as with any failure: turns it into a binding's end, a page's failure or a task's ``Settled`` result. The
-    operation's end takes the latched interrupt (``close``), ahead of anything else, once its report is published; one
-    latched while no read is in flight is taken at once and handed to the event loop. So no route an interrupt takes
-    (an event, a future, a task's result) can drop it. Once its interrupt is out, nobody would raise another: the
-    latch hands one caught then to the event loop (``hand_on``), which raises it out of ``asyncio.run`` as it does
-    any task's, once, while its catchers go on as with any failure.
+    Library code that catches an escape in an operation's work either raises it at once or hands it to the latch
+    (``latch_escape``); there is no third way. Having handed it on, it goes on as with any end: turns it into a
+    binding's end, a page's failure or a task's ``Settled`` result, or leaves it on a future a close cancelled.
+    ``settle`` hands on whatever a library task ends in, so every task the library starts around caller code is
+    such a site.
+
+    The first interrupt ends the operation: latched while it runs, it wakes its owner. Any other escape stays
+    undelivered until a read or close raises it. The operation's end (``close``) raises the interrupt, ahead of
+    anything else, or else the first undelivered escape, once, as from a ``finally``. The escapes it does not raise,
+    and any caught once it is out, go to the event loop (``hand_on``), once each: an interrupt is raised out of
+    ``asyncio.run`` as any task's is, and any other escape goes to the loop's exception handler, with the operation's
+    report. So no route an escape takes (an event, a future, a task's result, a cancelled pull) loses it silently.
     """
 
-    __slots__ = ("_handed", "_wake", "first", "state")
+    __slots__ = ("_out", "_undelivered", "_wake", "first", "report", "state")
 
     def __init__(self, wake: Callable[[], None] | None = None) -> None:
-        """Hold no interrupt yet; ``wake`` ends the operation at once when one is latched while it runs."""
+        """Hold no escape yet; ``wake`` ends the operation at once when an interrupt is latched while it runs."""
         self.first: BaseException | None = None
         self.state = LatchState.ARMED
+        # The operation's published report, for an escape handed to the event loop after it.
+        self.report: object | None = None
         self._wake = wake
-        # The interrupts handed to the event loop, each once however many catch it.
-        self._handed: list[BaseException] = []
+        # The escapes caught and not raised yet, in the order they were caught.
+        self._undelivered: list[BaseException] = []
+        # The escapes that are out: raised by the operation's end, or handed to the event loop.
+        self._out: list[BaseException] = []
 
     def end(self) -> None:
         """The operation is ending: an interrupt latched from now on is raised at its end, waking nothing."""
@@ -505,35 +522,64 @@ class InterruptLatch:
             self.state = LatchState.ENDING
 
     def close(self) -> BaseException | None:
-        """The interrupt is out now: return it, if any, for the caller to raise or hand on; none is latched from now on.
+        """The operation's end: return what it raises, and hand every other undelivered escape to the event loop.
 
-        The latch outlives the operation in the context of any task its work started, so it lets go of its owner.
+        That is the interrupt, which every end raises (a read a concurrent close ended raises it too), or else the
+        first undelivered escape, which only the first end raises. Nothing is latched from now on: the latch
+        outlives the operation in the context of any task its work started, so it lets go of its owner.
         """
         self.state = LatchState.CLOSED
         self._wake = None
-        return self.first
+        undelivered, self._undelivered = self._undelivered, []
+        raised = self.first
+        if raised is None and undelivered:
+            raised = undelivered.pop(0)
+            self._out.append(raised)
+        for error in undelivered:
+            self.hand_on(error)
+        return raised
+
+    def pending(self) -> BaseException | None:
+        """Return the first undelivered escape, still undelivered: what the operation's end will raise."""
+        return self._undelivered[0] if self._undelivered else None
 
     def record(self, error: BaseException | None) -> None:
-        """Latch ``error`` when it is the operation's first interrupt; anything else is not this latch's.
+        """Latch ``error`` when it is an escape this latch does not hold yet; anything else is not this latch's.
 
-        After the operation ended, an interrupt other than its own goes to the event loop instead.
+        Once the operation's end is out, an escape goes to the event loop instead.
         """
-        if error is None or not is_interrupt(error):
+        if error is None or not is_escape(error) or self._holds(error):
             return
         if self.state is LatchState.CLOSED:
-            if error is not self.first:
-                self.hand_on(error)
-            return
-        if self.first is None:
+            self.hand_on(error)
+        elif not is_interrupt(error):
+            self._undelivered.append(error)
+        elif self.first is None:
             self.first = error
             if self.state is LatchState.ARMED and self._wake is not None:
                 self._wake()
 
     def hand_on(self, error: BaseException) -> None:
-        """Hand ``error`` to the event loop, which raises it out of ``asyncio.run``: no reader of the operation will."""
-        if error not in self._handed:
-            self._handed.append(error)
-            asyncio.get_running_loop().call_soon(_raise, error)
+        """Hand ``error`` to the event loop, once: no read or close of the operation will raise it."""
+        if any(out is error for out in self._out):
+            return
+        self._out.append(error)
+        loop = asyncio.get_running_loop()
+        if is_interrupt(error):
+            # The loop raises it out of ``asyncio.run`` from a callback.
+            loop.call_soon(_raise, error)
+            return
+        context: dict[str, object] = {
+            "message": "b24api: an operation could no longer deliver this exception to a read or a close",
+            "exception": error,
+        }
+        if self.report is not None:
+            context["report"] = self.report
+        loop.call_exception_handler(context)
+
+    def _holds(self, error: BaseException) -> bool:
+        """Whether ``error`` is this latch's already: latched, undelivered or out."""
+        return error is self.first or any(held is error for held in (*self._undelivered, *self._out))
 
 
 def _raise(error: BaseException) -> None:
@@ -543,12 +589,12 @@ def _raise(error: BaseException) -> None:
 
 # The latch of the operation whose work runs the current code: its runner sets it in its read and cleanup tasks, and
 # every task they start inherits it.
-INTERRUPTS: ContextVar[InterruptLatch | None] = ContextVar("b24api_interrupts", default=None)
+OPERATION_LATCH: ContextVar[OperationLatch | None] = ContextVar("b24api_operation_latch", default=None)
 
 
-def latch_interrupt(error: BaseException) -> None:
-    """Latch ``error`` on the current operation's ``InterruptLatch`` when it is an interrupt."""
-    if (latch := INTERRUPTS.get()) is not None:
+def latch_escape(error: BaseException) -> None:
+    """Hand ``error`` to the current operation's ``OperationLatch`` when it is an escape (``is_escape``)."""
+    if (latch := OPERATION_LATCH.get()) is not None:
         latch.record(error)
 
 
@@ -559,9 +605,9 @@ class Settled[T]:
     instead of ending in the failure. ``asyncio.run`` reports every task that its shutdown cancelled and that then
     ended in an exception, whether or not its owner retrieves it later, so only a task that never ends in one keeps
     the failure its owner's alone. That includes ``KeyboardInterrupt`` and ``SystemExit``: a task ending in one
-    stops the event loop from inside that task, leaving the owner waiting. An interrupt is latched on the operation
-    besides (``InterruptLatch``), which raises it as its end whatever the owner does with the result, or hands it to
-    the event loop once the operation has ended.
+    stops the event loop from inside that task, leaving the owner waiting. An escape (``is_escape``) is latched on the
+    operation besides (``OperationLatch``), which raises it as its end whatever the owner does with the result, or
+    hands it to the event loop once the operation has ended.
     """
 
     __slots__ = ("error", "value")
@@ -589,7 +635,7 @@ async def settle[T](work: Awaitable[T]) -> Settled[T]:
     except (asyncio.CancelledError, GeneratorExit):
         raise
     except BaseException as error:  # noqa: BLE001 - returned for the task's owner to raise: the task ends without it
-        latch_interrupt(error)
+        latch_escape(error)
         settled: Settled[T] = Settled(error=error)
     # The work's cleanup may have re-armed a cancellation it absorbed on this task, which would end it cancelled and
     # lose the failure. Whoever cancelled it learns how it ended from its owner, so the task takes the cancellation.

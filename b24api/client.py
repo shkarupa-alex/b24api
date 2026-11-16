@@ -186,8 +186,8 @@ class Bitrix24(_TraversalFacade):
     ) -> None:
         """Close owned work; a failed or cancelled close never replaces a primary body exception.
 
-        Anything else the close raises, an interrupt (a stream's, ``InterruptLatch``) or a ``BaseException`` that is
-        no failure, replaces it as from a ``finally``, with the body's exception as its context.
+        Anything else the close raises, an escape (``is_escape``: an interrupt, or any other ``BaseException`` that is
+        no failure), replaces it as from a ``finally``, with the body's exception as its context.
         """
         try:
             await self.aclose()

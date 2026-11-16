@@ -105,8 +105,8 @@ def _in_context[R](step: Awaitable[R], context: contextvars.Context) -> Generato
 async def _finish_in_thread[R](call: Callable[[], R]) -> R:
     """Run ``call`` in a worker thread that a cancellation waits for instead of abandoning.
 
-    The cancelled call's failure is dropped. An interrupt (``is_interrupt``) it ends in is not: its task returns it
-    (``settle``) in the operation's context, so the operation's latch has it (``InterruptLatch``).
+    The cancelled call's failure is dropped. An escape (``is_escape``) it ends in is not: its task returns it
+    (``settle``) in the operation's context, so the operation's latch has it (``OperationLatch``).
     """
     work = spawn_settled(asyncio.to_thread(call))
     try:

@@ -21,7 +21,7 @@ from b24api.execution import (
     Executor,
     WorkClass,
 )
-from b24api.execution.context import latch_interrupt
+from b24api.execution.context import latch_escape
 from b24api.execution.facts import settlement
 from b24api.references.outcome import (
     KernelReferenceFailure,
@@ -1298,12 +1298,12 @@ class _BatchPageDispatcher:
             for item in chunk:
                 item.future.cancel()
             raise
-        except BaseException as error:  # noqa: BLE001 - total chunk correlation boundary, an interrupt's too
+        except BaseException as error:  # noqa: BLE001 - total chunk correlation boundary, an escape's too
             # Every page fails with the chunk's error and keeps what its own command did, which the chunk's
             # progress says at the page's position, whatever failed: a sent page no longer has a deadline to end
-            # its wait. An interrupt (``is_interrupt``) reaches every page's fetch as itself: the sender never ends
-            # in it, and it is no page's outcome: the operation's latch has it.
-            latch_interrupt(error)
+            # its wait. An escape (``is_escape``) is no page's outcome: it is the operation's latch's, and reaches
+            # every page's fetch as itself, though the pages a close cancelled no longer deliver it.
+            latch_escape(error)
             for position, item in enumerate(chunk):
                 if not item.future.done():
                     item.future.set_exception(

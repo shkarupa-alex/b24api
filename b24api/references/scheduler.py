@@ -16,7 +16,7 @@ from b24api.contracts.request import ReplaySafety, Request, ResultSelector, Trav
 from b24api.contracts.response import result_snapshot
 from b24api.contracts.violation import retain_violations
 from b24api.errors import BudgetExceededError, CapabilityError, CleanupOverrunError
-from b24api.execution.context import is_interrupt, spawn_settled
+from b24api.execution.context import is_escape, is_interrupt, latch_escape, spawn_settled
 from b24api.execution.facts import dropped_result
 from b24api.references.counted_io import SharedCountedWaveIO
 from b24api.references.dispatch import (
@@ -247,8 +247,7 @@ class ReferenceScheduler:
         try:
             await iterator.aclose(self.context)
         except BaseException as error:  # noqa: BLE001 - every owned resource is closed before the first failure
-            if error is not primary_error:
-                cleanup_errors.append(error)
+            _keep_cleanup_failure(cleanup_errors, error, primary_error)
         if cleanup_errors:
             raise cleanup_errors[0]
 
@@ -267,19 +266,17 @@ class ReferenceScheduler:
         try:
             await self.buffer.close()
         except BaseException as error:  # noqa: BLE001 - cleanup continues across owned resources
-            if error is not primary_error:
-                cleanup_errors.append(error)
+            _keep_cleanup_failure(cleanup_errors, error, primary_error)
         try:
             await self.dispatcher.aclose()
         except BaseException as error:  # noqa: BLE001 - cleanup continues across owned resources
-            if error is not primary_error:
-                cleanup_errors.append(error)
+            _keep_cleanup_failure(cleanup_errors, error, primary_error)
         pending, task_errors = await _wait_for_cleanup_tasks(
             (producer, *admission.tasks.values()),
             remaining=self.context.cleanup_window(),
         )
-        # An interrupt a task ended in is the latch's (``settle``), not a failure of the cleanup.
-        cleanup_errors.extend(error for error in task_errors if error is not primary_error and not is_interrupt(error))
+        for task_error in task_errors:
+            _keep_cleanup_failure(cleanup_errors, task_error, primary_error)
         if pending:
             cleanup_errors.append(CleanupOverrunError("reference task cleanup exceeded operation time budget"))
 
@@ -422,12 +419,10 @@ class ReferenceScheduler:
         """End a binding by what its run raised: its terminal event, unless that is no way a binding ends.
 
         A failure (an ``Exception``) is its failure event. A cancellation (how the operation stops its bindings,
-        ``_stop_work``), the close of a coroutine a dropped loop left, and an interrupt (the operation's latch takes
-        it, ``settle``) go on as they are. Anything else is no failure and no outcome, so it is never lost either:
-        the binding's task ends in it, and whoever finishes that task raises it, once: a read where the binding's
-        end comes in order (``_EndedEvent``), or the close that collects the tasks nobody read. The event's queue
-        has room: under INPUT it is unbounded; under READY the binding waits for the consumer to take each page
-        before its next step.
+        ``_stop_work``) and the close of a coroutine a dropped loop left go on as they are. An escape (``is_escape``)
+        is no failure and no outcome: the operation's latch has it, and the binding's task ends in it. An interrupt
+        ends the operation; any other escape is raised by a read that finishes the task where the binding's end
+        comes (``_EndedEvent``, ``_finish_task``), or else by the operation's end.
         """
         if isinstance(error, Exception):
             # The binding fails with what its failed page reports, and its command's replay disposition, if any: a
@@ -438,8 +433,10 @@ class ReferenceScheduler:
                 event = replace(event, replay_disposition=failed.failure.replay_disposition)
             await self.publish_terminal(run, event)
             return
-        if not isinstance(error, asyncio.CancelledError | GeneratorExit) and not is_interrupt(error):
-            run.output.put_nowait(_EndedEvent(run.work))
+        if is_escape(error):
+            latch_escape(error)
+            if not is_interrupt(error):
+                await self.publish_terminal(run, _EndedEvent(run.work))
         raise error
 
     def _driven_pages(self, run: _ReferenceRun) -> AsyncGenerator[_Page]:
@@ -494,7 +491,7 @@ class ReferenceScheduler:
             ),
         )
 
-    async def publish_terminal(self, run: _ReferenceRun, event: _DoneEvent | _FailureEvent) -> None:
+    async def publish_terminal(self, run: _ReferenceRun, event: _DoneEvent | _FailureEvent | _EndedEvent) -> None:
         """Publish the binding's terminal event once it has cleaned up; it adds no command any more.
 
         It stops counting as a producer first, so no wave waits for it while the event waits for room,
@@ -975,6 +972,16 @@ class ReferenceScheduler:
         """Record one delivered reference item."""
         stored = self._delivery_uniqueness.pop(id(item), None)
         return stored is not None and stored[0] is item and stored[1]
+
+
+def _keep_cleanup_failure(
+    cleanup_errors: list[BaseException], error: BaseException, primary_error: BaseException | None
+) -> None:
+    """Keep a failure of the cleanup, unless it is what ended the stream; an escape is the operation's latch's."""
+    if is_escape(error):
+        latch_escape(error)
+    elif error is not primary_error:
+        cleanup_errors.append(error)
 
 
 async def _close_pages(pages: AsyncGenerator[_Page], primary_error: BaseException | None) -> BaseException | None:
