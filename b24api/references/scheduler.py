@@ -422,10 +422,10 @@ class ReferenceScheduler:
         """End a binding by what its run raised: its terminal event, unless that is no way a binding ends.
 
         A failure (an ``Exception``) is its failure event. A cancellation (how the operation stops its bindings,
-        ``_stop_work``) and an interrupt (the operation's latch takes it, ``settle``) go on as they are. Anything
-        else is no failure, so no outcome, yet ends the binding as a failure would: the reader raises it as it is
-        where the binding's outcome would be, and a close that comes first drops it with the rest of what nobody
-        read.
+        ``_stop_work``), the close of a coroutine a dropped loop left, and an interrupt (the operation's latch takes
+        it, ``settle``) go on as they are. Anything else is no failure and no outcome; it is only delivered: its
+        event takes the binding's place, so the reader raises it as it is there and waits for no end that never
+        comes.
         """
         if isinstance(error, Exception):
             # The binding fails with what its failed page reports, and its command's replay disposition, if any: a
@@ -435,7 +435,7 @@ class ReferenceScheduler:
             if failed.failure is not None:
                 event = replace(event, replay_disposition=failed.failure.replay_disposition)
             await self.publish_terminal(run, event)
-        elif isinstance(error, asyncio.CancelledError) or is_interrupt(error):
+        elif isinstance(error, asyncio.CancelledError | GeneratorExit) or is_interrupt(error):
             raise error
         else:
             await self.publish_terminal(run, _EndedEvent(run.work, error))

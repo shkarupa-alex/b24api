@@ -677,6 +677,10 @@ class OperationRunner[T, R: _Report]:
         )
         # The operation's end: its interrupt is raised now, ahead of anything else.
         self._raise_latched()
+        if attempt.error is not None and not isinstance(attempt.error, Exception):
+            # No failure, so nothing ranks it: as from a ``finally``, it replaces what ended the stream, a
+            # cancellation included, which is not replayed.
+            raise attempt.error
         if cause is TerminalCause.FAILED and primary is not None:
             self._raise_failed(primary, report, attempt, finalize_failed=finalize_failed)
         if finalize_failed and self._finalize_error is not None and primary is None:

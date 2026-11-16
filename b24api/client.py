@@ -3,6 +3,7 @@
 # ruff: noqa: SLF001 - class-owned alternate construction
 
 from __future__ import annotations
+import asyncio
 import warnings
 import weakref
 from typing import TYPE_CHECKING, Self, cast
@@ -33,7 +34,7 @@ from b24api.execution import (
     rearm_cancellation,
 )
 from b24api.execution.cleanup import OwnedStream, close_owned_resources
-from b24api.execution.context import Settled, is_interrupt, spawn_settled
+from b24api.execution.context import Settled, spawn_settled
 from b24api.redaction import Redactor, secret_values
 from b24api.references.facade import reference_stream
 from b24api.references.fanout import CommandSource as FanOutCommandSource
@@ -45,7 +46,6 @@ from b24api.transport.protocol import ProtocolCodec
 from b24api.traversal.keyset_verifier import verify_keyset_capability as _verify_keyset_capability
 
 if TYPE_CHECKING:
-    import asyncio
     from collections.abc import AsyncIterable, Iterable
     from types import TracebackType
 
@@ -184,12 +184,15 @@ class Bitrix24(_TraversalFacade):
         primary: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Close owned work without replacing a primary body exception."""
+        """Close owned work; a failed or cancelled close never replaces a primary body exception.
+
+        Anything else the close raises, an interrupt (a stream's, ``InterruptLatch``) or a ``BaseException`` that is
+        no failure, replaces it as from a ``finally``, with the body's exception as its context.
+        """
         try:
             await self.aclose()
-        except BaseException as cleanup_error:
-            # An interrupt the close raised (a stream's, ``InterruptLatch``) leaves ahead of the body's exception.
-            if primary is not None and not is_interrupt(cleanup_error):
+        except (Exception, asyncio.CancelledError) as cleanup_error:
+            if primary is not None:
                 raise primary.with_traceback(traceback) from cleanup_error
             raise
 
