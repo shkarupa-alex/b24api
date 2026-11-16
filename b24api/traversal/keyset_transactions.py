@@ -41,6 +41,7 @@ from b24api.traversal.keyset_transaction_contract import (
     build_controlled_request,
     build_lane_plan,
 )
+from b24api.traversal.page_failure import failed_page
 
 if TYPE_CHECKING:
     from b24api.batch.outcome import BatchOutcome
@@ -96,13 +97,17 @@ async def execute_wave(
             all(plan.phase is KeysetPhase.BOUNDARY for plan in plans)
             and getattr(getattr(host.execution, "total_hint", None), "value", None) == "request_advisory"
         )
-        outcomes = await host.engine.execute_requests(
-            {plan.command_id: plan.request for plan in plans},
-            context=host.context.execution_context,
-            advisory_totals=advisory,
-            strict_envelope=True,
-            strict_json_members=True,
-        )
+        try:
+            outcomes = await host.engine.execute_requests(
+                {plan.command_id: plan.request for plan in plans},
+                context=host.context.execution_context,
+                advisory_totals=advisory,
+                strict_envelope=True,
+                strict_json_members=True,
+            )
+        except BaseException as error:
+            _trace_failed_call(host, plans, error, PageDispatch.BATCH)
+            raise
         _record_wave_dispatch(host, plans, outcomes)
         receipts, rejections = _validate_wave(host, plans, outcomes, reservations)
         if rejections:
@@ -230,6 +235,50 @@ def _abort_wave(
     if rejection is None:
         raise PaginationError("fast keyset wave validation failed")
     _raise_rejection(host, rejection)
+
+
+async def _execute_finish_command(
+    host: KeysetTransactionHost, plan: LaneCommandPlan, request: Request, dispatch: PageDispatch
+) -> BatchOutcome:
+    """Send the finish page through the engine; a call that fails as a whole traces the page before it raises."""
+    try:
+        return await host.engine.execute_page(
+            request, command_id=plan.command_id, context=host.context.execution_context
+        )
+    except BaseException as error:
+        _trace_failed_call(host, (plan,), error, dispatch)
+        raise
+
+
+def _trace_failed_call(
+    host: KeysetTransactionHost,
+    plans: tuple[LaneCommandPlan, ...],
+    error: BaseException,
+    dispatch: PageDispatch,
+) -> None:
+    """Trace each page of an engine call that failed as a whole the way it settles (``failed_page``).
+
+    The call left no outcome per command to validate; the engine settled each page from what its command did
+    (``WaveEngine.failed_pages``), and the trace reads that same fact, with the command's index in its physical
+    batch: a page never sent is not traced. A cancelled call is no failure of its pages.
+    """
+    pages = host.engine.failed_pages(error)
+    if pages is None:
+        return
+    for plan, page in zip(plans, pages, strict=True):
+        traced = failed_page(error, page.settlement)
+        if traced is None:
+            continue
+        page_outcome, rejection_code = traced
+        host.record_page(
+            plan,
+            index=page.batch_index,
+            selected=0,
+            admitted=0,
+            outcome=page_outcome,
+            rejection=rejection_code,
+            dispatch=dispatch,
+        )
 
 
 def _finish_index(outcome: BatchOutcome, dispatch: PageDispatch) -> int | None:
@@ -390,9 +439,7 @@ async def execute_finish_page(
     try:
         await host.adjust_buffer(host.effective_page_cap)
         host.completion_recorder.schedule(plan.command_id)
-        outcome = await host.engine.execute_page(
-            request, command_id=plan.command_id, context=host.context.execution_context
-        )
+        outcome = await _execute_finish_command(host, plan, request, dispatch)
         _record_finish_dispatch(host, plan, outcome, dispatch)
         commit = host.context.commit_page if isinstance(outcome, BatchSuccess) else host.context.release_page
         commit(reservation)

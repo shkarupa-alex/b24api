@@ -70,6 +70,7 @@ from b24api.contracts.page_stop import ContinuePage
 from b24api.contracts.policy import KernelState, RetryPolicy
 from b24api.contracts.request import RouteKind
 from b24api.errors import (
+    ApiResponseError,
     BudgetExceededError,
     CapabilityError,
     IdentityContractError,
@@ -1600,7 +1601,14 @@ def _descending(execution: Execution) -> KeysetTraversal:
 
 def _finish_rejection(report: OperationReport) -> list[tuple[object, ...]]:
     return [
-        (record.reference_index, record.dispatch, record.batch_index, record.outcome, record.rejection_code)
+        (
+            record.reference_index,
+            record.dispatch,
+            record.batch_index,
+            record.rows_selected,
+            record.outcome,
+            record.rejection_code,
+        )
         for record in report.page_trace
         if record.phase is not None and record.phase.value == "finish" and record.outcome is not PageOutcome.COMMITTED
     ]
@@ -1632,9 +1640,12 @@ async def test_a_flat_descending_finish_page_the_admission_frontier_refuses_is_t
     assert portal.waves == [2, 1]
     report = stream.report
     assert report is not None
+    # The refused page selected its four rows and admitted none: they are discarded, not lost from the provenance.
     assert _finish_rejection(report) == [
-        (None, PageDispatch.DIRECT, None, PageOutcome.REJECTED, PageRejectionCode.RANGE_CONTRADICTION)
+        (None, PageDispatch.DIRECT, None, 4, PageOutcome.REJECTED, PageRejectionCode.RANGE_CONTRADICTION)
     ]
+    assert report.keyset_execution is not None
+    assert report.keyset_execution.probe_rows_discarded == 4
 
 
 @pytest.mark.asyncio
@@ -1659,5 +1670,124 @@ async def test_a_reference_descending_finish_page_the_admission_frontier_refuses
     assert set(_completes(outcomes)) == {"p0", "p2"}
     assert portal.waves == [6, 3]
     assert _finish_rejection(report) == [
-        (1, PageDispatch.BATCH, 0, PageOutcome.REJECTED, PageRejectionCode.RANGE_CONTRADICTION)
+        (1, PageDispatch.BATCH, 0, 4, PageOutcome.REJECTED, PageRejectionCode.RANGE_CONTRADICTION)
     ]
+
+
+# --- A keyset engine call that fails as a whole -------------------------------------------------------
+
+_UNDECODABLE = WireResponse(200, (("content-type", "application/json"),), b"[" * _NESTED + b"]" * _NESTED)
+_DENIED = WireResponse(
+    200, (("content-type", "application/json"),), b'{"error":"ACCESS_DENIED","error_description":"denied"}'
+)
+_UNKNOWN_PAGE = (PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION)
+
+
+def _failing(portal: BatchPortal, failing_send: int, answer: WireResponse) -> ResponderTransport:
+    """Answer the ``failing_send``-th physical request with ``answer`` and every other one from ``portal``."""
+    sends = [0]
+
+    async def respond(request: Request) -> WireResponse:
+        sends[0] += 1
+        if sends[0] == failing_send:
+            return answer
+        return await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 22)
+
+    return ResponderTransport(respond, host=portal.host)
+
+
+def _failed_pages(report: OperationReport) -> list[tuple[object, ...]]:
+    return [
+        (
+            record.reference_index,
+            None if record.phase is None else record.phase.value,
+            record.dispatch,
+            record.batch_index,
+            record.outcome,
+            record.rejection_code,
+        )
+        for record in report.page_trace
+        if record.outcome is not PageOutcome.COMMITTED
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failing_send", "phase"),
+    [(1, "boundary"), (2, "finish")],
+    ids=["boundary-wave", "finish-pages"],
+)
+async def test_a_shared_keyset_batch_that_fails_as_a_whole_traces_each_page_the_way_it_settles(
+    failing_send: int, phase: str
+) -> None:
+    # Three one-row parents share each batch: the boundary probes (two per parent) or the finish pages (one each).
+    # The batch's answer cannot be decoded, so it fails as a whole: each binding fails, and each of its pages in
+    # that batch, which may have run, is traced unknown with its command's index in the shared batch.
+    portal = BatchPortal(_answer({f"p{index}": (1,) for index in range(3)}))
+    async with client_for(
+        _failing(portal, failing_send, _UNDECODABLE), policy=ExecutionPolicy(page_trace_limit=1024)
+    ) as client:
+        stream = client.iter_reference_outcomes(
+            _base(),
+            [_parent(f"p{index}") for index in range(3)],
+            traversal=_traversal(AutoKeysetExecution(_CONTRACT)),
+            dispatch=BatchDispatch(),
+        )
+        outcomes, report = await _drain(stream)
+
+    assert sorted(str(outcome.correlation) for outcome in outcomes if isinstance(outcome, ReferenceFailure)) == [
+        "p0",
+        "p1",
+        "p2",
+    ]
+    per_binding = 2 if phase == "boundary" else 1
+    assert sorted(_failed_pages(report), key=lambda page: str(page[3])) == [
+        (index // per_binding, phase, PageDispatch.BATCH, index, *_UNKNOWN_PAGE) for index in range(3 * per_binding)
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failing_send", "answer", "raised", "failed"),
+    [
+        # The boundary wave's private batch cannot be decoded: both probes may have run.
+        (
+            1,
+            _UNDECODABLE,
+            RecursionError,
+            [
+                (None, "boundary", PageDispatch.BATCH, 0, *_UNKNOWN_PAGE),
+                (None, "boundary", PageDispatch.BATCH, 1, *_UNKNOWN_PAGE),
+            ],
+        ),
+        # The direct finish request is refused: rejected by its own failure, with no batch to point to.
+        (
+            2,
+            _DENIED,
+            ApiResponseError,
+            [(None, "finish", PageDispatch.DIRECT, None, PageOutcome.REJECTED, PageRejectionCode.COMMAND_FAILURE)],
+        ),
+    ],
+    ids=["boundary-wave", "direct-finish"],
+)
+async def test_a_flat_keyset_request_that_fails_as_a_whole_traces_its_pages_the_way_they_settle(
+    failing_send: int, answer: WireResponse, raised: type[Exception], failed: list[tuple[object, ...]]
+) -> None:
+    portal = BatchPortal(_flat_answer((1,)))
+    async with client_for(
+        _failing(portal, failing_send, answer), policy=ExecutionPolicy(page_trace_limit=1024)
+    ) as client:
+        stream = client.iter_list_keyset(
+            _base(),
+            selector=ResultSelector.root(),
+            identity=_identity(),
+            page_size=PAGE,
+            keyset=_keyset(),
+            execution=AutoKeysetExecution(_CONTRACT),
+        )
+        with pytest.raises(raised):
+            await _drain(stream)
+
+    report = stream.report
+    assert report is not None
+    assert _failed_pages(report) == failed

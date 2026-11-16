@@ -492,11 +492,9 @@ class _FailedPage:
     settlement: CommandSettlement
     # The command's own final outcome, when the batch answered or ended it: a failure of that command alone.
     failure: BatchFailure | None = None
-
-    @property
-    def batch_index(self) -> int | None:
-        """Return the command's index in its physical batch, known from its own outcome."""
-        return None if self.failure is None else self.failure.command_index
+    # The command's index in the physical batch it was handed to: its own outcome's, or its position in a chunk
+    # that failed as a whole; none for a page the dispatcher never handed to a batch.
+    batch_index: int | None = None
 
 
 class _SentPageError(Exception):
@@ -514,7 +512,12 @@ class _BatchPageError(_SentPageError):
         cause = failure.error
         super().__init__(
             "batch page command failed",
-            _FailedPage(cause if isinstance(cause, BaseException) else self, settlement_of(failure), failure),
+            _FailedPage(
+                cause if isinstance(cause, BaseException) else self,
+                settlement_of(failure),
+                failure,
+                failure.command_index,
+            ),
         )
 
 
@@ -528,7 +531,7 @@ class _ChunkPageError(_SentPageError):
     def __init__(self, error: Exception, progress: BatchProgress, position: int) -> None:
         super().__init__(
             "batch page failed with its chunk",
-            _FailedPage(error, progress.settlement(position)),
+            _FailedPage(error, progress.settlement(position), batch_index=position),
         )
 
 
@@ -804,7 +807,8 @@ class _RowBuffer:
             self._reservations.remove(reservation)
         self._changed()
         if self._ordered and reservation.hold is _Hold.QUEUED and self._producer_state is not None:
-            # The drain projection counts these rows already, whether queued or free.
+            # Freed rows wake the producers and waves waiting for room; the drain projection counts a queued page's
+            # rows already, so this wakes them without a fact change that would make a coalescing wave project again.
             self._producer_state.progress()
         else:
             self._touch()

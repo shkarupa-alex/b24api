@@ -184,6 +184,18 @@ class _FlatTailStream:
         return self._outcomes.report
 
     async def __aiter__(self) -> AsyncIterator[TailReceipt]:
+        try:
+            async for receipt in self._receipts():
+                yield receipt
+        except BaseException as error:
+            start = self._outcomes.failed_chunk(error)
+            if start is None:
+                raise
+            # The batch failed as a whole: the traversal stops at its first page, which reports the batch's error and
+            # settles from what its command did, as a reference tail page that fails with its chunk does.
+            yield TailReceipt(start, None, 0, self._outcomes.settlement(start), error=error)
+
+    async def _receipts(self) -> AsyncIterator[TailReceipt]:
         async for outcome in self._outcomes:
             # The page's ordinal in the tail is its command's index in the whole stream; its batch index is the
             # command's index in its own batch, as every page trace records it.
@@ -216,8 +228,10 @@ class _FlatTailStream:
 
     def failure(self, receipt: TailReceipt) -> BaseException:
         outcome = receipt.failure
-        if outcome is None:  # the flat tail yields every failed page with its command's own outcome
-            raise RuntimeError("flat counted tail failure lacks its command outcome")
+        if outcome is None:  # a page that failed with its whole batch reports the batch's error
+            if receipt.error is None:
+                raise RuntimeError("flat counted tail failure lacks its error")
+            return receipt.error
         error = outcome.error
         if self._context.ended_by(error):
             # The operation's budget refused the page's send and ends the operation: its end, not a failed page.

@@ -872,6 +872,12 @@ now unknown with reason `CONNECTION_LOST_AFTER_DISPATCH` and a cause chain that 
   physical batch shared with other bindings' commands. Each is now its command's index in that batch.
   A page replayed alone keeps the index of the batch it was first sent with: it is the command's key
   in every send of it.
+- **A page sent with a batch that failed as a whole is traced.** When a physical batch fails as a whole
+  (its answer cannot be decoded, for example), each page sent with it is traced the way it settles, with
+  its index in that batch: a fast keyset wave or finish page, of `iter_list_keyset()` or of a reference
+  binding, and the page a flat counted tail stops at in `iter_list_counted()`. Before, none of them was
+  traced, and a reference counted tail page was traced with no `batch_index`. A direct keyset finish
+  request that fails is traced too, with no `batch_index`. The errors raised are unchanged.
 - **A flat counted tail page the traversal stops before settles as its command did.** In the
   completion evidence of `iter_list_counted()`, every tail page read but not reached when the traversal
   stopped (at a failed page, at the budget, cancelled, or when the consumer broke out of the loop)

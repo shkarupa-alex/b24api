@@ -81,8 +81,15 @@ own failure when the batch answered or ended it), and every caller reads a faile
 settlement and trace, and a wave or a counted tail that takes a command's own failure as its outcome.
 `page_failure.failed_page` alone decides whether a failed page is traced and how, for `record_failed_page` and
 for keyset's `classify_rejection`. Both counted tails, reference and flat, hand the tail's one trace site a
-receipt for every failed page they reach, sent or never sent, with its command's own failure or (on the
-reference path) its whole chunk's, and that site traces it by `failed_page` alone. A page's `batch_index` is
+receipt for every failed page they reach, sent or never sent, with its command's own failure or its whole
+chunk's, and that site traces it by `failed_page` alone. A page sent with a chunk that failed as a whole (its
+batch failed, or its answer could not be decoded) is traced as its settlement says, with its position in that
+chunk as its `batch_index`, on every path that sends one: the reference dispatcher's `_FailedPage`, the flat
+tail's stream (`failed_chunk`: the traversal stops at that chunk's first page, the one it traces) and a keyset
+engine whose wave or finish call failed (`failed_pages`: each page's settlement and index, which the keyset
+transaction traces by `failed_page`, a direct finish page with no index). A chunk ended by cancellation is not
+such a failure: its pages are settled from its progress, and the operation ends without a failed page to
+trace. A page's `batch_index` is
 its command's index in the physical batch it was submitted with (sent with, or handed to), as its command's
 outcome carries it, on every path: a keyset wave or finish page of a reference binding shares that batch with
 other bindings' commands, so its index in its own binding's wave is not one. The index is also the command's

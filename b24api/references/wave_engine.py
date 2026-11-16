@@ -17,6 +17,7 @@ from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
 from b24api.errors import CapabilityError
 from b24api.references.dispatch import _DecodeOptions, _failed_page
+from b24api.traversal.keyset_context import FailedWavePage
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -64,6 +65,7 @@ class SharedWaveEngine:
         self._ledger = ledger
         self._context = host.context
         self._cap = host.wave_command_cap
+        self._failed: tuple[BaseException, tuple[FailedWavePage, ...]] | None = None
 
     @property
     def portal_command_cap(self) -> int:
@@ -110,12 +112,12 @@ class SharedWaveEngine:
             # Each command's error is already recorded in ``errors``; retrieve it so it is not logged as lost.
             await asyncio.gather(*tasks, return_exceptions=True)
             outcomes = self._correlate(tasks, errors)
-        except BaseException:
+        except BaseException as error:
             # A wave that ends early, or whose envelope failed as a whole, settles each of its pages first.
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            self._settle(tuple(pages), tasks, errors)
+            self._settle(tuple(pages), tasks, errors, error)
             raise
         # Only a wave the runtime receives may lead to another: a whole-envelope failure ends the binding.
         self._state.runnable.add(key)
@@ -152,10 +154,19 @@ class SharedWaveEngine:
         command_ids: tuple[str, ...],
         tasks: tuple[asyncio.Task[_DispatchedPage], ...],
         errors: dict[int, BaseException],
+        raised: BaseException | None,
     ) -> None:
         """Settle every page of a wave whose call raises, by id, from what its own command's dispatch proved."""
-        for index, (command_id, task) in enumerate(zip(command_ids, tasks, strict=True)):
-            self._ledger.settle(command_id, _settlement(task, errors.get(index)))
+        failed = tuple(_failed_wave_page(task, errors.get(index)) for index, task in enumerate(tasks))
+        for command_id, page in zip(command_ids, failed, strict=True):
+            self._ledger.settle(command_id, page.settlement)
+        # A cancellation is no failure of the wave's pages.
+        self._failed = (raised, failed) if isinstance(raised, Exception) else None
+
+    def failed_pages(self, error: BaseException) -> tuple[FailedWavePage, ...] | None:
+        """Return the pages of the latest call that ``error`` failed, as the engine settled them."""
+        failed = self._failed
+        return failed[1] if failed is not None and failed[0] is error else None
 
     def _start(
         self,
@@ -199,15 +210,18 @@ class SharedWaveEngine:
         return dispatched
 
 
-def _settlement(task: asyncio.Task[_DispatchedPage], error: BaseException | None) -> CommandSettlement:
+def _failed_wave_page(task: asyncio.Task[_DispatchedPage], error: BaseException | None) -> FailedWavePage:
     """Settle one wave command from what its dispatch proved: its failure, or its outcome (``settlement_of``).
 
-    A task cancelled before it ran never handed its command to the dispatcher: it was not executed.
+    A task cancelled before it ran never handed its command to the dispatcher: it was not executed, in no batch.
     """
     if error is not None:
-        return _failed_page(error).settlement
+        failed = _failed_page(error)
+        return FailedWavePage(failed.settlement, failed.batch_index)
     outcome = task.result().outcome if task.done() and not task.cancelled() else None
-    return CommandSettlement.NOT_EXECUTED if outcome is None else settlement_of(outcome)
+    if outcome is None:
+        return FailedWavePage(CommandSettlement.NOT_EXECUTED, None)
+    return FailedWavePage(settlement_of(outcome), outcome.command_index)
 
 
 __all__ = ["SharedWaveEngine", "WaveHost"]

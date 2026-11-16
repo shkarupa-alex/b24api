@@ -74,6 +74,19 @@ class _ChunkSending:
 
 
 @dataclass(frozen=True, slots=True)
+class _ChunkFailed:
+    """A chunk whose send failed as a whole with ``error``: where each command stood is its ended ``BatchProgress``."""
+
+    commands: range
+    progress: BatchProgress
+    error: Exception
+
+    def settlement(self, index: int) -> CommandSettlement:
+        """Return how the command settles from what it did before the chunk failed."""
+        return self.progress.settlement(index)
+
+
+@dataclass(frozen=True, slots=True)
 class _ChunkAnswered:
     """A chunk whose send ended with an outcome per command, as the stream yields it."""
 
@@ -85,7 +98,7 @@ class _ChunkAnswered:
         return settlement_of(self.outcomes[index])
 
 
-type _ChunkState = _ChunkRead | _ChunkSending | _ChunkAnswered
+type _ChunkState = _ChunkRead | _ChunkSending | _ChunkFailed | _ChunkAnswered
 
 
 class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
@@ -154,6 +167,15 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
         if index < chunk.commands.start:
             raise RuntimeError("a command of an earlier chunk was yielded with its outcome")
         return chunk.settlement(index)
+
+    def failed_chunk(self, error: BaseException) -> int | None:
+        """Return the stream index of the first command of the chunk whose send ``error`` failed as a whole, if it did.
+
+        A chunk-wide failure leaves no outcome per command: its commands settle from where each stood
+        (``settlement``), and the stream ends with the chunk's error.
+        """
+        chunk = self._chunk
+        return chunk.commands.start if isinstance(chunk, _ChunkFailed) and chunk.error is error else None
 
     async def __anext__(self) -> BatchStreamItem:
         """Return the next asynchronous item."""
@@ -234,9 +256,12 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
                 on_envelope=self._count_batch_request,
                 progress=progress,
             )
-        except BaseException:
+        except BaseException as error:
             for reservation in reservations:
                 self._context.release_page(reservation)
+            sending = self._chunk
+            if isinstance(sending, _ChunkSending) and isinstance(error, Exception):
+                self._chunk = _ChunkFailed(sending.commands, sending.progress, error)
             raise
         if reservations:
             for reservation, outcome in zip(reservations, outcomes, strict=True):

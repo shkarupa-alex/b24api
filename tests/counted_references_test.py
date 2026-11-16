@@ -863,13 +863,14 @@ async def test_a_counted_tail_page_that_fails_with_its_chunk_is_traced_the_way_i
             outcomes = [event async for event in stream]
 
     traced = sorted(
-        (record.reference_index, record.offset, record.outcome, record.rejection_code)
+        (record.reference_index, record.offset, record.batch_index, record.outcome, record.rejection_code)
         for record in _report(stream).page_trace
         if record.outcome is not PageOutcome.COMMITTED
     )
     unknown = (PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION)
     second = unknown if mode == "undecodable" else (PageOutcome.REJECTED, PageRejectionCode.TRANSACTION_ABORTED)
-    assert traced == [(0, WIDTH, *unknown), (1, WIDTH, *second)]
+    # Each page keeps its command's index in the chunk, the first binding's six tail pages ahead of the second's.
+    assert traced == [(0, WIDTH, 0, *unknown), (1, WIDTH, _TAIL_PAGES, *second)]
     assert [event.correlation for event in outcomes if isinstance(event, ReferenceFailure)] == [1, 2]
     # The tail pages: every one may have run when the chunk's answer is lost; otherwise only the refused command's,
     # whose replay's answer is lost, and the rest of the chunk, its commands answered with successes, succeeded.
@@ -1325,3 +1326,46 @@ async def test_flat_counted_tail_pages_cancelled_while_their_batch_fills_settle_
         range(answered, cancel_at + 1), CommandSettlement.NOT_EXECUTED
     )
     assert _flat_settlement(events) == (settled, [], BindingClosure.FAILURE)
+
+
+@pytest.mark.asyncio
+async def test_a_flat_counted_tail_batch_that_fails_as_a_whole_traces_the_page_it_stops_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The second tail batch's answer cannot be decoded: the batch fails as a whole, with no outcome per page. The
+    # traversal stops at its first page, which is traced the way it settles (it may have run), with its index in
+    # its batch, as a reference tail page failing with its chunk is; each page of the batch may have run.
+    events = _observed(monkeypatch)
+    portal = BatchPortal(_dense(301))
+    undecodable = WireResponse(200, (("content-type", "application/json"),), b"[" * _NESTED + b"]" * _NESTED)
+    sends = [0]
+
+    async def respond(request: Request) -> WireResponse:
+        sends[0] += 1
+        if sends[0] == 3:  # noqa: PLR2004 - the second tail batch
+            return undecodable
+        return await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 22)
+
+    async with client_for(ResponderTransport(respond, host=portal.host)) as client:
+        stream = client.iter_list_counted(
+            Request.bare("crm.item.list", {"PARENT": 3}, ReplaySafety.SAFE), page_size=WIDTH, batch_size=3
+        )
+
+        async def drain() -> None:
+            async with stream:
+                async for _ in stream:
+                    pass
+
+        with pytest.raises(IncompleteTraversalError) as raised:
+            await drain()
+
+    assert isinstance(raised.value.__cause__, RecursionError)
+    assert _failed_trace(_report(stream)) == [
+        (None, 4 * WIDTH, PageDispatch.BATCH, 0, PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION)
+    ]
+    settled, aborted, closure = _flat_settlement(events)
+    assert settled == dict.fromkeys(range(4), CommandSettlement.SUCCESS) | dict.fromkeys(
+        range(4, 7), CommandSettlement.UNKNOWN
+    )
+    assert aborted == []
+    assert closure is BindingClosure.UNKNOWN

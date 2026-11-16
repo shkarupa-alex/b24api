@@ -8,12 +8,13 @@ never imports references: both sides meet in these protocols.
 """
 
 from __future__ import annotations
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from b24api.batch.outcome import BatchOutcome
+    from b24api.contracts.completion import CommandSettlement
     from b24api.contracts.policy import ExecutionPolicy
     from b24api.contracts.report import PageDispatch
     from b24api.contracts.request import Request
@@ -62,6 +63,13 @@ class KeysetContext(Protocol):
         ...
 
 
+class FailedWavePage(NamedTuple):
+    """One page of a wave whose engine call raised: how its command settled, and its index in its physical batch."""
+
+    settlement: CommandSettlement
+    batch_index: int | None
+
+
 class WaveEngine(Protocol):
     """Execute the atomic correlated waves and the sequential finish pages of one fast keyset runtime."""
 
@@ -101,5 +109,13 @@ class WaveEngine(Protocol):
         """
         ...
 
+    def failed_pages(self, error: BaseException) -> tuple[FailedWavePage, ...] | None:
+        """Return each page of the latest call that raised ``error``, as the engine settled it, in the call's order.
 
-__all__ = ["KeysetContext", "WaveEngine"]
+        ``None`` when ``error`` is not a failure of the pages the latest call sent: the call was refused before
+        any page, or it was cancelled.
+        """
+        ...
+
+
+__all__ = ["FailedWavePage", "KeysetContext", "WaveEngine"]

@@ -11,6 +11,7 @@ from b24api.batch.engine import BatchExecutor, BatchProgress
 from b24api.batch.outcome import BatchSuccess
 from b24api.contracts.report import PageDispatch
 from b24api.execution.facts import settlement
+from b24api.traversal.keyset_context import FailedWavePage
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -29,6 +30,7 @@ class FlatWaveEngine:
         self._executor = executor
         self._batches = BatchExecutor(executor)
         self._ledger = ledger
+        self._failed: tuple[BaseException, tuple[FailedWavePage, ...]] | None = None
 
     @property
     def portal_command_cap(self) -> int:
@@ -64,9 +66,11 @@ class FlatWaveEngine:
                 strict_json_members=strict_json_members,
                 progress=progress,
             )
-        except BaseException:
-            for index, command_id in enumerate(pages):
-                self._ledger.settle(command_id, progress.settlement(index))
+        except BaseException as error:
+            failed = tuple(FailedWavePage(progress.settlement(index), index) for index in range(len(pages)))
+            for command_id, page in zip(pages, failed, strict=True):
+                self._ledger.settle(command_id, page.settlement)
+            self._remember(error, failed)
             raise
 
     async def execute_page(self, request: Request, *, command_id: str, context: ExecutionContext) -> BatchOutcome:
@@ -74,9 +78,20 @@ class FlatWaveEngine:
         try:
             response = await self._executor.execute(request, context=context)
         except BaseException as error:
-            self._ledger.settle(command_id, settlement(error))
+            page = FailedWavePage(settlement(error), None)
+            self._ledger.settle(command_id, page.settlement)
+            self._remember(error, (page,))
             raise
         return BatchSuccess(0, "finish", request, response.result, response=response)
+
+    def failed_pages(self, error: BaseException) -> tuple[FailedWavePage, ...] | None:
+        """Return the pages of the latest call that ``error`` failed, as the engine settled them."""
+        failed = self._failed
+        return failed[1] if failed is not None and failed[0] is error else None
+
+    def _remember(self, error: BaseException, pages: tuple[FailedWavePage, ...]) -> None:
+        """Keep how the pages of a call that failed settled; a cancellation is no failure of its pages."""
+        self._failed = (error, pages) if isinstance(error, Exception) else None
 
 
 __all__ = ["FlatWaveEngine"]
