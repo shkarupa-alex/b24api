@@ -1202,6 +1202,30 @@ async def test_a_hold_that_appears_during_the_retry_wait_fails_with_the_failure_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("hold", "sent"), [(10.0, False), (9.5, True)], ids=["as-long", "shorter"])
+async def test_a_hold_as_long_as_the_time_left_refuses_the_send_before_it_queues(hold: float, sent: bool) -> None:  # noqa: FBT001
+    # A send that waited out a hold ending exactly as the operation's time does would reach its dispatch with none
+    # left, so it is refused at once, as a longer hold is; a shorter hold is waited out and the request sent.
+    time = _Time()
+    transport = ResponderTransport(replies(_OK))
+    executor = _executor(transport, time)
+    _holds_pass_in_virtual_time(executor, time)
+    await executor.coordinator.observe_throttle(hold, reason="test hold")
+    context = executor.context(ExecutionPolicy(max_elapsed=10.0))
+    request = _request(ReplaySafety.SAFE, "crm.item.get")
+    try:
+        if sent:
+            await executor.execute(request, context=context)
+        else:
+            with pytest.raises(BudgetExceededError, match="coordinator hold exceeds execution time budget"):
+                await executor.execute(request, context=context)
+    finally:
+        await executor.coordinator.close()
+
+    assert len(transport.requests) == int(sent)
+
+
+@pytest.mark.asyncio
 async def test_the_admission_delay_of_no_method_is_the_host_cooldown() -> None:
     coordinator = RateCoordinator(clock=lambda: 0.0)
     assert coordinator.admission_delay(frozenset()) == 0.0
