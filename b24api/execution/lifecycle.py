@@ -189,8 +189,17 @@ class _Phase(Enum):
     # An interrupt ended the operation between reads and is out already; nobody has begun its end (cleanup and
     # publication) yet. Whoever comes first runs it: the task the interrupt started, a read or a close.
     INTERRUPTED = "interrupted"
+    # Somebody (a read, a close, the task an interrupt started) has claimed the end; its cleanup has not begun.
     CLOSING = "closing"
+    # The end's cleanup has begun closing the source. An end is published once its cleanup began, or once its claimant
+    # gave up waiting for it at its deadline; a cleanup cancelled before it began (a loop's shutdown cancels every task
+    # it finds) closed nothing, so the claimant starts it again (``_end``).
+    CLEANING = "cleaning"
     CLOSED = "closed"
+
+
+# An end some caller runs: a read or close that finds it waits for its publication.
+_ENDING = frozenset({_Phase.CLOSING, _Phase.CLEANING})
 
 
 _SELF_CLOSE = (
@@ -388,7 +397,7 @@ class OperationRunner[T, R: _Report]:
             # raises what the kernel ends with, a failed cleanup say, so the latch is what keeps it.
             self._latch().record(error)
             self._pull = None
-            if self._phase is _Phase.CLOSING:
+            if self._phase in _ENDING:
                 # A concurrent aclose() owns termination; this read reports the published report.
                 await self._published.wait()
                 self._raise_latched()
@@ -426,14 +435,14 @@ class OperationRunner[T, R: _Report]:
         """
         if not self.inside_own_work:
             await self._see_end()
-        if self._phase in {_Phase.INTERRUPTED, _Phase.CLOSING, _Phase.CLOSED}:
+        if self._phase in {_Phase.INTERRUPTED, *_ENDING, _Phase.CLOSED}:
             raise StopAsyncIteration
 
     async def _see_end(self) -> None:
         """See an end in progress over: run the one nobody began, or wait for the one another caller runs."""
         if self._phase is _Phase.INTERRUPTED:
             await self._end_between_reads()
-        elif self._phase is _Phase.CLOSING:
+        elif self._phase in _ENDING:
             await self._published.wait()
 
     async def _end_if_interrupted(self, deadline: float | None) -> None:
@@ -489,7 +498,7 @@ class OperationRunner[T, R: _Report]:
             return
         if self.inside_own_work:
             raise RuntimeError(_SELF_CLOSE)
-        if self._phase in {_Phase.INTERRUPTED, _Phase.CLOSING}:
+        if self._phase in {_Phase.INTERRUPTED, *_ENDING}:
             await self._see_end()
             return
         pull = self._pull
@@ -555,7 +564,9 @@ class OperationRunner[T, R: _Report]:
         handed on, so a loop the interrupt stops does so before that task's first step. Under ``asyncio.run`` the
         shutdown then cancels the task, and the end is run by a close the shutdown runs as it unwinds a task it
         cancelled (``async with stream``, the client's ``async with``): that cancellation has landed already, so the
-        cleanup runs to its end and closes the source. A stream nothing closes then gets no end and no report.
+        cleanup runs to its end and closes the source. A read that resumed ahead of the loop's raise and claimed the end
+        sees its cleanup, which the shutdown cancels before it begins, started again (``_end``), past the shutdown's
+        cancellations. A stream nothing closes then gets no end and no report.
         """
         pull = self._pull
         if self._phase is _Phase.PULLING and pull is not None and pull is not asyncio.current_task():
@@ -612,6 +623,9 @@ class OperationRunner[T, R: _Report]:
         if read is not None:
             # A cancelled read ends before the body closes under it, even after a deadline stopped the wait.
             read_failure = await _settle(cast("asyncio.Future[Settled[object]]", read), self._read)
+        if self._phase is _Phase.CLOSING:
+            # Unless its claimant gave up at its deadline and published the end before this cleanup got here.
+            self._phase = _Phase.CLEANING
         try:
             close = getattr(self._body, "aclose", None)
             if close is not None:
@@ -636,14 +650,12 @@ class OperationRunner[T, R: _Report]:
             if (interrupt := self.interrupt) is not None and self._hooks.interrupted is not None:
                 # Whatever ended the stream, an interrupt is what leaves: the report has its one shape either way.
                 report = self._hooks.interrupted(report, interrupt)
-        except BaseException:
-            # Even a failing fallback ends publication, so no later close waits for a report that never comes.
+            self._report = report
+        finally:
+            # Publication ends here on every path, a failing fallback's included: nobody waits for a report that
+            # never comes.
             self._phase = _Phase.CLOSED
             self._published.set()
-            raise
-        self._report = report
-        self._phase = _Phase.CLOSED
-        self._published.set()
         if outcome.error is not None:
             self._hooks.attach(outcome.error, report)
             self._finalize_error = outcome.error
@@ -660,12 +672,9 @@ class OperationRunner[T, R: _Report]:
         deadline: float | None = None,
     ) -> None:
         """End the operation (``_end``) and raise by the §3.1 rows."""
-        ended = await self._end(cause, primary, pending=pending, read=read, deadline=deadline)
-        report, attempt, finalize_failed = ended
-        if pending is not None and attempt.cancellation is None:
-            # The reader's own cancellation, which its read absorbed before cleanup began, is no close failure: the
-            # report never records it, but the end raises it as one cleanup deferred.
-            attempt = CleanupAttempt(attempt.error, pending, finished=attempt.finished)
+        report, attempt, finalize_failed = await self._end(
+            cause, primary, pending=pending, read=read, deadline=deadline
+        )
         # The operation's end: its interrupt is raised now, ahead of anything else.
         self._raise_latched()
         if cause is TerminalCause.FAILED and primary is not None:
@@ -689,20 +698,31 @@ class OperationRunner[T, R: _Report]:
         """Settle a cancelled ``read``, clean up and publish once; return the report, cleanup and finalization outcome.
 
         A caller's cancellation, pending or arriving during cleanup, is deferred only until ``deadline``;
-        cleanup still running then finishes in the background and is reported as failed.
+        cleanup still running then finishes in the background and is reported as failed. Only a cleanup that began
+        settles the end (``_Phase.CLEANING``): one cancelled before it began, as a loop's shutdown cancels every task
+        it finds, closed nothing, so it is started again. The returned cleanup outcome is what the end raises: the
+        report records only a cancellation that arrived while cleanup ran, never the caller's own cancellation that
+        came before (``pending``: absorbed by its read, or delivered before cleanup began), which the end raises as
+        one cleanup deferred.
         """
         self._primary = primary
         # The operation is ending: an interrupt latched from now on wakes nothing, so it cancels no read, not the one
         # an inline kernel's cleanup runs in.
         self._latch().end()
-        cancelled = pending is not None or isinstance(primary, asyncio.CancelledError)
-        self._cleanup_task = spawn_settled(self._clean_up(read))
-        cleanup = await await_cleanup_resistant(self._cleanup_task, deadline=deadline, cancelled=cancelled)
+        while True:
+            cancelled = pending is not None or isinstance(primary, asyncio.CancelledError)
+            self._cleanup_task = spawn_settled(self._clean_up(read))
+            cleanup = await await_cleanup_resistant(self._cleanup_task, deadline=deadline, cancelled=cancelled)
+            if self._phase is not _Phase.CLOSING or cleanup.unfinished is not None:
+                break
+            pending = pending or cleanup.cancellation
         # An interrupt is never a cleanup failure: its task latched it (``settle``), and it leaves as the end.
         error = None if is_interrupt(cleanup.error) else cleanup.error
         attempt = CleanupAttempt(error, cleanup.cancellation, finished=cleanup.unfinished is None)
         reason = report_reason(primary) if cause is TerminalCause.FAILED and primary is not None else None
         report, finalize_failed = await self._publish(cause, reason, attempt)
+        if pending is not None and attempt.cancellation is None:
+            attempt = CleanupAttempt(attempt.error, pending, finished=attempt.finished)
         return report, attempt, finalize_failed
 
     def _raise_failed(

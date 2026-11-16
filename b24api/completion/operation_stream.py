@@ -298,13 +298,11 @@ class MappedOperationStream[S, T]:
 
     def _publish(self, *, forced_state: TerminalState | None = None, reason: str | None = None) -> OperationReport:
         gate = self._gate()
-        unrecorded = self._source.report.state is KernelState.NOT_STARTED
-        if (self._cleanup is not None and not self._cleanup[1].finished) or (unrecorded and not gate.unstarted):
-            # The source never recorded its terminal, though it ran: cleanup was given up at the deadline, or cancelled
-            # before it ended the source (a loop shutting down cancels every task). The gate closes conservatively
-            # from the evidence it already holds.
+        if self._cleanup is not None and not self._cleanup[1].finished:
+            # Cleanup given up at the deadline: the source never recorded its terminal, so the gate closes
+            # conservatively from the evidence it already holds.
             gate.close_after_failure(CleanupState.FAILURE)
-        elif unrecorded:
+        elif self._source.report.state is KernelState.NOT_STARTED:
             gate.abort_unstarted()
         source = self._source_report()
         if reason is not None:
