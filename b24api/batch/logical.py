@@ -37,7 +37,6 @@ from b24api.execution import (
     Executor,
 )
 from b24api.execution.facts import Execution, ambiguity_of, execution, settlement
-from b24api.execution.failure import outcome_error
 from b24api.execution.lifecycle import (
     CleanupAttempt,
     LifecycleHooks,
@@ -109,7 +108,7 @@ def _public_outcomes(outcomes: tuple[KernelSuccess | KernelFailure, ...]) -> tup
                 CommandSuccess(outcome.command_index, outcome.correlation, outcome.request.summary, response),
             )
             continue
-        error = outcome_error(outcome.error, "batch command failed")
+        error = outcome.error
         # The variant follows the execution facts; only the physical decoder proves a command withheld.
         summary = outcome.request.summary
         ambiguity = ambiguity_of(
