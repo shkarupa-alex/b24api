@@ -585,13 +585,15 @@ def _v3_command(index: int) -> Command[int]:
     return Command(Request("x.item.get", {"id": index}, ReplaySafety.SAFE, route=RouteKind.API_V3), index)
 
 
+@pytest.mark.usefixtures("coalescing")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("family", ["fan_out_outcomes", "batch_outcomes"])
 async def test_a_v3_envelope_permitted_after_the_deadline_ends_the_operation_with_it(
     monkeypatch: pytest.MonkeyPatch, family: str
 ) -> None:
     # A v3 batch is sent as one envelope (``Executor._send_envelope``): granted its permit as the deadline passes,
-    # it is refused before dispatch, recorded, and the stream ends with the budget.
+    # it is refused before dispatch, recorded, and the stream ends with the budget. The commands arrive on the loop
+    # and coalesce by loop turns, so both travel in that one envelope on any machine.
     clock = _OperationClock(monkeypatch)
     acquire = RateCoordinator.acquire
 
@@ -606,9 +608,11 @@ async def test_a_v3_envelope_permitted_after_the_deadline_ends_the_operation_wit
     outcomes: list[object] = []
     async with client_for(transport, policy=POLICY) as client:
         if family == "fan_out_outcomes":
-            stream: OperationStream[Any] = client.fan_out_outcomes(commands, dispatch=BatchDispatch(batch_size=50))
+            stream: OperationStream[Any] = client.fan_out_outcomes(
+                on_loop(commands), dispatch=BatchDispatch(batch_size=50)
+            )
         else:
-            stream = client.batch_outcomes(commands, batch_size=50)
+            stream = client.batch_outcomes(on_loop(commands), batch_size=50)
         async with stream:
             error = await asyncio.wait_for(_collect(stream, outcomes), timeout=HANG_BOUND)
 

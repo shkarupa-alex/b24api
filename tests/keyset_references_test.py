@@ -687,6 +687,7 @@ async def test_a_page_whose_answer_was_lost_settles_and_traces_as_possibly_run_w
         assert reader.cancelled()
 
 
+@pytest.mark.usefixtures("coalescing")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("end", ["on_the_wire", "at_its_permit"])
 async def test_fast_reference_bindings_cancelled_mid_run_settle_each_page_from_what_its_command_did(
@@ -733,7 +734,9 @@ async def test_fast_reference_bindings_cancelled_mid_run_settle_each_page_from_w
         return answer
 
     async with client_for(ResponderTransport(respond, host=portal.host)) as client:
-        stream = client.iter_reference_outcomes(_base(), [_parent("p0"), _parent("p1")], traversal=_traversal(_auto()))
+        stream = client.iter_reference_outcomes(
+            _base(), on_loop([_parent("p0"), _parent("p1")]), traversal=_traversal(_auto())
+        )
         reader = asyncio.create_task(_drain(stream))
         await asyncio.wait_for(held.wait(), HANG_BOUND)
         reader.cancel()
