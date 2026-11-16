@@ -458,7 +458,8 @@ def is_interrupt(error: BaseException | None) -> bool:
     """Whether ``error`` interrupts the program rather than fails work: a ``KeyboardInterrupt`` or ``SystemExit``.
 
     These are what the event loop raises out of ``asyncio.run`` from a callback; it logs and drops any other
-    exception there. Any other ``BaseException`` is a failure like any other, its reader's to receive.
+    exception there. Only an ``Exception`` is a failure; any other ``BaseException`` but a cancellation is neither a
+    failure nor an interrupt: it propagates as it is, its reader's to receive.
     """
     return isinstance(error, KeyboardInterrupt | SystemExit)
 

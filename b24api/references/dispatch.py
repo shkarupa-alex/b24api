@@ -205,17 +205,14 @@ class _FailureEvent:
 
 @dataclass(frozen=True, slots=True)
 class _EndedEvent:
-    """A binding ended in no outcome: in a ``BaseException`` that is neither a failure nor an interrupt.
+    """A binding ended in no outcome: its task ended in a ``BaseException`` that is neither a failure nor an interrupt.
 
-    It is the binding's terminal event as a failure's is (``ReferenceScheduler._run_reference``), in the place its
-    outcome would have taken: the reader raises ``error`` there, as it is. The operation ends with it, so it carries
-    no evidence of its own.
+    It takes the binding's place in the order its outcome would have, so the reader gets there instead of waiting
+    for an end that never comes, and raises what the task ended in as it is (``_finish_task``). It carries no
+    evidence.
     """
 
     work: _Work
-    error: BaseException
-    violations: tuple[Violation, ...] = ()
-    page_records: tuple[PageRecord, ...] = ()
 
 
 type _Event = _PageEvent | _DoneEvent | _FailureEvent | _EndedEvent

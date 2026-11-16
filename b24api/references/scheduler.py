@@ -423,9 +423,11 @@ class ReferenceScheduler:
 
         A failure (an ``Exception``) is its failure event. A cancellation (how the operation stops its bindings,
         ``_stop_work``), the close of a coroutine a dropped loop left, and an interrupt (the operation's latch takes
-        it, ``settle``) go on as they are. Anything else is no failure and no outcome; it is only delivered: its
-        event takes the binding's place, so the reader raises it as it is there and waits for no end that never
-        comes.
+        it, ``settle``) go on as they are. Anything else is no failure and no outcome, so it is never lost either:
+        the binding's task ends in it, and whoever finishes that task raises it, once: a read where the binding's
+        end comes in order (``_EndedEvent``), or the close that collects the tasks nobody read. The event's queue
+        has room: under INPUT it is unbounded; under READY the binding waits for the consumer to take each page
+        before its next step.
         """
         if isinstance(error, Exception):
             # The binding fails with what its failed page reports, and its command's replay disposition, if any: a
@@ -435,10 +437,10 @@ class ReferenceScheduler:
             if failed.failure is not None:
                 event = replace(event, replay_disposition=failed.failure.replay_disposition)
             await self.publish_terminal(run, event)
-        elif isinstance(error, asyncio.CancelledError | GeneratorExit) or is_interrupt(error):
-            raise error
-        else:
-            await self.publish_terminal(run, _EndedEvent(run.work, error))
+            return
+        if not isinstance(error, asyncio.CancelledError | GeneratorExit) and not is_interrupt(error):
+            run.output.put_nowait(_EndedEvent(run.work))
+        raise error
 
     def _driven_pages(self, run: _ReferenceRun) -> AsyncGenerator[_Page]:
         """Build the binding's pagination driver and return its page stream."""
@@ -492,7 +494,7 @@ class ReferenceScheduler:
             ),
         )
 
-    async def publish_terminal(self, run: _ReferenceRun, event: _DoneEvent | _FailureEvent | _EndedEvent) -> None:
+    async def publish_terminal(self, run: _ReferenceRun, event: _DoneEvent | _FailureEvent) -> None:
         """Publish the binding's terminal event once it has cleaned up; it adds no command any more.
 
         It stops counting as a producer first, so no wave waits for it while the event waits for room,
@@ -850,6 +852,8 @@ class ReferenceScheduler:
         self._raise_if_budget_refused()
 
     def _record_event_violations(self, event: _Event) -> None:
+        if isinstance(event, _EndedEvent):
+            return
         self.violations = list(retain_violations((*self.violations, *event.violations)))
         combined = tuple(sorted((*self.page_trace, *event.page_records), key=lambda record: record.sequence))
         retained, truncated = retain_page_trace(combined, self.context.policy.page_trace_limit)
@@ -920,7 +924,7 @@ class ReferenceScheduler:
 
     async def _consume_event(self, event: _Event) -> AsyncGenerator[ReferenceStreamItem]:
         if isinstance(event, _EndedEvent):
-            raise event.error  # no outcome: what ended the binding ends the operation, as it is
+            return  # no outcome: finishing the binding's task raises what it ended in (``_finish_task``)
         if isinstance(event, _PageEvent):
             async for outcome in self._consume_page(event):
                 yield outcome

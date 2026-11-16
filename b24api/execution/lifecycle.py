@@ -401,6 +401,10 @@ class OperationRunner[T, R: _Report]:
                 # A concurrent aclose() owns termination; this read reports the published report.
                 await self._published.wait()
                 self._raise_latched()
+                if not isinstance(error, Exception | asyncio.CancelledError):
+                    # No failure, so the close raises it, once (``_clean_up``): this read ends as the close's
+                    # cancellation of it ends it.
+                    raise asyncio.CancelledError from None
                 closed = self._closed_read_error(error)
                 if closed is error:
                     raise
