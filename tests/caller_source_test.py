@@ -40,7 +40,15 @@ from b24api import (
     TerminalState,
 )
 from b24api.contracts import Command, ReferenceSource
-from b24api.errors import BatchFailed, BudgetExceededError, CleanupOverrunError, InputSourceError, PaginationError
+from b24api.errors import (
+    BatchFailed,
+    BudgetExceededError,
+    CapabilityError,
+    CleanupOverrunError,
+    InputSourceError,
+    PaginationError,
+    ReferenceFailed,
+)
 from tests.scripting import (
     DEADLINE_BUDGET,
     HANG_BOUND,
@@ -1360,6 +1368,57 @@ def test_an_interrupt_latched_between_reads_goes_to_the_event_loop_at_once(
     assert report.terminal_reason == "operation interrupted"
     assert _violations(report) == [*cancelled_cleanup, ("interrupted", f"operation interrupted ({interrupt.__name__})")]
     assert getattr(error, "report", None) is report
+
+
+class _NotAnInterruptError(BaseException):
+    """A ``BaseException`` that is neither an interrupt nor a cancellation: a failure like any other."""
+
+
+@pytest.mark.parametrize("when", ["between", "in_read"])
+@pytest.mark.parametrize("family", REFERENCE_FAMILIES)
+def test_a_base_exception_that_is_no_interrupt_fails_the_operation_for_its_reader(family: str, when: str) -> None:
+    # Binding 1's send raises a ``BaseException`` that is neither ``KeyboardInterrupt`` nor ``SystemExit``, while the
+    # reader holds an item and reads again later (``between``) or while its read waits (``in_read``). The event loop
+    # would only log it and drop it, so it is never handed there: it is a failure like any other, its reader's. A
+    # fail-fast family raises it, as the cause of its failure, with the failed report; an outcome family yields it as
+    # that reference's failure outcome.
+    reported: list[str] = []
+    got: list[object] = []
+    streams: list[OperationStream[Any]] = []
+    transport = _InterruptsBetweenReads(_NotAnInterruptError)
+
+    async def main() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
+        async with client_for(ResponderTransport(transport), policy=POLICIES["returns"]) as client:
+            stream = _stream(client, family, _items(family), DirectDispatch(concurrency=2))
+            streams.append(stream)
+            async with stream:
+                await anext(stream)
+                transport.between.set()
+                if when == "between":
+                    await reached(transport.raising)
+                    for _turn in range(HANDOVER_TURNS):
+                        await asyncio.sleep(0)
+                try:
+                    got.extend([item async for item in stream])
+                except (BatchFailed, ReferenceFailed) as error:
+                    got.append(error)
+
+    asyncio.run(main())
+    assert reported == []
+    report = streams[0].report
+    assert report is not None
+    if family.endswith("_outcomes"):
+        failures = [item for item in got if isinstance(getattr(item, "error", None), CapabilityError)]
+        assert len(failures) == 1
+        assert report.state is TerminalState.COMPLETED_WITH_FAILURES
+        return
+    error = got[-1]
+    assert isinstance(error, BatchFailed | ReferenceFailed)
+    assert error.__cause__ is transport.raised[0]
+    assert error.report is report
+    assert report.state is TerminalState.FAILED
+    assert _violations(report)[-1][0] == "internal_failure"
 
 
 class _ClosesWhenReleased:
