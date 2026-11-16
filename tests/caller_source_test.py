@@ -1280,6 +1280,17 @@ def test_an_interrupt_on_any_route_ends_the_operation_and_leaves_asyncio_run(
     ]
 
 
+def _owner(request: Request) -> object:
+    """The binding or command a send is for; a batch family's envelope of its one command 1 is 1's."""
+    parameters = request.copy_parameters()
+    owner_filter = parameters.get("filter")
+    owner = parameters.get("id", owner_filter.get("OWNER") if isinstance(owner_filter, dict) else None)
+    commands = parameters.get("cmd")
+    if isinstance(commands, dict) and any(str(command).endswith("id=1") for command in commands.values()):
+        return 1
+    return owner
+
+
 class _InterruptsBetweenReads:
     """Answer the first binding; the second binding's send raises the interrupt once the reader has an item."""
 
@@ -1291,13 +1302,7 @@ class _InterruptsBetweenReads:
         self.raised: list[BaseException] = []
 
     async def __call__(self, request: Request) -> object:
-        parameters = request.copy_parameters()
-        owner_filter = parameters.get("filter")
-        owner = parameters.get("id", owner_filter.get("OWNER") if isinstance(owner_filter, dict) else None)
-        commands = parameters.get("cmd")
-        if isinstance(commands, dict) and any(str(command).endswith("id=1") for command in commands.values()):
-            owner = 1  # a batch family's envelope of its one command
-        if owner == 1 and self.interrupt is not None:
+        if _owner(request) == 1 and self.interrupt is not None:
             await reached(self.between)
             error = self.interrupt("between reads")
             self.raised.append(error)
@@ -1487,8 +1492,7 @@ class _RaisesWhenCancelled(_InterruptsBetweenReads):
         self.sending = asyncio.Event()
 
     async def __call__(self, request: Request) -> object:
-        parameters = request.copy_parameters()
-        if parameters.get("id", parameters.get("filter", {}).get("OWNER")) != 1:
+        if _owner(request) != 1:
             return _answer(request)
         self.sending.set()
         try:
