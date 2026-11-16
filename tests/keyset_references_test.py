@@ -2030,3 +2030,36 @@ async def test_a_keyset_page_s_completion_record_retires_it_with_the_code_its_tr
     ) == sorted(traced, key=str)
     rejected = [code.value for _phase, _index, outcome, code in traced if outcome is PageOutcome.REJECTED]
     assert sorted(event.reason for event in retired) == sorted(rejected)
+
+
+@pytest.mark.asyncio
+async def test_a_sequential_keyset_page_the_driver_rejects_is_retired_with_the_code_its_trace_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The sequential traversal's first page breaks the identity contract: the driver rejects it, and its completion
+    # record retires it with the trace's code, through the same coupling as a keyset wave's page.
+    retired = _retired(monkeypatch)
+
+    def broken(method: str, query: Query) -> Envelope:
+        del method
+        rows = _rows(tuple(range(1, 46)), query)
+        return {"result": [{"id": f"0{rows[0]['id']}"}, *rows[1:]]}
+
+    async with client_for(BatchPortal(broken), policy=ExecutionPolicy(page_trace_limit=1024)) as client:
+        stream = client.iter_list_keyset(
+            _base(),
+            selector=ResultSelector.root(),
+            identity=_identity(),
+            page_size=PAGE,
+            keyset=_keyset(),
+            execution=SequentialKeysetExecution(),
+        )
+        with pytest.raises(IncompleteTraversalError):
+            await _drain(stream)
+
+    report = stream.report
+    assert report is not None
+    assert [(record.outcome, record.rejection_code) for record in report.page_trace] == [
+        (PageOutcome.REJECTED, PageRejectionCode.IDENTITY_CONTRACT)
+    ]
+    assert [event.reason for event in retired] == [PageRejectionCode.IDENTITY_CONTRACT.value]
