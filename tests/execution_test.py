@@ -1200,9 +1200,39 @@ def test_a_closed_latch_hands_each_late_interrupt_to_the_event_loop_once() -> No
     asyncio.run(main())
 
 
+@pytest.mark.parametrize("state", ["running", "ending"])
+def test_a_second_interrupt_the_running_operation_latches_goes_to_the_event_loop_at_its_end(state: str) -> None:
+    # Two interrupts in one operation, running or ending: its end raises the first and hands the second to the event
+    # loop, once however many catchers record it; nothing goes to the exception handler.
+    handed: list[tuple[object, ...]] = []
+    reported: list[object] = []
+    first, second = KeyboardInterrupt("first"), SystemExit("second")
+
+    async def main() -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _loop, context: reported.append(context))
+        call_soon = loop.call_soon
+        loop.call_soon = lambda _callback, *args, **_kwargs: handed.append(args)  # type: ignore[assignment,method-assign]
+        try:
+            latch = OperationLatch()
+            latch.record(first)
+            if state == "ending":
+                latch.end()
+            for error in (second, second, first):
+                latch.record(error)
+            assert latch.close() is first
+        finally:
+            loop.call_soon = call_soon  # type: ignore[method-assign]
+
+    asyncio.run(main())
+    assert handed == [(second,)]
+    assert reported == []
+
+
 def test_a_latch_wakes_its_owner_only_while_the_operation_runs() -> None:
-    # Running, the first interrupt wakes the owner, once; ending, an interrupt is latched for the end, waking nothing;
-    # an interrupt the end handed on (no reader raised it) is not handed again when a catcher records it later.
+    # Running, the first interrupt wakes the owner, once (a second waits for the end, which hands it on); ending, an
+    # interrupt is latched for the end, waking nothing; an interrupt the end handed on (no reader raised it) is not
+    # handed again when a catcher records it later.
     woken: list[bool] = []
     handed: list[tuple[object, ...]] = []
 
@@ -1212,10 +1242,11 @@ def test_a_latch_wakes_its_owner_only_while_the_operation_runs() -> None:
         loop.call_soon = lambda _callback, *args, **_kwargs: handed.append(args)  # type: ignore[assignment,method-assign]
         try:
             running = OperationLatch(lambda: woken.append(True))
-            first = KeyboardInterrupt("first")
+            first, second = KeyboardInterrupt("first"), SystemExit("second")
             running.record(first)
-            running.record(SystemExit("second"))
+            running.record(second)
             assert (running.first, woken) == (first, [True])
+            assert running.close() is first
             ending = OperationLatch(lambda: woken.append(False))
             ending.end()
             ending.record(first)
@@ -1225,7 +1256,7 @@ def test_a_latch_wakes_its_owner_only_while_the_operation_runs() -> None:
             ending.record(first)
         finally:
             loop.call_soon = call_soon  # type: ignore[method-assign]
-        assert handed == [(first,)]
+        assert handed == [(second,), (first,)]
 
     asyncio.run(main())
 

@@ -175,6 +175,8 @@ class _Source:
         self.release = asyncio.Event()
         self.closing = asyncio.Event()
         self.closes = 0
+        # What an ``exits`` close raises.
+        self.exit = SystemExit("the caller's close exited")
 
     def __aiter__(self) -> _Source:
         return self
@@ -193,6 +195,8 @@ class _Source:
         self.closing.set()
         if self._close == "raises":
             raise RuntimeError("the caller's close failed")
+        if self._close == "exits":
+            raise self.exit
         if self._close == "overruns":
             await reached(self.release)
 
@@ -1172,6 +1176,8 @@ def _others() -> list[str]:
 
 
 REFERENCE_FAMILIES = tuple(family for family in FAMILIES if family not in {"batch", "batch_outcomes"})
+# Loop turns that let an operation's end and everything it hands to the event loop run out.
+TURNS_TO_SETTLE = 10
 
 
 class _Interrupting:
@@ -2337,6 +2343,47 @@ def test_a_close_that_fails_after_an_interrupt_ended_the_read_is_behind_it(famil
         ("cleanup_failure", "stream cleanup also failed (InputSourceError)"),
         ("interrupted", "operation interrupted (KeyboardInterrupt)"),
     ]
+
+
+@pytest.mark.parametrize("family", REFERENCE_FAMILIES)
+def test_an_interrupt_a_close_raises_behind_the_one_that_ended_the_read_leaves_the_loop_after_it(family: str) -> None:
+    # The interrupt ends the read, and the source's close then raises a second one (``SystemExit``): the read raises
+    # the first, and the event loop raises the second from a callback, once, raw (before the first leaves ``main``,
+    # which still closes its client); neither reaches the exception handler, and the source is closed once.
+    reported: list[object] = []
+    got: list[BaseException] = []
+    raised: list[BaseException] = []
+    source = _Source(family, "exits")
+
+    async def main() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context))
+        async with client_for(ResponderTransport(_Interrupting("queued")), policy=POLICIES["raises"]) as client:
+            stream = _stream(client, family, source, DirectDispatch(concurrency=2))
+
+            async def read() -> None:
+                try:
+                    await _end(stream, "read_to_end")
+                except BaseException as error:  # noqa: BLE001 - the test inspects what the reader got
+                    got.append(error)
+
+            await asyncio.create_task(read())
+        raise got[0]
+
+    loop = asyncio.new_event_loop()
+    try:
+        work = loop.create_task(main())
+        for _turn in range(TURNS_TO_SETTLE):
+            try:
+                loop.run_until_complete(work if not work.done() else asyncio.sleep(0))
+            except BaseException as error:  # noqa: BLE001 - the test inspects what the loop raised
+                raised.append(error)
+    finally:
+        loop.close()
+    assert len(got) == 1
+    assert isinstance(got[0], KeyboardInterrupt)
+    assert sorted(map(id, raised)) == sorted([id(got[0]), id(source.exit)])
+    assert reported == []
+    assert source.closes == 1
 
 
 @pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])

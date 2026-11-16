@@ -197,24 +197,42 @@ async def test_owned_cleanup_closes_streams_then_coordinator_then_transport_keep
 
 
 @pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
-@pytest.mark.asyncio
-async def test_owned_cleanup_raises_an_interrupt_ahead_of_an_earlier_failure(interrupt: type[BaseException]) -> None:
+def test_owned_cleanup_raises_an_interrupt_ahead_of_an_earlier_failure(interrupt: type[BaseException]) -> None:
     # An interrupt is never behind a failure: the first one latched is what leaves, as it is, every resource closed.
+    # A second interrupt (the coordinator's) leaves the event loop from a callback right after it, once.
     order: list[str] = []
     streams = (
         _Resource("failing-stream", order, fail=True),
         _Resource("interrupted-stream", order, interrupt=interrupt),
     )
-
-    with pytest.raises(interrupt, match="interrupted-stream interrupted") as captured:
-        await close_owned_resources(
-            streams,
-            _Resource("transport", order, fail=True),
-            _Resource("coordinator", order, interrupt=KeyboardInterrupt),
+    raised: list[BaseException] = []
+    loop = asyncio.new_event_loop()
+    try:
+        work = loop.create_task(
+            close_owned_resources(
+                streams,
+                _Resource("transport", order, fail=True),
+                _Resource("coordinator", order, interrupt=KeyboardInterrupt),
+            )
         )
+        try:
+            loop.run_until_complete(work)
+        except BaseException as error:  # noqa: BLE001 - the test inspects what the loop raised
+            raised.append(error)
+        loop.call_soon(loop.stop)  # One more turn: the callbacks the close scheduled run.
+        try:
+            loop.run_forever()
+        except BaseException as error:  # noqa: BLE001 - the test inspects what the loop raised
+            raised.append(error)
+    finally:
+        loop.close()
 
+    assert [(type(error), str(error)) for error in raised] == [
+        (interrupt, "interrupted-stream interrupted"),
+        (KeyboardInterrupt, "coordinator interrupted"),
+    ]
     assert order == ["failing-stream", "interrupted-stream", "coordinator", "transport"]
-    assert not hasattr(captured.value, "__notes__")
+    assert not hasattr(raised[0], "__notes__")
 
 
 @pytest.mark.asyncio

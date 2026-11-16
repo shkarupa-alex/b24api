@@ -554,13 +554,14 @@ class OperationLatch:
             return
         if self.state is LatchState.CLOSED:
             self.hand_on(error)
-        elif not is_interrupt(error):
-            self._loop = self._loop or asyncio.get_running_loop()
-            self._undelivered.append(error)
-        elif self.first is None:
+        elif is_interrupt(error) and self.first is None:
             self.first = error
             if self.state is LatchState.ARMED and self._wake is not None:
                 self._wake()
+        else:
+            # Any other escape, a second interrupt included, waits for the end, which hands on what it does not raise.
+            self._loop = self._loop or asyncio.get_running_loop()
+            self._undelivered.append(error)
 
     def hand_on(self, error: BaseException) -> None:
         """Hand ``error`` to the event loop, once: no read or close of the operation will raise it."""
