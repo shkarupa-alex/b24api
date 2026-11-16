@@ -1865,6 +1865,93 @@ def test_a_base_exception_a_counted_tail_page_the_close_cancelled_raises_is_the_
     assert source.closes == 1
 
 
+class _Abandoned:
+    """A stream nothing closes: binding 1's send raises it between reads, or once ``asyncio.run``'s shutdown cancels it.
+
+    ``shutdown``: ``main`` returns with the stream and its client open. ``gc``: the stream is dropped and collected
+    while the loop runs on, then the client is closed.
+    """
+
+    def __init__(self, family: str, raised: str, end: str) -> None:
+        self.family = family
+        self.raised = raised
+        self.end = end
+        if raised == "held":
+            self.transport: _InterruptsBetweenReads = _RaisesWhenCancelled(_NotAnInterruptError)
+        else:
+            self.transport = _InterruptsBetweenReads(_NotAnInterruptError)
+        self.handler = _Handler()
+        self.kept: list[object] = []
+        # The escape's identity alone: whoever holds the escape holds its traceback, and through it the operation.
+        self.raised_id: int | None = None
+
+    def take_raised(self) -> int:
+        """Let go of the escape the transport raised, keeping its identity."""
+        if self.raised_id is None:
+            assert len(self.transport.raised) == 1
+            self.raised_id = id(self.transport.raised.pop())
+        return self.raised_id
+
+    async def main(self) -> None:
+        asyncio.get_running_loop().set_exception_handler(self.handler)
+        client = client_for(ResponderTransport(self.transport), policy=POLICIES["returns"])
+        await client.__aenter__()
+        stream = _stream(client, self.family, _Source(self.family, "returns"), DirectDispatch(concurrency=2))
+        await anext(stream)
+        if isinstance(self.transport, _RaisesWhenCancelled):
+            await reached(self.transport.sending)
+        else:
+            self.transport.between.set()
+            await reached(self.transport.raising)
+            await _turns()
+            self.take_raised()
+        if self.end == "shutdown":
+            self.kept.append((client, stream))
+            return
+        del stream
+        for _collection in range(3):
+            gc.collect()
+            await asyncio.sleep(0)
+        await client.__aexit__(None, None, None)
+
+
+# Where nothing ends the operation: the escape raised between reads or by a send the shutdown cancels, the stream
+# left open as ``asyncio.run`` returns or dropped while the loop runs on.
+ABANDONED = [
+    *((family, "held", "shutdown") for family in REFERENCE_FAMILIES),
+    *(
+        (family, raised, end)
+        for family in ("fan_out", "iter_references")
+        for raised, end in (("held", "gc"), ("between", "shutdown"), ("between", "gc"))
+    ),
+]
+
+
+@pytest.mark.filterwarnings("ignore:coroutine .* was never awaited:RuntimeWarning")
+@pytest.mark.parametrize(("family", "raised", "end"), ABANDONED)
+def test_an_escape_of_an_operation_nothing_ends_reaches_the_loops_handler_once(
+    family: str, raised: str, end: str
+) -> None:
+    # Nothing ends the operation: no read or close is there to raise the escape. As asyncio reports a task's exception
+    # nobody retrieved, the operation reports it to the loop's exception handler, once, with that very object, when it
+    # is collected: after asyncio.run returned, on its closed loop, or as the dropped stream goes while the loop runs
+    # on. A dropped stream whose held send the client's close cancels is that close's to raise instead.
+    run = _Abandoned(family, raised, end)
+    escaped: list[int] = []
+    try:
+        asyncio.run(run.main())
+    except _NotAnInterruptError as error:
+        escaped.append(id(error))
+    error_id = run.take_raised()
+    run.kept.clear()
+    gc.collect()
+    handed = [id(context["exception"]) for context in run.handler.contexts if context.get("exception") is not None]
+    if (raised, end) == ("held", "gc"):
+        assert (escaped, handed) == ([error_id], [])
+    else:
+        assert (escaped, handed) == ([], [error_id])
+
+
 @pytest.mark.filterwarnings("ignore:coroutine .* was never awaited:RuntimeWarning")
 @pytest.mark.parametrize("family", ["fan_out_outcomes", "iter_references", "iter_reference_source_outcomes"])
 def test_closing_the_binding_coroutines_a_dropped_loop_left_raises_nothing_and_logs_nothing(
