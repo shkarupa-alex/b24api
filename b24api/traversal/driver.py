@@ -5,6 +5,7 @@ import contextlib
 from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
+from b24api.completion.page_failure import failed_page, rejection_reason
 from b24api.contracts.completion import EMPTY_SOURCE_WITNESS, CommandSettlement, EmptySourceWitness
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.policy import (
@@ -62,7 +63,6 @@ from b24api.traversal.identity import (
 from b24api.traversal.inclusive_window import InclusiveWindowStrategy
 from b24api.traversal.keyset import KeysetStrategy
 from b24api.traversal.page_adaptation import PageTokens, _SourcePageState, adapt_page
-from b24api.traversal.page_failure import failed_page, rejection_reason
 from b24api.traversal.plans import (
     ContinuationPlan,
     CountedOffsetPlan,

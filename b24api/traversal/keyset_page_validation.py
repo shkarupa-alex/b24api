@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from b24api.batch.outcome import BatchFailure, BatchSuccess, settlement_of
+from b24api.completion.page_failure import failed_page
 from b24api.contracts.keyset_execution import ClosureWitness, KeysetPageCompletion, KeysetPhase
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.policy import ReplayDisposition
@@ -21,7 +22,6 @@ from b24api.errors import (
 )
 from b24api.traversal.keyset_geometry import closure_witness
 from b24api.traversal.page_adaptation import PageTokens, adapt_page
-from b24api.traversal.page_failure import failed_page
 from b24api.traversal.values import _response_items, _row_identity, _validate_order
 
 if TYPE_CHECKING:

@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from b24api.completion.fast_recorder import FastPageLedger
 from b24api.completion.gate import CompletionGate
+from b24api.completion.page_failure import unconsumed_rejection
 from b24api.contracts.completion import (
     BindingAdmitted,
     BindingClosure,
@@ -23,7 +24,6 @@ from b24api.contracts.completion import (
     StreamClosure,
     StreamTerminal,
 )
-from b24api.contracts.report import PageRejectionCode
 
 
 class _PageFields(TypedDict):
@@ -177,8 +177,9 @@ class ReferenceBindingRecorder:
             raise RuntimeError("reference page abandonment lacks a reserved page")
         self._reserved.discard(page_id)
         self._emit(PageCommandOutcome(**self._fields(page_id), outcome=outcome))
-        if outcome is CommandSettlement.SUCCESS:
-            self._emit(PageRejected(**self._fields(page_id), reason=PageRejectionCode.TRANSACTION_ABORTED.value))
+        reason = unconsumed_rejection(outcome)
+        if reason is not None:
+            self._emit(PageRejected(**self._fields(page_id), reason=reason))
         elif outcome is CommandSettlement.UNKNOWN:
             self.unknown = True
 

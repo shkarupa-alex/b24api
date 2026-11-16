@@ -6,6 +6,10 @@ from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageOutcome, PageRejectionCode
 from b24api.errors import ProtocolError
 
+# How a page whose own command succeeded is traced when it is dropped: rejected with the batch or the traversal that
+# failed or stopped around it, as a page of an aborted keyset transaction is.
+_ABORTED = (PageOutcome.REJECTED, PageRejectionCode.TRANSACTION_ABORTED)
+
 
 def failed_page(error: object, settled: CommandSettlement) -> tuple[PageOutcome, PageRejectionCode] | None:
     """Return how a page whose command failed is traced, or ``None`` for a page that never executed.
@@ -27,7 +31,7 @@ def failed_page(error: object, settled: CommandSettlement) -> tuple[PageOutcome,
         return PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION
     if settled is CommandSettlement.SUCCESS:
         # Its own command succeeded: the page is rejected with the physical batch that failed around it.
-        return PageOutcome.REJECTED, PageRejectionCode.TRANSACTION_ABORTED
+        return _ABORTED
     if _batch_envelope_failure(error):
         return PageOutcome.REJECTED, PageRejectionCode.BATCH_ENVELOPE
     return PageOutcome.REJECTED, PageRejectionCode.COMMAND_FAILURE
@@ -46,6 +50,15 @@ def rejection_reason(outcome: PageOutcome, code: PageRejectionCode | None) -> st
     return code.value
 
 
+def unconsumed_rejection(settled: CommandSettlement) -> str | None:
+    """Return the reason a page the traversal reserved but will not consume is rejected with, beyond its settlement.
+
+    A page whose own command succeeded is rejected as aborted with the traversal, the code ``failed_page`` traces
+    such a page with; any other page is retired by its settlement alone: not executed, failed or unknown.
+    """
+    return rejection_reason(*_ABORTED) if settled is CommandSettlement.SUCCESS else None
+
+
 def _batch_envelope_failure(error: object) -> bool:
     """Return whether a failure is the physical batch envelope's own protocol failure, not one command's."""
     if not isinstance(error, ProtocolError):
@@ -54,4 +67,4 @@ def _batch_envelope_failure(error: object) -> bool:
     return summary is not None and summary.method == "batch"
 
 
-__all__ = ["failed_page", "rejection_reason"]
+__all__ = ["failed_page", "rejection_reason", "unconsumed_rejection"]

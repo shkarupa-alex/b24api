@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, NoReturn
 
 from b24api.batch.outcome import BatchSuccess, settlement_of
+from b24api.completion.page_failure import failed_page
 from b24api.contracts.keyset_execution import ClosureWitness, KeysetPageCompletion, KeysetPhase
 from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode
 from b24api.errors import (
@@ -41,7 +42,6 @@ from b24api.traversal.keyset_transaction_contract import (
     build_controlled_request,
     build_lane_plan,
 )
-from b24api.traversal.page_failure import failed_page
 
 if TYPE_CHECKING:
     from b24api.batch.outcome import BatchOutcome

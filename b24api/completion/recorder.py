@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from b24api.completion.closure import qualified_closure
 from b24api.completion.gate import CompletionGate
+from b24api.completion.page_failure import unconsumed_rejection
 from b24api.contracts.completion import (
     BindingAdmitted,
     BindingClosure,
@@ -23,7 +24,6 @@ from b24api.contracts.completion import (
     StreamTerminal,
 )
 from b24api.contracts.policy import KernelState
-from b24api.contracts.report import PageRejectionCode
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -283,8 +283,9 @@ class CountedCompletionRecorder(CompletionRecorder):
         for page_id in sorted(self._reserved - {self._current}):
             outcome = settlement(page_id)
             self._settle(page_id, outcome)
-            if outcome is CommandSettlement.SUCCESS:
-                self._reject(page_id, PageRejectionCode.TRANSACTION_ABORTED.value)
+            reason = unconsumed_rejection(outcome)
+            if reason is not None:
+                self._reject(page_id, reason)
             self._reserved.discard(page_id)
 
     def activate(self, page_id: int) -> None:

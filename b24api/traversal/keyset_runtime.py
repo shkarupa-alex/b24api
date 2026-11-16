@@ -5,6 +5,7 @@ from collections import deque
 from typing import TYPE_CHECKING
 
 from b24api.completion.fast_recorder import FastCompletionRecorder
+from b24api.completion.page_failure import rejection_reason
 from b24api.contracts.completion import BindingClosure
 from b24api.contracts.dispatch import PORTAL_BATCH_CAP
 from b24api.contracts.keyset_execution import (
@@ -25,7 +26,6 @@ from b24api.traversal.keyset_plan import FastKeysetPlan, KeysetPlanner
 from b24api.traversal.keyset_reporting import build_keyset_report
 from b24api.traversal.keyset_transaction_contract import KeysetTransactionState
 from b24api.traversal.keyset_transactions import execute_body_wave, execute_finish_page, execute_wave
-from b24api.traversal.page_failure import rejection_reason
 
 if TYPE_CHECKING:
     from b24api.completion.fast_recorder import FastPageLedger
