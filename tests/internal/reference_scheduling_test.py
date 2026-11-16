@@ -735,7 +735,7 @@ async def test_a_failed_counted_binding_closes_its_tail_before_its_terminal_even
 
     failure_event = ReferenceScheduler._failure_event  # noqa: SLF001 - observed when it is built
 
-    def observing(self: ReferenceScheduler, run: _ReferenceRun, error: BaseException) -> object:
+    def observing(self: ReferenceScheduler, run: _ReferenceRun, error: Exception) -> object:
         observed.append(
             (
                 run.producer_key in self.producer_state.pending_refills,
@@ -897,7 +897,7 @@ async def test_a_tail_cleanup_failure_never_replaces_the_failure_that_ended_its_
 
     failure_event = ReferenceScheduler._failure_event  # noqa: SLF001 - observed when it is built
 
-    def observing(self: ReferenceScheduler, run: _ReferenceRun, error: BaseException) -> _FailureEvent:
+    def observing(self: ReferenceScheduler, run: _ReferenceRun, error: Exception) -> _FailureEvent:
         errors.append(error)
         return failure_event(self, run, error)
 

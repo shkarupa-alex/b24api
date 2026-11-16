@@ -1472,14 +1472,12 @@ def test_a_base_exception_that_is_no_interrupt_reaches_the_reader_as_it_is(famil
                 async for _item in stream:
                     pass
 
-    with pytest.raises(_NotAnInterruptError) as caught:
-        asyncio.run(main())
+    error = raised_by_asyncio_run(main)
+    assert isinstance(error, _NotAnInterruptError)
     assert reported == []
     if stage in {"in_read", "between"}:
-        assert caught.value is transport.raised[0]
-    assert str(caught.value) == {"close": "close", "in_read": "between reads", "between": "between reads"}.get(
-        stage, "pull"
-    )
+        assert error is transport.raised[0]
+    assert str(error) == {"close": "close", "in_read": "between reads", "between": "between reads"}.get(stage, "pull")
     assert source.closes == 1
     report = streams[0].report
     assert report is not None
