@@ -27,6 +27,7 @@ import pytest
 from b24api import (
     BatchDispatch,
     Binding,
+    CountedTraversal,
     CursorSpec,
     DirectDispatch,
     ExecutionPolicy,
@@ -50,6 +51,7 @@ from b24api.errors import (
     InputSourceError,
     PaginationError,
 )
+from b24api.execution.context import is_interrupt
 from tests.scripting import (
     DEADLINE_BUDGET,
     HANG_BOUND,
@@ -62,7 +64,7 @@ from tests.scripting import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
+    from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable, Iterator
 
     from b24api import Bitrix24
     from b24api.contracts.report import OperationReport
@@ -142,24 +144,30 @@ def _binding(index: int) -> Binding[int]:
     )
 
 
-def _items(family: str) -> list[Any]:
+def _items(family: str, count: int = ITEMS) -> list[Any]:
     if family in {"batch", "batch_outcomes", "fan_out", "fan_out_outcomes"}:
         return [
             Command(Request("x.get", {"id": index}, ReplaySafety.SAFE, route=RouteKind.BARE), index)
-            for index in range(ITEMS)
+            for index in range(count)
         ]
     if family in {"iter_reference_sources", "iter_reference_source_outcomes"}:
-        return [ReferenceSource(LIST_REQUEST, TRAVERSAL, _binding(index)) for index in range(ITEMS)]
-    return [_binding(index) for index in range(ITEMS)]
+        return [ReferenceSource(LIST_REQUEST, TRAVERSAL, _binding(index)) for index in range(count)]
+    return [_binding(index) for index in range(count)]
 
 
 class _Source:
     """A caller's source whose close returns, raises or blocks until released; it may fail after one item."""
 
     def __init__(
-        self, family: str, close: str, *, fail_after: int | None = None, failure: BaseException | None = None
+        self,
+        family: str,
+        close: str,
+        *,
+        fail_after: int | None = None,
+        failure: BaseException | None = None,
+        count: int = ITEMS,
     ) -> None:
-        self._items = iter(_items(family))
+        self._items = iter(_items(family, count))
         self._close = close
         self._fail_after = fail_after
         self._failure = failure or ValueError("the caller's source failed")
@@ -218,6 +226,20 @@ class _SyncSource:
             raise RuntimeError("the caller's close failed")
         if self._close == "overruns":
             self.release.wait(HANG_BOUND)
+
+
+class _SyncPullHeld(_SyncSource):
+    """``_SyncSource`` whose failing pull waits in its worker thread (``entered``) until ``release`` is set."""
+
+    def __init__(self, family: str, failure: BaseException) -> None:
+        super().__init__(family, "returns", fail_after=1, failure=failure)
+        self.entered = threading.Event()
+
+    def __next__(self) -> Any:  # noqa: ANN401 - commands, bindings or reference sources
+        if self._pulled == self._fail_after:
+            self.entered.set()
+            self.release.wait(HANG_BOUND)
+        return super().__next__()
 
 
 def _stream(
@@ -1291,18 +1313,30 @@ def _owner(request: Request) -> object:
     return owner
 
 
-class _InterruptsBetweenReads:
-    """Answer the first binding; the second binding's send raises the interrupt once the reader has an item."""
+def _sends_for(request: Request, owner: int) -> bool:
+    """Whether ``request`` sends ``owner``'s binding or command: alone, or in a batch with others."""
+    if owner == 1:
+        return _owner(request) == 1
+    commands = request.copy_parameters().get("cmd")
+    return isinstance(commands, dict) and any(str(command).endswith(f"id={owner}") for command in commands.values())
 
-    def __init__(self, interrupt: type[BaseException] | None) -> None:
+
+class _InterruptsBetweenReads:
+    """Answer the first binding; the second binding's send raises the interrupt once the reader has an item.
+
+    ``owner`` names another binding or command whose send raises it instead.
+    """
+
+    def __init__(self, interrupt: type[BaseException] | None, owner: int = 1) -> None:
         self.interrupt = interrupt
+        self.owner = owner
         self.between = asyncio.Event()
         # Set as the interrupt is raised: a reader waiting for it reads again in the same loop turn as the latch's wake.
         self.raising = asyncio.Event()
         self.raised: list[BaseException] = []
 
     async def __call__(self, request: Request) -> object:
-        if _owner(request) == 1 and self.interrupt is not None:
+        if _sends_for(request, self.owner) and self.interrupt is not None:
             await reached(self.between)
             error = self.interrupt("between reads")
             self.raised.append(error)
@@ -1487,12 +1521,12 @@ class _CloseFails(_Source):
 class _RaisesWhenCancelled(_InterruptsBetweenReads):
     """Hold binding 1's send (``sending`` is set first); raise ``interrupt`` from it once it is cancelled."""
 
-    def __init__(self, interrupt: type[BaseException]) -> None:
-        super().__init__(interrupt)
+    def __init__(self, interrupt: type[BaseException], owner: int = 1) -> None:
+        super().__init__(interrupt, owner)
         self.sending = asyncio.Event()
 
     async def __call__(self, request: Request) -> object:
-        if _owner(request) != 1:
+        if not _sends_for(request, self.owner):
             return _answer(request)
         self.sending.set()
         try:
@@ -1510,9 +1544,9 @@ class _RaisesWhenCancelled(_InterruptsBetweenReads):
 # which then reads on (``between``) or closes, by ``async with`` (``between_close``) or ``aclose()``
 # (``between_aclose``); or once the close cancels it, the reader holding an item (``cancelled_send``) or reading in
 # another task (``conc_close_in_read``). The source's second pull, on the loop (``async_pull``) or in its worker thread
-# (``sync_pull``). The source's close: at the end (``close``), behind the source's own failure (``behind_failure``),
-# or behind the caller's own exception, from the stream's ``async with`` (``behind_body``) or the client's
-# (``client_close``).
+# (``sync_pull``), or there once the close cancelled it, a read waiting in another task (``sync_pull_cancelled``).
+# The source's close: at the end (``close``), behind the source's own failure (``behind_failure``), or behind the
+# caller's own exception, from the stream's ``async with`` (``behind_body``) or the client's (``client_close``).
 RAW_POINTS = (
     "in_read",
     "between",
@@ -1522,44 +1556,80 @@ RAW_POINTS = (
     "conc_close_in_read",
     "async_pull",
     "sync_pull",
+    "sync_pull_cancelled",
     "close",
     "behind_failure",
     "behind_body",
     "client_close",
 )
 # The points where the stream's close, not a read, raises it.
-CLOSE_RAISES = {"between_close", "between_aclose", "cancelled_send", "conc_close_in_read", "behind_body"}
+CLOSE_RAISES = {
+    "between_close",
+    "between_aclose",
+    "cancelled_send",
+    "conc_close_in_read",
+    "sync_pull_cancelled",
+    "behind_body",
+}
 # A batch family sends only while it is read: nothing of it runs between reads or waits for a close.
 SENT_BETWEEN_READS = {"between", "between_close", "between_aclose", "cancelled_send", "conc_close_in_read"}
+# The commands' sends: one by one, or in batches that a sender task sends for every binding, of one command or of
+# two: four commands, the reader's first in the first batch and the one that raises it in the second, with another.
+RAW_DISPATCHES: dict[str, DirectDispatch | BatchDispatch] = {
+    "direct": DirectDispatch(concurrency=2),
+    "batch1": BatchDispatch(batch_size=1, concurrency=2),
+    "batch2": BatchDispatch(batch_size=2, concurrency=2),
+}
+# Per dispatch: how many commands the source has, and which one's send raises it.
+RAW_SENDS = {"direct": (ITEMS, 1), "batch1": (ITEMS, 1), "batch2": (4, 3)}
+RAW_CASES = [
+    *(
+        (family, point, "direct")
+        for family in FAMILIES
+        for point in RAW_POINTS
+        if not (point in SENT_BETWEEN_READS and family in {"batch", "batch_outcomes"})
+    ),
+    *(
+        (family, point, dispatch)
+        for dispatch in ("batch1", "batch2")
+        for family in ("fan_out", "fan_out_outcomes")
+        for point in ("in_read", *sorted(SENT_BETWEEN_READS))
+    ),
+]
 
 
-def _raw_source(family: str, point: str) -> _Source | _SyncSource:
+def _raw_source(family: str, point: str, count: int) -> _Source | _SyncSource:
     raw = _NotAnInterruptError(point)
     if point == "async_pull":
         return _Source(family, "returns", fail_after=1, failure=raw)
     if point == "sync_pull":
         return _SyncSource(family, "returns", fail_after=1, failure=raw)
+    if point == "sync_pull_cancelled":
+        return _SyncPullHeld(family, raw)
     if point == "behind_failure":
         return _CloseFails(family, raw, fail_after=1, failure=ValueError("pull"))
     if point in {"close", "behind_body", "client_close"}:
         return _CloseFails(family, raw)
-    return _Source(family, "returns")
+    return _Source(family, "returns", count=count)
 
 
-def _raw_transport(point: str) -> _InterruptsBetweenReads:
+def _raw_transport(point: str, owner: int) -> _InterruptsBetweenReads:
     if point in {"cancelled_send", "conc_close_in_read"}:
-        return _RaisesWhenCancelled(_NotAnInterruptError)
-    return _InterruptsBetweenReads(_NotAnInterruptError if point in {"in_read", *SENT_BETWEEN_READS} else None)
+        return _RaisesWhenCancelled(_NotAnInterruptError, owner)
+    raises = _NotAnInterruptError if point in {"in_read", *SENT_BETWEEN_READS} else None
+    return _InterruptsBetweenReads(raises, owner)
 
 
 class _RawEnd:
     """One run of ``family`` with the ``BaseException`` raised at ``point``; it records where the reader got it."""
 
-    def __init__(self, family: str, point: str) -> None:
+    def __init__(self, family: str, point: str, dispatch: str = "direct") -> None:
         self.family = family
         self.point = point
-        self.transport = _raw_transport(point)
-        self.source = _raw_source(family, point)
+        self.dispatch = RAW_DISPATCHES[dispatch]
+        count, owner = RAW_SENDS[dispatch]
+        self.transport = _raw_transport(point, owner)
+        self.source = _raw_source(family, point, count)
         self.own = _OwnError("body")
         self.reported: list[str] = []
         self.items: list[object] = []
@@ -1573,7 +1643,7 @@ class _RawEnd:
             lambda _loop, context: self.reported.append(context["message"])
         )
         async with client_for(ResponderTransport(self.transport), policy=POLICIES["returns"]) as client:
-            stream = _stream(client, self.family, self.source, DirectDispatch(concurrency=2))
+            stream = _stream(client, self.family, self.source, self.dispatch)
             if self.point == "client_close":
                 self.items.append(await anext(stream))
                 raise self.own
@@ -1592,6 +1662,9 @@ class _RawEnd:
         self.items.append(await anext(stream))
         if self.point == "behind_body":
             raise self.own
+        if isinstance(self.source, _SyncPullHeld):
+            await self._close_held_pull(stream, self.source)
+            return
         if isinstance(self.transport, _RaisesWhenCancelled):
             reader = asyncio.ensure_future(self._read_on(stream)) if self.point == "conc_close_in_read" else None
             await reached(self.transport.sending)
@@ -1610,6 +1683,16 @@ class _RawEnd:
                 return
         await self._read_on(stream)
 
+    async def _close_held_pull(self, stream: OperationStream[Any], source: _SyncPullHeld) -> None:
+        """Close while the source's pull waits in its thread and a read in another task waits for it; then let it go."""
+        reader = asyncio.ensure_future(self._read_on(stream))
+        await asyncio.to_thread(source.entered.wait, HANG_BOUND)
+        closing = asyncio.ensure_future(self._close(stream))
+        await _turns()  # the close has cancelled what waits for the pull
+        source.release.set()
+        await closing
+        self.readers.append(await _settled(reader))
+
     async def _read_on(self, stream: OperationStream[Any]) -> None:
         async for item in stream:
             self.items.append(item)  # one by one: the items read before it is raised count too
@@ -1627,22 +1710,18 @@ async def _turns() -> None:
         await asyncio.sleep(0)
 
 
-@pytest.mark.parametrize(
-    ("family", "point"),
-    [
-        (family, point)
-        for family in FAMILIES
-        for point in RAW_POINTS
-        if not (point in SENT_BETWEEN_READS and family in {"batch", "batch_outcomes"})
-    ],
-)
-def test_a_base_exception_that_is_no_interrupt_reaches_the_reader_as_python_raises_it(family: str, point: str) -> None:
+@pytest.mark.parametrize(("family", "point", "dispatch"), RAW_CASES)
+def test_a_base_exception_that_is_no_interrupt_reaches_the_reader_as_python_raises_it(
+    family: str, point: str, dispatch: str
+) -> None:
     # It is no failure: no family classifies, wraps or ranks it, nor makes it an outcome, and it is never lost. The
     # reader gets it as it is, exactly once: from the read it ended, or else from the close, as a ``finally`` raises
-    # it, the close a read waiting in another task makes included (that read is cancelled). The source is closed once,
-    # nothing hangs, and nothing reaches the event loop: no handler call, no task left with its exception unretrieved.
-    # Behind the caller's own exception it has that as its context. Neither its report nor its rank is promised.
-    run = _RawEnd(family, point)
+    # it, the close a read waiting in another task makes included (that read is cancelled), whatever caught it on the
+    # way (a binding, a batch sender whose pages the close cancelled, a pull's worker thread). The source is closed
+    # once, nothing hangs, and nothing reaches the event loop: no handler call, no task left with its exception
+    # unretrieved. Behind the caller's own exception it has that as its context. Neither its report nor its rank is
+    # promised.
+    run = _RawEnd(family, point, dispatch)
     error = raised_by_asyncio_run(run.main)
     gc.collect()  # a task left with its exception unretrieved reports it as it is collected
     assert isinstance(error, _NotAnInterruptError)
@@ -1655,11 +1734,135 @@ def test_a_base_exception_that_is_no_interrupt_reaches_the_reader_as_python_rais
         assert error is run.transport.raised[0]
     else:
         assert str(error) == point
-    if point == "conc_close_in_read":
+    if point in {"conc_close_in_read", "sync_pull_cancelled"}:
         assert len(run.readers) == 1
         assert isinstance(run.readers[0], asyncio.CancelledError)
     if point in {"behind_body", "client_close"}:
         assert error.__context__ is run.own
+
+
+# Loop turns between binding 1's send raising it and the close: the close comes before the read's task ends in it,
+# after that but before the reader resumes, and after.
+RACE_TURNS = 60
+
+
+class _RawRace:
+    """A read on in another task, binding 1's send raising it, and a close ``turns`` loop turns later."""
+
+    def __init__(self, family: str, turns: int) -> None:
+        self.family = family
+        self.turns = turns
+        self.transport = _InterruptsBetweenReads(_NotAnInterruptError)
+        self.source = _Source(family, "returns")
+        self.reported: list[str] = []
+        self.read: BaseException | None = None
+        self.closed: BaseException | None = None
+
+    async def main(self) -> None:
+        asyncio.get_running_loop().set_exception_handler(
+            lambda _loop, context: self.reported.append(context["message"])
+        )
+        async with client_for(ResponderTransport(self.transport), policy=POLICIES["returns"]) as client:
+            stream = _stream(client, self.family, self.source, DirectDispatch(concurrency=2))
+            await anext(stream)
+            reader = asyncio.ensure_future(_settled(self._read_on(stream)))
+            self.transport.between.set()
+            for _turn in range(self.turns):
+                await asyncio.sleep(0)
+            self.closed = await _settled(stream.aclose())
+            self.read = await reader
+
+    @staticmethod
+    async def _read_on(stream: OperationStream[Any]) -> None:
+        async for _item in stream:
+            pass
+
+
+@pytest.mark.parametrize("family", REFERENCE_FAMILIES)
+def test_a_base_exception_a_read_ends_in_reaches_that_read_or_a_concurrent_close_once(family: str) -> None:
+    # A read waits in another task when binding 1's send raises it, and the stream is closed after one number of loop
+    # turns, then the next: the read's task may have ended in it already, its reader not resumed yet. Whoever comes
+    # first gets it, exactly once: the read, or else the close, which cancels the read. Both come first in the sweep.
+    # The source is closed once, and nothing reaches the event loop.
+    firsts: set[str] = set()
+    for turns in range(RACE_TURNS):
+        run = _RawRace(family, turns)
+        asyncio.run(run.main())
+        gc.collect()
+        assert run.reported == [], turns
+        assert run.source.closes == 1, turns
+        raised = run.transport.raised
+        got = [end for end, error in (("read", run.read), ("close", run.closed)) if raised and error is raised[0]]
+        assert len(got) == len(raised) == 1, (turns, run.read, run.closed)
+        firsts.update(got)
+        if got == ["close"]:
+            assert run.read is None or isinstance(run.read, asyncio.CancelledError), turns
+        else:
+            assert run.closed is None, turns
+    assert firsts == {"read", "close"}
+
+
+class _TailWavesRaiseWhenCancelled:
+    """Serve a counted traversal's head and first tail pages; hold every later one, which raises it once cancelled."""
+
+    ROWS = 1001
+    WIDTH = 50
+    SERVED = frozenset({0, 50, 100})
+
+    def __init__(self) -> None:
+        self.raised: list[BaseException] = []
+
+    async def __call__(self, method: str, query: Query) -> Envelope:
+        del method
+        offset = int(str(query.get("start", "0")))
+        if offset not in self.SERVED:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                error = _NotAnInterruptError(f"cancelled tail page {offset}")
+                self.raised.append(error)
+                raise error from None
+        rows = [{"ID": row + 1} for row in range(offset, min(offset + self.WIDTH, self.ROWS))]
+        envelope: Envelope = {"result": rows, "total": self.ROWS}
+        if offset + self.WIDTH < self.ROWS:
+            envelope["next"] = offset + self.WIDTH
+        return envelope
+
+
+@pytest.mark.parametrize("turns", [3, 30])
+def test_a_base_exception_a_counted_tail_page_the_close_cancelled_raises_is_the_closes(turns: int) -> None:
+    # A counted traversal's dense tail sends its pages in batches ahead of the reader, delivered as they are ready. The
+    # reader stops reading with tail pages in flight and closes the stream; a page the close cancels raises it. No
+    # read gets it, so the close raises it, once; the source is closed once, and nothing reaches the event loop.
+    answer = _TailWavesRaiseWhenCancelled()
+    source = _Source("iter_references", "returns", count=1)
+    reported: list[str] = []
+    read: list[object] = []
+
+    async def main() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
+        async with client_for(BatchPortal(answer)) as client:
+            stream = client.iter_references(
+                LIST_REQUEST,
+                source,
+                traversal=CountedTraversal(page_size=answer.WIDTH),
+                dispatch=BatchDispatch(batch_size=3, coalesce_wait=0.0),
+                policy=ExecutionPolicy(max_active_references=1, max_elapsed=60.0),
+            )
+            async for item in stream:
+                read.append(item)
+                if len(read) > answer.WIDTH:
+                    break
+            for _turn in range(turns):
+                await asyncio.sleep(0)
+            await stream.aclose()
+
+    error = raised_by_asyncio_run(main)
+    gc.collect()
+    assert len(answer.raised) == 1
+    assert error is answer.raised[0]
+    assert reported == []
+    assert source.closes == 1
 
 
 @pytest.mark.filterwarnings("ignore:coroutine .* was never awaited:RuntimeWarning")
@@ -2182,12 +2385,13 @@ def test_an_interrupt_an_inline_kernels_send_raises_ends_the_operation_in_one_sh
 
 
 class _AsyncClosesLate:
-    """A caller's source whose close outlives the cleanup window, resisting its cancellation, then is interrupted."""
+    """A caller's source whose close outlives the cleanup window, resisting its cancellation, then raises ``escape``."""
 
-    def __init__(self, family: str, interrupt: type[BaseException]) -> None:
+    def __init__(self, family: str, escape: type[BaseException]) -> None:
         self._items = iter(_items(family))
-        self._interrupt = interrupt
+        self._escape = escape
         self.release = asyncio.Event()
+        self.raised: list[BaseException] = []
 
     def __aiter__(self) -> _AsyncClosesLate:
         return self
@@ -2202,16 +2406,18 @@ class _AsyncClosesLate:
         while not self.release.is_set():
             with contextlib.suppress(asyncio.CancelledError):
                 await self.release.wait()
-        raise self._interrupt("late close")
+        self.raised.append(self._escape("late close"))
+        raise self.raised[-1]
 
 
 class _SyncClosesLate:
-    """``_AsyncClosesLate`` as a synchronous iterator: its close waits in its worker thread, then is interrupted."""
+    """``_AsyncClosesLate`` as a synchronous iterator: its close waits in its worker thread, then raises ``escape``."""
 
-    def __init__(self, family: str, interrupt: type[BaseException]) -> None:
+    def __init__(self, family: str, escape: type[BaseException]) -> None:
         self._items = iter(_items(family))
-        self._interrupt = interrupt
+        self._escape = escape
         self.release = threading.Event()
+        self.raised: list[BaseException] = []
 
     def __iter__(self) -> _SyncClosesLate:
         return self
@@ -2221,51 +2427,104 @@ class _SyncClosesLate:
 
     def close(self) -> None:
         self.release.wait(HANG_BOUND)
-        raise self._interrupt("late close")
+        self.raised.append(self._escape("late close"))
+        raise self.raised[-1]
 
 
-@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+class _Handler:
+    """The event loop's exception handler: it keeps every context it gets."""
+
+    def __init__(self) -> None:
+        self.contexts: list[dict[str, object]] = []
+        self.arrived = asyncio.Event()
+
+    def __call__(self, _loop: asyncio.AbstractEventLoop, context: dict[str, object]) -> None:
+        self.contexts.append(context)
+        self.arrived.set()
+
+
+async def _handed_on(handler: _Handler) -> None:
+    """Wait until the event loop's exception handler got something, then a few turns more for anything after it.
+
+    An interrupt stops the loop instead, out of ``asyncio.run``.
+    """
+    async with asyncio.timeout(HANG_BOUND):
+        await handler.arrived.wait()
+    await _turns()
+
+
+def _handed_late(
+    escape: type[BaseException], main: Callable[[], Coroutine[Any, Any, None]], raised: list[BaseException]
+) -> None:
+    """Run ``main``, which ends an operation and then lets its work raise ``escape``: no read or close raises it.
+
+    An interrupt leaves the event loop out of ``asyncio.run``, as any task's interrupt does. Any other escape goes to
+    the loop's exception handler, once, with that very object.
+    """
+    if is_interrupt(escape("probe")):
+        with pytest.raises(escape, match="late"):
+            asyncio.run(main())
+        return
+    asyncio.run(main())
+    assert len(raised) == 1
+
+
+@pytest.mark.parametrize("escape", [KeyboardInterrupt, SystemExit, _NotAnInterruptError])
 @pytest.mark.parametrize("kind", ["async", "sync"])
 @pytest.mark.parametrize("family", ["fan_out", "batch"])
-def test_an_interrupt_raised_after_the_operation_ended_stops_the_loop(
-    family: str, kind: str, interrupt: type[BaseException]
+def test_an_escape_raised_after_the_operation_ended_goes_to_the_event_loop_once(
+    family: str, kind: str, escape: type[BaseException]
 ) -> None:
     # The source's close outlives the cleanup window: the stream ends without it (a cleanup overrun) and its operation
-    # raises nothing more. The close then raises an interrupt, which nobody would raise any longer: it is not kept
-    # but leaves the event loop out of asyncio.run, as any task's interrupt does.
-    reported: list[str] = []
+    # raises nothing more. The close then raises an escape, which nobody would raise any longer: it is not kept but
+    # goes to the event loop: an interrupt leaves it out of asyncio.run, and any other reaches its exception handler,
+    # once, with the stream's report.
+    handler = _Handler()
     got: list[type[BaseException]] = []
-    source = _AsyncClosesLate(family, interrupt) if kind == "async" else _SyncClosesLate(family, interrupt)
+    streams: list[OperationStream[Any]] = []
+    source = _AsyncClosesLate(family, escape) if kind == "async" else _SyncClosesLate(family, escape)
 
     async def main() -> None:
-        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
+        asyncio.get_running_loop().set_exception_handler(handler)
         try:
             async with client_for(ResponderTransport(_answer), policy=POLICIES["overruns"]) as client:
                 stream = _stream(client, family, source)
+                streams.append(stream)
                 try:
                     async for _item in stream:
                         pass
                 except Exception as error:  # noqa: BLE001 - the test inspects what the reader got
                     got.append(type(error))
                 source.release.set()
-                await asyncio.sleep(HANG_BOUND)
+                await _handed_on(handler)
         finally:
             source.release.set()
 
-    with pytest.raises(interrupt, match="late close"):
-        asyncio.run(main())
+    _handed_late(escape, main, source.raised)
     gc.collect()
     assert got == [_raised_for(family, "overruns")]
-    assert reported == []
+    _assert_handed(handler.contexts, escape, source.raised, streams[0].report)
+
+
+def _assert_handed(
+    handed: list[dict[str, object]], escape: type[BaseException], raised: list[BaseException], report: object
+) -> None:
+    """Nothing reached the loop's exception handler but a late escape that is no interrupt, once, with the report."""
+    if is_interrupt(escape("probe")):
+        assert handed == []
+        return
+    assert [context["exception"] for context in handed] == raised
+    assert handed[0]["report"] is report
 
 
 class _SendInterruptedLate:
-    """Answer the first command; block the second's send, ignoring its cancellation, until released, then interrupt."""
+    """Answer the first command; hold the second's send, ignoring its cancellation, until released; raise ``escape``."""
 
-    def __init__(self, interrupt: type[BaseException]) -> None:
-        self._interrupt = interrupt
+    def __init__(self, escape: type[BaseException]) -> None:
+        self._escape = escape
         self.started = asyncio.Event()
         self.release = asyncio.Event()
+        self.raised: list[BaseException] = []
 
     async def __call__(self, request: Request) -> object:
         if request.method != "batch" and request.copy_parameters().get("id") == 0:
@@ -2274,28 +2533,31 @@ class _SendInterruptedLate:
         while not self.release.is_set():
             with contextlib.suppress(asyncio.CancelledError):
                 await self.release.wait()
-        raise self._interrupt("late send")
+        self.raised.append(self._escape("late send"))
+        raise self.raised[-1]
 
 
-@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("escape", [KeyboardInterrupt, SystemExit, _NotAnInterruptError])
 @pytest.mark.parametrize(
     "dispatch", [DirectDispatch(concurrency=2), BatchDispatch(batch_size=1, concurrency=2)], ids=["direct", "batch"]
 )
-def test_an_interrupt_a_send_raises_after_the_operation_ended_stops_the_loop(
-    dispatch: DirectDispatch | BatchDispatch, interrupt: type[BaseException]
+def test_an_escape_a_send_raises_after_the_operation_ended_goes_to_the_event_loop_once(
+    dispatch: DirectDispatch | BatchDispatch, escape: type[BaseException]
 ) -> None:
     # A send outlives the cleanup window (its binding's task, or the batch sender, ignores the cancellation): the
-    # stream's close ends without it (a cleanup overrun), and the interrupt it raises afterwards leaves the event loop
-    # out of asyncio.run.
-    reported: list[str] = []
+    # stream's close ends without it (a cleanup overrun), and the escape it raises afterwards goes to the event loop:
+    # an interrupt leaves it out of asyncio.run, and any other reaches its exception handler, once.
+    handler = _Handler()
     got: list[type[BaseException]] = []
-    transport = _SendInterruptedLate(interrupt)
+    streams: list[OperationStream[Any]] = []
+    transport = _SendInterruptedLate(escape)
 
     async def main() -> None:
-        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
+        asyncio.get_running_loop().set_exception_handler(handler)
         try:
             async with client_for(ResponderTransport(transport), policy=POLICIES["overruns"]) as client:
                 stream = client.fan_out_outcomes(_items("fan_out_outcomes"), dispatch=dispatch)
+                streams.append(stream)
                 read = asyncio.create_task(_settled(anext(stream)))
                 await reached(transport.started)
                 closed = await _settled(stream.aclose())
@@ -2303,15 +2565,14 @@ def test_an_interrupt_a_send_raises_after_the_operation_ended_stops_the_loop(
                 got.append(type(closed))
                 await read
                 transport.release.set()
-                await asyncio.sleep(HANG_BOUND)
+                await _handed_on(handler)
         finally:
             transport.release.set()
 
-    with pytest.raises(interrupt, match="late send"):
-        asyncio.run(main())
+    _handed_late(escape, main, transport.raised)
     gc.collect()
     assert got == [CleanupOverrunError]
-    assert reported == []
+    _assert_handed(handler.contexts, escape, transport.raised, streams[0].report)
 
 
 class _OwnError(Exception):

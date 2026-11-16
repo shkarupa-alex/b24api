@@ -36,7 +36,7 @@ from b24api.execution import (
     WorkClass,
     rearm_cancellation,
 )
-from b24api.execution.context import InterruptLatch, LatchState, is_interrupt, settle
+from b24api.execution.context import LatchState, OperationLatch, is_interrupt, settle
 from b24api.execution.rate import (
     CoordinatorBudgetError,
     DeadlineBudget,
@@ -1186,7 +1186,7 @@ def test_a_closed_latch_hands_each_late_interrupt_to_the_event_loop_once() -> No
         call_soon = loop.call_soon
         loop.call_soon = lambda _callback, *args, **_kwargs: handed.append(args)  # type: ignore[assignment,method-assign]
         try:
-            latch = InterruptLatch()
+            latch = OperationLatch()
             own = KeyboardInterrupt("own")
             latch.record(own)
             assert latch.close() is own
@@ -1211,12 +1211,12 @@ def test_a_latch_wakes_its_owner_only_while_the_operation_runs() -> None:
         call_soon = loop.call_soon
         loop.call_soon = lambda _callback, *args, **_kwargs: handed.append(args)  # type: ignore[assignment,method-assign]
         try:
-            running = InterruptLatch(lambda: woken.append(True))
+            running = OperationLatch(lambda: woken.append(True))
             first = KeyboardInterrupt("first")
             running.record(first)
             running.record(SystemExit("second"))
             assert (running.first, woken) == (first, [True])
-            ending = InterruptLatch(lambda: woken.append(False))
+            ending = OperationLatch(lambda: woken.append(False))
             ending.end()
             ending.record(first)
             assert (ending.first, ending.state, woken) == (first, LatchState.ENDING, [True])
@@ -1226,6 +1226,43 @@ def test_a_latch_wakes_its_owner_only_while_the_operation_runs() -> None:
         finally:
             loop.call_soon = call_soon  # type: ignore[method-assign]
         assert handed == [(first,)]
+
+    asyncio.run(main())
+
+
+class _Escape(BaseException):
+    """A ``BaseException`` that is neither an interrupt nor a cancellation."""
+
+
+def test_a_latch_raises_the_first_undelivered_escape_once_and_hands_the_rest_to_the_event_loop() -> None:
+    # An escape that is no interrupt stays undelivered until the operation's end, whoever records it how often. The
+    # end takes the first, once; it hands every other to the event loop's exception handler, as it does one caught
+    # after the end, once each, with the report, and never the one it raised. Behind an interrupt, which the end
+    # raises, every one is handed on. A failure, a cancellation and a coroutine's close are not the latch's.
+    handled: list[dict[str, object]] = []
+
+    async def main() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: handled.append(context))
+        latch = OperationLatch()
+        first, second, late = _Escape("first"), _Escape("second"), _Escape("late")
+        for error in (first, first, second, asyncio.CancelledError(), GeneratorExit(), RuntimeError("failure"), None):
+            latch.record(error)
+        assert latch.pending() is first
+        latch.report = report = object()
+        assert latch.close() is first
+        assert latch.close() is None
+        for error in (late, late, first, second):
+            latch.record(error)
+        assert [context["exception"] for context in handled] == [second, late]
+        assert all(context["report"] is report for context in handled)
+        handled.clear()
+        behind = OperationLatch()
+        interrupt, raw = KeyboardInterrupt("first"), _Escape("behind")
+        behind.record(raw)
+        behind.record(interrupt)
+        assert behind.close() is interrupt
+        assert behind.close() is interrupt
+        assert [context["exception"] for context in handled] == [raw]
 
     asyncio.run(main())
 

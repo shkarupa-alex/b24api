@@ -24,7 +24,7 @@ from b24api.contracts import Command
 from b24api.contracts.policy import ExecutionPolicy, IdentityCoercion, KernelState
 from b24api.contracts.request import IdentitySpec
 from b24api.execution import Executor, WireResponse
-from b24api.execution.context import latch_interrupt
+from b24api.execution.context import latch_escape
 from b24api.execution.lifecycle import CleanupAttempt, LifecycleHooks, OperationRunner, TerminalCause, kernel_terminal
 from b24api.execution.snapshot import KernelReport
 from b24api.references.outcome import ReferenceRequest
@@ -759,7 +759,7 @@ def test_a_read_whose_own_task_latched_an_interrupt_raises_it_instead_of_its_ite
     got: list[object] = []
 
     async def body() -> AsyncIterator[int]:
-        latch_interrupt(interrupt)
+        latch_escape(interrupt)
         yield 1
 
     async def cleanup() -> None:
@@ -836,7 +836,7 @@ class _BetweenReads:
     async def _latch_later(self) -> None:
         await self.go.wait()
         self.latching.set()
-        latch_interrupt(self.interrupt)
+        latch_escape(self.interrupt)
         for step in self.after_latch:
             await step()
 
@@ -850,7 +850,7 @@ class _BetweenReads:
         self.cleaning.set()
         await self.release.wait()
         for interrupt in self.latched_in_cleanup:
-            latch_interrupt(interrupt)
+            latch_escape(interrupt)
 
     async def read_one(self) -> None:
         """Read the one item, let the work latch the interrupt, and go on working past the event loop's raise."""
