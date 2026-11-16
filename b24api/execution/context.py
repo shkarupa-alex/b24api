@@ -511,9 +511,10 @@ class OperationLatch:
         # The operation's published report, for an escape handed to the event loop after it.
         self.report: object | None = None
         self._wake = wake
-        # The escapes caught and not raised yet, in the order they were caught.
+        # The escapes caught and not raised yet, in the order they were caught: one each catcher records.
         self._undelivered: list[BaseException] = []
-        # The escapes that are out: raised by the operation's end, or handed to the event loop.
+        # The escapes that are out, each once however many catchers record it: raised by the operation's end, or
+        # handed to the event loop.
         self._out: list[BaseException] = []
 
     def end(self) -> None:
@@ -539,16 +540,12 @@ class OperationLatch:
             self.hand_on(error)
         return raised
 
-    def pending(self) -> BaseException | None:
-        """Return the first undelivered escape, still undelivered: what the operation's end will raise."""
-        return self._undelivered[0] if self._undelivered else None
-
     def record(self, error: BaseException | None) -> None:
-        """Latch ``error`` when it is an escape this latch does not hold yet; anything else is not this latch's.
+        """Latch ``error`` when it is an escape; anything else is not this latch's.
 
-        Once the operation's end is out, an escape goes to the event loop instead.
+        Once the operation's end is out, an escape goes to the event loop instead, unless the end raised it.
         """
-        if error is None or not is_escape(error) or self._holds(error):
+        if error is None or not is_escape(error) or error is self.first:
             return
         if self.state is LatchState.CLOSED:
             self.hand_on(error)
@@ -576,10 +573,6 @@ class OperationLatch:
         if self.report is not None:
             context["report"] = self.report
         loop.call_exception_handler(context)
-
-    def _holds(self, error: BaseException) -> bool:
-        """Whether ``error`` is this latch's already: latched, undelivered or out."""
-        return error is self.first or any(held is error for held in (*self._undelivered, *self._out))
 
 
 def _raise(error: BaseException) -> None:

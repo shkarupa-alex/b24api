@@ -602,15 +602,14 @@ class OperationRunner[T, R: _Report]:
 
         Every end of the stream raises the interrupt, ahead of whatever else would leave: the read or close that ended
         it and a read a concurrent close ended. Without one, the first end raises the first undelivered escape, as
-        from a ``finally``. Only the latch's owner closes it: a runner reading inline in its operation's read ends as
-        it would otherwise, so the operation's report keeps what ended it first, and its owner raises the interrupt;
-        it raises the undelivered escape, which its owner's end then raises as it propagates there. One handed to the
-        event loop between reads never gets here: no read or close ends that operation (``_end_between_reads``). Once
-        closed, the latch keeps nothing: an escape caught later goes to the event loop (``OperationLatch.record``).
+        from a ``finally``. Only the latch's owner raises: a runner reading inline in its operation's read ends as it
+        would otherwise, so the operation's report keeps what ended it first, and its owner raises the escape. One
+        handed to the event loop between reads never gets here: no read or close ends that operation
+        (``_end_between_reads``). Once closed, the latch keeps nothing: an escape caught later goes to the event loop
+        (``OperationLatch.record``).
         """
         latch = self._latch()
-        escape = latch.close() if latch is self._own_latch else latch.pending()
-        if escape is not None:
+        if latch is self._own_latch and (escape := latch.close()) is not None:
             if self._report is not None:
                 self._hooks.attach(escape, self._report)
             raise escape
