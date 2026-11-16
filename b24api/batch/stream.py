@@ -215,6 +215,9 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
                 context=self._context,
             )
             if not chunk.commands:
+                # The source has ended. The operation ends with its budget if the budget refused work, as a reference
+                # operation's does; a deadline that passed with nothing left to admit refused none.
+                self._context.raise_if_refused()
                 break
             self._chunk = _ChunkRead(range(next_index, next_index + len(chunk.commands)))
             next_index += len(chunk.commands)

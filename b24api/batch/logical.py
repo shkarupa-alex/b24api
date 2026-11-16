@@ -238,6 +238,9 @@ class LogicalBatchKernelStream[C]:
         while True:
             chunk = await self._read_chunk(controller, next_index)
             if not chunk.commands:
+                # The source has ended. The operation ends with its budget if the budget refused work, as a reference
+                # operation's does; a deadline that passed with nothing left to admit refused none.
+                self._context.raise_if_refused()
                 break
             next_index += len(chunk.commands)
             self.admitted += len(chunk.commands)
