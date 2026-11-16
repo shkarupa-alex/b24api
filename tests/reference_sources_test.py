@@ -843,6 +843,7 @@ async def test_ahomo_sources_of_one_template_trace_exactly_like_the_homogeneous_
     )
 
 
+@pytest.mark.usefixtures("coalescing")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("api", ["references", "sources"])
 @pytest.mark.parametrize(
@@ -861,7 +862,9 @@ async def test_the_operation_policy_bounds_every_reference_operation_s_dispatch(
     bound: int,
 ) -> None:
     # The dispatch asks for more than the policy allows: a batch holds at most max_buffered_commands, and direct
-    # pages in flight are at most max_direct_concurrency, whichever API built the operation.
+    # pages in flight are at most max_direct_concurrency, whichever API built the operation. The bindings arrive on
+    # the loop and a wave coalesces by loop turns (``VirtualClock``), so the dispatch reaches the bound by
+    # construction, on any machine: the policy, not a slow source, is what holds it there.
     in_flight, peak = 0, 0
 
     async def answer(_method: str, query: Query) -> Envelope:
@@ -883,10 +886,10 @@ async def test_the_operation_policy_bounds_every_reference_operation_s_dispatch(
     client = Bitrix24(Settings(webhook_url="https://fixture.invalid/rest/1/token/"), transport=portal, policy=policy)
     async with client:
         stream = (
-            client.iter_reference_outcomes(request, bindings, traversal=BETA, dispatch=dispatch)
+            client.iter_reference_outcomes(request, on_loop(bindings), traversal=BETA, dispatch=dispatch)
             if api == "references"
             else client.iter_reference_source_outcomes(
-                [ReferenceSource(request, BETA, binding) for binding in bindings], dispatch=dispatch
+                on_loop([ReferenceSource(request, BETA, binding) for binding in bindings]), dispatch=dispatch
             )
         )
         outcomes = [outcome async for outcome in stream]

@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 import pytest
 import pytest_asyncio
 
-from tests.scripting import HOST, ResponderTransport, client_for
+from tests.scripting import HOST, ResponderTransport, VirtualClock, client_for
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -44,3 +44,14 @@ async def scripted_client() -> AsyncIterator[Callable[..., Bitrix24]]:
     yield build
     for client in clients:
         await client.aclose()
+
+
+@pytest.fixture
+def coalescing(monkeypatch: pytest.MonkeyPatch) -> VirtualClock:
+    """Make coalescing structural: a wave waits for the pages a bounded number of loop turns brings, not wall time.
+
+    A test that reads which commands share a physical batch also feeds its bindings on the loop (``on_loop``): a
+    list is pulled in a worker thread, so when each binding arrives would depend on thread scheduling. Together,
+    loop turns alone set each batch's composition, on any machine and under any load.
+    """
+    return VirtualClock().install(monkeypatch)

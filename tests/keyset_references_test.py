@@ -85,7 +85,7 @@ from b24api.references.dispatch import _RowBuffer
 from b24api.transport import WireResponse
 from b24api.traversal.keyset_fast_plan import fit_wave
 from b24api.traversal.keyset_runtime import KeysetRuntime
-from tests.scripting import HANG_BOUND, BatchPortal, ResponderTransport, VirtualClock, client_for
+from tests.scripting import HANG_BOUND, BatchPortal, ResponderTransport, client_for, on_loop
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -569,6 +569,7 @@ async def test_a_wave_whose_replay_fails_settles_each_page_from_its_own_command(
     ]
 
 
+@pytest.mark.usefixtures("coalescing")
 @pytest.mark.asyncio
 async def test_sequential_pages_of_a_chunk_whose_replay_fails_settle_and_trace_from_their_own_commands(
     monkeypatch: pytest.MonkeyPatch,
@@ -605,7 +606,7 @@ async def test_sequential_pages_of_a_chunk_whose_replay_fails_settle_and_trace_f
     async with client_for(ResponderTransport(respond, host=portal.host)) as client:
         outcomes, report = await _drain(
             client.iter_reference_outcomes(
-                _base(), [_parent("p0"), _parent("p1")], traversal=_traversal(SequentialKeysetExecution())
+                _base(), on_loop([_parent("p0"), _parent("p1")]), traversal=_traversal(SequentialKeysetExecution())
             )
         )
 
@@ -1391,15 +1392,6 @@ async def test_a_keyset_command_its_own_budget_stops_fails_also_once_the_operati
 # --- A keyset page's batch index ---------------------------------------------------------------------
 
 
-@pytest.fixture
-def coalescing(monkeypatch: pytest.MonkeyPatch) -> VirtualClock:
-    """Make coalescing structural: a wave waits for the pages a bounded number of loop turns brings, not wall time.
-
-    The tests that read which commands share a physical batch hold on a loaded machine too.
-    """
-    return VirtualClock().install(monkeypatch)
-
-
 async def _indexed(
     portal: BatchPortal, execution: Execution, parents: int, policy: ExecutionPolicy | None = None
 ) -> list[tuple[int | None, str | None, int | None]]:
@@ -1410,7 +1402,7 @@ async def _indexed(
     async with client_for(portal, policy=policy or ExecutionPolicy(page_trace_limit=1024)) as client:
         stream = client.iter_reference_outcomes(
             request,
-            [_parent(f"p{index}") for index in range(parents)],
+            on_loop([_parent(f"p{index}") for index in range(parents)]),
             traversal=_traversal(execution),
             dispatch=BatchDispatch(),
         )
@@ -1557,7 +1549,7 @@ async def test_a_rejected_keyset_reference_page_records_its_index_in_the_shared_
     async with client_for(portal, policy=ExecutionPolicy(page_trace_limit=1024)) as client:
         stream = client.iter_reference_outcomes(
             _base(),
-            [_parent(f"p{index}") for index in range(4)],
+            on_loop([_parent(f"p{index}") for index in range(4)]),
             traversal=_traversal(AutoKeysetExecution(_CONTRACT)),
             dispatch=BatchDispatch(),
         )
@@ -1689,7 +1681,7 @@ async def test_a_reference_descending_finish_page_the_admission_frontier_refuses
     async with client_for(portal, policy=ExecutionPolicy(page_trace_limit=1024)) as client:
         stream = client.iter_reference_outcomes(
             _base(),
-            [_parent(f"p{index}") for index in range(3)],
+            on_loop([_parent(f"p{index}") for index in range(3)]),
             traversal=_descending(AutoKeysetExecution(_CONTRACT)),
             dispatch=BatchDispatch(),
         )
@@ -1763,7 +1755,7 @@ async def test_a_shared_keyset_batch_that_fails_as_a_whole_traces_each_page_the_
     ) as client:
         stream = client.iter_reference_outcomes(
             _base(),
-            [_parent(f"p{index}") for index in range(3)],
+            on_loop([_parent(f"p{index}") for index in range(3)]),
             traversal=_traversal(AutoKeysetExecution(_CONTRACT)),
             dispatch=BatchDispatch(),
         )
@@ -1791,7 +1783,7 @@ async def test_a_shared_keyset_wave_split_over_two_batches_traces_its_answered_p
     async with client_for(_failing(portal, 2, _UNDECODABLE), policy=ExecutionPolicy(page_trace_limit=1024)) as client:
         stream = client.iter_reference_outcomes(
             _base(),
-            [_parent(f"p{index}") for index in range(3)],
+            on_loop([_parent(f"p{index}") for index in range(3)]),
             traversal=_traversal(AutoKeysetExecution(_CONTRACT)),
             dispatch=BatchDispatch(batch_size=5),
         )
