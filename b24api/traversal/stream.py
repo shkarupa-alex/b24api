@@ -140,6 +140,11 @@ class ItemStream(AsyncIterator[JsonValue]):
         return self._context
 
     @property
+    def cleanup_failure(self) -> BaseException | None:
+        """Return the cleanup failure this stream raised as its end (``OperationRunner.cleanup_failure``)."""
+        return self._runner.cleanup_failure
+
+    @property
     def completion_gate(self) -> object:
         """Return live bounded evidence for the sequential traversal family."""
         return None if self._completion is None else self._completion.gate
@@ -277,7 +282,7 @@ class ItemStream(AsyncIterator[JsonValue]):
                 terminal_reason=self._driver.terminal_reason,
                 qualified_total=self._driver.expected_total,
             )
-        self.report = with_cleanup_attempt(self.report, cause, attempt, subject="pagination")
+        self.report = with_cleanup_attempt(self.report, cause, attempt)
         if self._completion is not None:
             failed = cleanup_failed(cause, attempt)
             self._completion.cleanup(CleanupState.FAILURE if failed else CleanupState.SUCCESS)
@@ -286,7 +291,7 @@ class ItemStream(AsyncIterator[JsonValue]):
     def _failure_report(self, cause: TerminalCause, reason: str, attempt: CleanupAttempt) -> KernelReport:
         # The finalizer raised: publish the fallback as this kernel's report and close its completion gate,
         # so a public adapter over it can still publish its one FAILED report.
-        self.report = failed_kernel_report(cause, reason, attempt, subject="pagination")
+        self.report = failed_kernel_report(cause, reason, attempt)
         if self._completion is not None:
             self._completion.gate.close_after_failure(
                 CleanupState.FAILURE if cleanup_failed(cause, attempt) else CleanupState.SUCCESS

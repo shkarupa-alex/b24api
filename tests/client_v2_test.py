@@ -1115,8 +1115,21 @@ async def test_tolerant_batch_distinguishes_user_source_failure_from_local_item_
     assert isinstance(local_outcome, CommandNotExecuted)
     assert local_outcome.correlation is correlation
     assert local_outcome.reason is NotExecutedReason.LOCAL_VALIDATION_FAILED
-    with pytest.raises(InputSourceError):
+    with pytest.raises(InputSourceError) as refused:
         await anext(local)
+    assert type(refused.value.__cause__) is TypeError
+
+    # The source raising a ``TypeError`` of its own is its failure, not the refusal of an item it yielded.
+    def type_failing_source() -> Iterator[Command[object]]:
+        yield Command(Request("test.get", route=RouteKind.BARE), correlation)
+        raise TypeError("caller source failed")
+
+    own = _client(transport).batch_outcomes(type_failing_source(), batch_size=2)
+    own_outcome = await anext(own)
+    assert isinstance(own_outcome, CommandNotExecuted)
+    assert own_outcome.reason is NotExecutedReason.SOURCE_FAILED
+    with pytest.raises(InputSourceError):
+        await anext(own)
 
 
 @pytest.mark.asyncio

@@ -21,6 +21,7 @@ from b24api.execution import (
     Executor,
     WorkClass,
 )
+from b24api.execution.context import latch_escape
 from b24api.execution.facts import settlement
 from b24api.references.outcome import (
     KernelReferenceFailure,
@@ -36,7 +37,7 @@ if TYPE_CHECKING:
     from b24api.contracts.report import KeysetExecutionReport, KeysetSelectionSummary, PageRecord, Violation
     from b24api.contracts.request import Request
     from b24api.contracts.response import Response
-    from b24api.execution.context import PageReservation
+    from b24api.execution.context import PageReservation, Settled
     from b24api.traversal.plans import (
         KernelBatchDispatch,
         KernelDirectDispatch,
@@ -192,7 +193,7 @@ class _DoneEvent:
 @dataclass(frozen=True, slots=True)
 class _FailureEvent:
     work: _Work
-    error: BaseException
+    error: Exception
     cursor: JsonValue | IdentityValue
     page_state: int
     partial_rows: int
@@ -202,7 +203,19 @@ class _FailureEvent:
     not_executed_reason: NotExecutedReason | None = None
 
 
-type _Event = _PageEvent | _DoneEvent | _FailureEvent
+@dataclass(frozen=True, slots=True)
+class _EndedEvent:
+    """A binding ended in no outcome: its task ended in a ``BaseException`` that is neither a failure nor an interrupt.
+
+    It takes the binding's place in the order its outcome would have, so the reader gets there instead of waiting
+    for an end that never comes, and raises what the task ended in as it is (``_finish_task``). It carries no
+    evidence.
+    """
+
+    work: _Work
+
+
+type _Event = _PageEvent | _DoneEvent | _FailureEvent | _EndedEvent
 
 
 @dataclass(frozen=True, slots=True)
@@ -429,7 +442,7 @@ class _Transit:
     page_reserved: bool
     arrived: bool = False
 
-    def carried_by(self, task: asyncio.Task[_DispatchedPage]) -> None:
+    def carried_by(self, task: asyncio.Future[Settled[_DispatchedPage]]) -> None:
         """End the transit when ``task`` ends, also if it is cancelled before it first runs."""
         task.add_done_callback(self.arrive)
 
@@ -471,7 +484,7 @@ class _DispatchedPage:
 
 @dataclass(slots=True)
 class _AdmissionState:
-    tasks: dict[int, asyncio.Task[None]]
+    tasks: dict[int, asyncio.Task[Settled[None]]]
     queues: dict[int, asyncio.Queue[_Event]]
     ready: asyncio.Queue[_Event]
     slots: asyncio.Semaphore
@@ -1285,13 +1298,17 @@ class _BatchPageDispatcher:
             for item in chunk:
                 item.future.cancel()
             raise
-        except Exception as error:  # noqa: BLE001 - total chunk correlation boundary
+        except BaseException as error:  # noqa: BLE001 - total chunk correlation boundary, an escape's too
             # Every page fails with the chunk's error and keeps what its own command did, which the chunk's
             # progress says at the page's position, whatever failed: a sent page no longer has a deadline to end
-            # its wait.
+            # its wait. An escape (``is_escape``) is no page's outcome: it is the operation's latch's, and reaches
+            # every page's fetch as itself, though the pages a close cancelled no longer deliver it.
+            latch_escape(error)
             for position, item in enumerate(chunk):
                 if not item.future.done():
-                    item.future.set_exception(_ChunkPageError(error, progress, position))
+                    item.future.set_exception(
+                        _ChunkPageError(error, progress, position) if isinstance(error, Exception) else error
+                    )
 
     @staticmethod
     def _correlate(chunk: list[_PendingBatch], outcomes: tuple[BatchOutcome, ...]) -> None:

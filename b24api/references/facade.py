@@ -47,7 +47,6 @@ from b24api.contracts.traversal import (
     TraversalSpec,
 )
 from b24api.errors import (
-    B24ApiError,
     CapabilityError,
     IncompleteTraversalError,
     PageAdaptationError,
@@ -55,6 +54,7 @@ from b24api.errors import (
     ReferenceFailed,
 )
 from b24api.execution.facts import ambiguity_of
+from b24api.execution.failure import outcome_error
 from b24api.references.binding import BindingSource, _BindingContext, _BindingSourceError, binding_source
 from b24api.references.compatibility import source_incompatibility
 from b24api.references.dispatch import (
@@ -101,6 +101,11 @@ class ReferenceKernelStream(Protocol):
     @property
     def operation_context(self) -> ExecutionContext:
         """Return the operation context."""
+        ...
+
+    @property
+    def cleanup_failure(self) -> BaseException | None:
+        """Return the cleanup failure the stream raised as its end."""
         ...
 
     def __aiter__(self) -> Self:
@@ -290,7 +295,7 @@ class _ReferenceEventMapper:
         self._item_indexes.pop(context.index, None)
         if event.not_executed_reason is not None:
             return ReferenceNotExecuted(context.index, context.correlation, event.not_executed_reason)
-        error = event.error if isinstance(event.error, B24ApiError) else CapabilityError("reference failed")
+        error = outcome_error(event.error, "reference failed")
         # The variant follows the execution facts of the page that failed, as for a fan-out command.
         ambiguity = ambiguity_of(
             error,

@@ -15,7 +15,7 @@ from b24api.contracts.policy import (
 from b24api.contracts.positional import PositionalControlError
 from b24api.contracts.request import IdentitySpec, ParameterPath, Request, TraversalIdentity
 from b24api.contracts.response import Response, inject_controls
-from b24api.errors import CapabilityError, PaginationError
+from b24api.errors import CapabilityError
 from b24api.traversal.identity_ledger import _ExternalIdentityStore
 from b24api.traversal.plans import (
     ContinuationPlan,
@@ -36,7 +36,6 @@ if TYPE_CHECKING:
 
     from b24api.contracts.identity_store import IdentityStore
     from b24api.contracts.json import JsonValue
-    from b24api.contracts.report import PageRejectionCode
     from b24api.execution import ExecutionContext
     from b24api.traversal.values import IdentityValue
 
@@ -51,16 +50,6 @@ _PLAN_TYPES = (
     ContinuationPlan,
     InclusiveWindowPlan,
 )
-
-
-class _PageRejectionError(PaginationError):
-    """Pagination error carrying a stable page-evidence category."""
-
-    report_name = "PaginationError"
-
-    def __init__(self, message: str, rejection_code: PageRejectionCode) -> None:
-        self.rejection_code = rejection_code
-        super().__init__(message)
 
 
 class _IdentityStore(Protocol):

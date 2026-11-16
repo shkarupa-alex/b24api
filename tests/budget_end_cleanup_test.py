@@ -434,7 +434,7 @@ async def test_a_cancellation_absorbed_by_cleanup_after_the_budget_is_recorded_o
     assert report is not None
     assert report.state is TerminalState.INCOMPLETE
     assert [violation.message for violation in report.violations if violation.code == "cleanup_failure"] == [
-        "reference cleanup also failed (CancelledError)"
+        "stream cleanup also failed (CancelledError)"
     ]
     assert "budget_exhausted" in _blocking(report)
 
@@ -812,9 +812,8 @@ async def test_a_cancellation_outranks_a_close_that_overruns_its_window(
     # the budget.
     assert _blocking(report) == ["cleanup_failure"]
     assert report.terminal_reason == "iteration cancelled"
-    subject = "batch" if family == "batch_outcomes" else "reference"
     assert [violation.message for violation in report.violations] == [
-        f"{subject} cleanup also failed (CleanupOverrunError)"
+        "stream cleanup also failed (CleanupOverrunError)"
     ]
 
 
@@ -943,85 +942,6 @@ async def test_a_close_before_the_first_pull_is_bounded_by_the_cleanup_window(fa
         await reached(source.closed)
 
 
-class _FailingClose:
-    """A caller's iterator of commands whose close fails: it overruns its window (blocks until released) or raises."""
-
-    def __init__(self, failure: str) -> None:
-        self.items = iter([_command(index) for index in range(ITEMS)])
-        self.failure = failure
-        self.release = asyncio.Event()
-
-    def __aiter__(self) -> _FailingClose:
-        return self
-
-    async def __anext__(self) -> Command[int]:
-        try:
-            return next(self.items)
-        except StopIteration:
-            raise StopAsyncIteration from None
-
-    async def aclose(self) -> None:
-        if self.failure == "runtime":
-            raise RuntimeError("the caller's close failed")
-        await reached(self.release)
-
-
-def _report_shape(report: OperationReport, failure: str) -> tuple[object, ...]:
-    """The report with the close's error name taken out, to compare two closes that failed differently."""
-    return (
-        report.state,
-        report.terminal_reason.replace(failure, "<close error>"),
-        [(violation.code, violation.message.replace(failure, "<close error>")) for violation in report.violations],
-    )
-
-
-async def _close_fails(family: str, failure: str, *, read_to_end: bool) -> tuple[BaseException, OperationReport]:
-    # A short real budget: the stream reads its source well within it, then the close blocks past it.
-    source = _FailingClose(failure)
-    caller: Any = source
-    async with client_for(ResponderTransport(_one_row), policy=ExecutionPolicy(max_elapsed=DEADLINE_BUDGET)) as client:
-        if family in {"batch", "batch_outcomes"}:
-            stream: OperationStream[Any] = getattr(client, family)(caller, batch_size=1)
-        else:
-            stream = getattr(client, family)(caller, dispatch=DirectDispatch(concurrency=1))
-        try:
-            with pytest.raises(Exception) as caught:  # noqa: PT011 - the test compares whichever error the close raised
-                await asyncio.wait_for(_read_and_close(stream, read_to_end=read_to_end), timeout=HANG_BOUND)
-        finally:
-            source.release.set()
-    report = stream.report
-    assert isinstance(report, OperationReport)
-    return caught.value, report
-
-
-async def _read_and_close(stream: OperationStream[Any], *, read_to_end: bool) -> None:
-    async with stream:
-        async for _item in stream:
-            if not read_to_end:
-                break
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("read_to_end", [True, False], ids=["read_to_end", "break"])
-@pytest.mark.parametrize("family", ["batch", "batch_outcomes", "fan_out", "fan_out_outcomes"])
-async def test_a_close_that_overruns_its_window_is_reported_as_any_failed_close(family: str, read_to_end: bool) -> None:  # noqa: FBT001
-    # The overrun refused no work, and all the work was admitted: it is a cleanup failure, reported as a close that
-    # raised, not the budget's end, though no time is left when the stream ends.
-    overrun, report = await _close_fails(family, "overrun", read_to_end=read_to_end)
-    failed, failed_report = await _close_fails(family, "runtime", read_to_end=read_to_end)
-
-    assert type(overrun) is CleanupOverrunError
-    assert type(failed) is RuntimeError
-    assert _report_shape(report, "CleanupOverrunError") == _report_shape(failed_report, "RuntimeError")
-    assert "budget_exhausted" not in _blocking(report)
-    assert report.state is (TerminalState.FAILED if read_to_end else TerminalState.EARLY_CLOSED)
-    cleanup = [violation.message for violation in report.violations if violation.code == "cleanup_failure"]
-    assert len(cleanup) == 1
-    assert cleanup[0].endswith("(CleanupOverrunError)")
-    if not read_to_end:
-        assert report.terminal_reason == "stream cleanup failed"
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("family", "public"),
@@ -1052,17 +972,15 @@ async def test_a_close_after_the_source_failed_in_the_read_ahead_raises_a_public
     report = stream.report
     assert report is not None
     assert report.state is TerminalState.EARLY_CLOSED
-    # The report names the public failure too, never the private one that carried it.
-    assert [violation.message for violation in report.violations] == [
-        "reference cleanup also failed (InputSourceError)"
-    ]
+    # The report names the public failure too, never the private one that carried it. Nothing ended the stream
+    # before the close that raised it, so the close is what failed.
+    assert report.terminal_reason == "stream cleanup failed"
+    assert [violation.message for violation in report.violations] == ["stream cleanup failed (InputSourceError)"]
 
 
 @pytest.mark.parametrize("secondary", [False, True])
 def test_a_cleanup_failure_names_the_public_failure_a_private_carrier_maps_to(secondary: bool) -> None:  # noqa: FBT001
-    violation = cleanup_failure_violation(
-        _BindingSourceError(ValueError("source")), secondary=secondary, subject="reference"
-    )
+    violation = cleanup_failure_violation(_BindingSourceError(ValueError("source")), secondary=secondary)
     assert violation.message.endswith("(InputSourceError)")
 
 
@@ -1086,19 +1004,27 @@ async def test_a_read_the_client_closes_raises_its_source_failure_as_a_public_er
         raise RuntimeError("the caller's source failed")
 
     blocker = Blocker()
-    async with client_for(ResponderTransport(blocker), policy=POLICY) as client:
-        if family == "iter_reference_outcomes":
-            stream: OperationStream[Any] = client.iter_reference_outcomes(
-                LIST_REQUEST, items(), traversal=TRAVERSAL, dispatch=DirectDispatch(concurrency=1)
-            )
-        else:
-            stream = client.iter_reference_source_outcomes(items(), dispatch=DirectDispatch(concurrency=1))
-        read = asyncio.create_task(anext(stream))
-        await reached(failed)
-        await reached(blocker.started)
-    # Closing the client closed the stream under the read, which ended with the source's failure.
+    reads: list[asyncio.Task[Any]] = []
+
+    async def close_the_client_under_the_read() -> None:
+        async with client_for(ResponderTransport(blocker), policy=POLICY) as client:
+            if family == "iter_reference_outcomes":
+                stream: OperationStream[Any] = client.iter_reference_outcomes(
+                    LIST_REQUEST, items(), traversal=TRAVERSAL, dispatch=DirectDispatch(concurrency=1)
+                )
+            else:
+                stream = client.iter_reference_source_outcomes(items(), dispatch=DirectDispatch(concurrency=1))
+            reads.append(asyncio.create_task(anext(stream)))
+            await reached(failed)
+            await reached(blocker.started)
+
+    # Closing the client closed the stream under the read; the close ended in the source's failure, so the client's
+    # close raises it, as for a stream with no read in flight, and so does the read the close ended.
+    with pytest.raises(InputSourceError) as closed:
+        await close_the_client_under_the_read()
     with pytest.raises(InputSourceError) as caught:
-        await asyncio.wait_for(read, timeout=HANG_BOUND)
+        await asyncio.wait_for(reads[0], timeout=HANG_BOUND)
+    assert caught.value is closed.value
     assert not type(caught.value).__name__.startswith("_")
     # It chains straight from the source's own exception, with no private carrier between them.
     assert type(caught.value.__cause__) is RuntimeError

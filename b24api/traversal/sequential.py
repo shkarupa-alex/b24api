@@ -12,7 +12,6 @@ from b24api.traversal import offset_rules
 from b24api.traversal.counted_rules import CountedContradiction, CountedPageFacts, judge_counted_page
 from b24api.traversal.identity import (
     _Page,
-    _PageRejectionError,
     _request_with_controls,
 )
 from b24api.traversal.plans import OffsetSequentialPlan, OffsetTerminalRule
@@ -224,9 +223,9 @@ class CountedStrategy:
         )
         terminal = verdict.terminal
         if not terminal and not items:
-            raise _PageRejectionError(
+            raise PaginationError(
                 "counted traversal ended before its exact total",
-                PageRejectionCode.RANGE_CONTRADICTION,
+                rejection_code=PageRejectionCode.RANGE_CONTRADICTION,
             )
         if verdict.contradiction is CountedContradiction.CONTINUATION_AFTER_TOTAL:
             raise CapabilityError("counted traversal completed while continuation remained")

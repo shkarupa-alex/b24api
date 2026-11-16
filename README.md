@@ -167,7 +167,9 @@ sent, with the same consequence for `UNSAFE` and `UNKNOWN` work; the failure its
 `TransportError` that names the exception's class and any HTTP status the client received
 (`error.http_status`), without the exception, which would carry the webhook URL, on its chain. A
 cancellation is re-raised with the same arguments, without the HTTPX frames it was raised in, and an
-exception that is not an `Exception` (`KeyboardInterrupt`) passes through unchanged. A response the
+exception that is not an `Exception` (`KeyboardInterrupt`) passes through as it is but without those
+frames, which hold the request, and without its chain (`__cause__` and `__context__` are cleared), which
+may be an HTTPX exception that holds it too. A response the
 transport refuses itself is reported as `ProtocolError` (a status outside 100-599) or
 `ResponseTooLargeError` rather than `TransportError`.
 A physical batch applies these rules to each command: after a failure, only the commands that
@@ -940,6 +942,77 @@ an `incomplete` (or `failed`) report, and the cancellation is delivered at its n
 closed before its first pull closes its source the same way. A synchronous source is pulled and closed in worker threads, in
 one `contextvars.Context`; a pull the deadline cut while it still runs is waited for before the close
 runs in that context, so a pull that outlasts the grace leaves its close to the background the same way.
+An asynchronous source also runs every pull and its close in one context of its own, copied when the call
+that creates the stream is made and driven by the task that reads it, so a context variable a generator sets
+before a `yield` is still set when it resumes. A context variable the caller sets after that call (a tracing
+span around the `async for` loop, say) is not seen by the source: set it before creating the stream.
+
+Every `Exception` a source raises, from a pull or from its close, is its failure: the stream raises
+`InputSourceError` (`batch()` and `fan_out()`: `BatchFailed`, whose `__cause__` is that
+`InputSourceError`) with the source's exception as its `__cause__`, whether the source is synchronous
+or asynchronous and even when that exception is a library error of its own. An item that is not what
+the family reads fails the source too, with a `TypeError` as that cause. Every family reports a
+failed close the same way. When nothing failed before it, the close is what failed: the terminal
+reason is "stream cleanup failed" and the report carries one `cleanup_failure` violation, "stream
+cleanup failed (X)", where X is `InputSourceError` or `CleanupOverrunError`. Behind an earlier failure,
+that failure stays the terminal reason and the close adds "stream cleanup also failed (X)". So does a
+close that fails behind the reader's cancellation: the reader gets its `CancelledError`, the stream is
+`cancelled` with the terminal reason "iteration cancelled", whether the cancellation landed while a
+read waited or between reads. That `CancelledError` carries the close's failure as its `__cause__`
+(`InputSourceError`, whose own `__cause__` is your source's exception) and the report as `.report`. An
+interrupt is the exception: a `KeyboardInterrupt` or `SystemExit` raised anywhere in the operation (by
+a close, a pull, or your transport inside one of the library's own tasks) is never behind anything. It
+is what the stream raises, whatever ended the stream before it (its end, a failure, the reader's
+cancellation, a timeout, a close from another task), and the report has one shape for it: `failed`
+with the terminal reason "operation interrupted", every violation recorded before it kept (an earlier
+failure's first), and one `interrupted` violation last, "operation interrupted (X)", where X is
+`KeyboardInterrupt` or `SystemExit`. The raised interrupt carries that report as `.report`, as the
+`CancelledError` does. A close that fails after an interrupt ended the stream is "stream cleanup also
+failed (X)", as behind any other end that came first.
+
+A failure is an `Exception`. Any other `BaseException` that is neither an interrupt nor a cancellation is
+no failure: the library never catches it as one, never wraps it, never makes it an outcome and never ranks
+it; it propagates as Python propagates it. Raised by your source's close it replaces whatever ended the
+stream, as an exception raised in a `finally` does, and under `async with` it replaces your own exception,
+which becomes its `__context__`. The library guarantees only this, in every family: it reaches you as it
+is, whether your transport raised it in your read or between your reads (in the stream's background work),
+or your source's pull or close did; the source is closed once; nothing hangs waiting for an end it took
+the place of; and it is never lost silently: when no read got it (you closed the stream between reads, or
+the close cancelled the send or the pull that raised it), the close raises it, once. A read the close ends
+in another task raises `CancelledError`. One delivered to a read or a close never reaches the event loop's
+exception handler and is never left in a task whose exception nobody retrieves; one the library could no
+longer deliver to a read or a close (raised by work that outlived the stream's cleanup window, or a second
+one behind what the close already raises) is reported to the loop's exception handler, once, with the
+stream's report as `report`. So is one of a stream nothing ever ends (left open when `asyncio.run` shuts
+down, or dropped): as asyncio reports a task's exception nobody retrieved, it is reported once the
+stream's work is collected, on a closed loop too. What the report says about it, and how it ranks behind
+other ends, is not promised.
+
+An interrupt raised while no read is waiting (by a send the stream runs between your reads, while you work
+on an item) does not wait for your next read: it leaves the event loop at once, out of `asyncio.run`, as
+asyncio raises any task's, and the operation's end follows: its work cancelled, its source closed and its
+report published, attached to the interrupt as `.report`. A read or close you start before that end is
+over runs it or waits for it, then finds the stream ended (a read raises `StopAsyncIteration`, a close
+returns); neither raises the interrupt, which the loop has. Under `asyncio.run` the interrupt stops the
+loop before the end begins, and the end is the close that `asyncio.run`'s shutdown runs as it cancels your
+tasks: the exit of an `async with stream` around your reads, or of the client's `async with`. A read or
+close cancelled while it runs the end still lets the end publish, with "stream cleanup also failed
+(CancelledError)" before the `interrupted` violation. The stream gets no end, so its source stays open and
+there is no report, only when nothing closes it: you never close the stream nor its client, or
+`asyncio.run` was already shutting down (your main coroutine had returned) when the interrupt was raised.
+The interrupt leaves `asyncio.run` in every case. An
+interrupt raised after the operation ended (by a close or a send still running past the cleanup window) is
+never dropped either: it leaves the event loop the same way, unless the stream already raised one. A stream
+raises one interrupt at most; a second one is reported to the loop's exception handler, like any escape the
+stream could no longer deliver, so it never stops the loop again while you unwind from the first. A library
+error carries this in its report (`error.report`), not as a note; your own exception raised inside
+`async with stream` stays what is raised and carries one note, the report's `cleanup_failure` violation
+word for word. Once the
+stream ends, its source is closed, even when the stream's own tasks outlast the cleanup window. A close from
+another task while a read is in flight is an early close: the read it ends raises `CancelledError`, or
+the close's failure when the close failed (an interrupt included), which the close raises too. A
+stream its reader's cancellation ended reports `cancelled` with the terminal reason "iteration
+cancelled", whatever its source had reached. `report.emitted` counts the items the reader got.
 
 Sequential, counted, and multi-reference exact traversal retain at most `max_identity_keys`
 observed identities per operation in memory (100,000 by default). All active reference bindings

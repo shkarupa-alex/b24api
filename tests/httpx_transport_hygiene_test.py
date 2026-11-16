@@ -8,7 +8,7 @@ import logging
 import re
 import traceback
 import types
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import httpx
 import pytest
@@ -978,3 +978,51 @@ def test_a_record_the_log_shield_fails_to_scrub_renders_no_credential_with_frame
     frames = [frame.name for frame in traceback.extract_tb(failed.value.__traceback__)]
     assert {"filter", "redact_owned_value" if owned else "redact_registered_value"} <= set(frames)
     assert [text for text in _rendered_texts(failed.value) if FRAGMENT in text] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("escape", [KeyboardInterrupt, SystemExit, GeneratorExit])
+async def test_an_escape_through_a_send_leaves_no_frame_holding_the_credential(escape: type[BaseException]) -> None:
+    # An interrupt, an exit or a coroutine's close is not a transport failure and passes through unclassified;
+    # its traceback kept the send's frames and HTTPX's, whose locals hold the request with the token in its URL.
+    def interrupted(_request: httpx.Request) -> httpx.Response:
+        raise escape
+
+    async with _client(interrupted) as http:
+        transport = HttpxTransport(WEBHOOK, client=http)
+        try:
+            with pytest.raises(escape) as captured:
+                await transport.send(Request.bare("user.current"), attempt_timeout=5.0, max_response_bytes=1000)
+        finally:
+            await transport.aclose()
+
+    _assert_token_unreachable(_without_this_files_frames(captured.value))
+
+
+def _refuse_connection(request: httpx.Request) -> NoReturn:
+    raise httpx.ConnectError("refused", request=request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("escape", [KeyboardInterrupt, SystemExit])
+async def test_an_escape_raised_while_httpx_handles_its_error_leaves_that_error_behind(
+    escape: type[BaseException],
+) -> None:
+    # Raised while HTTPX's own error is being handled, the escape's context is that error, whose request holds
+    # the token in its URL: it leaves without it.
+    def interrupted(request: httpx.Request) -> httpx.Response:
+        try:
+            _refuse_connection(request)
+        except httpx.ConnectError:
+            raise escape  # noqa: B904 - an interrupt keeps the error it interrupted as its context
+
+    async with _client(interrupted) as http:
+        transport = HttpxTransport(WEBHOOK, client=http)
+        try:
+            with pytest.raises(escape) as captured:
+                await transport.send(Request.bare("user.current"), attempt_timeout=5.0, max_response_bytes=1000)
+        finally:
+            await transport.aclose()
+
+    assert captured.value.__context__ is None
+    _assert_token_unreachable(_without_this_files_frames(captured.value))

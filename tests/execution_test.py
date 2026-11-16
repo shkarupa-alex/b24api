@@ -36,6 +36,7 @@ from b24api.execution import (
     WorkClass,
     rearm_cancellation,
 )
+from b24api.execution.context import LatchState, OperationLatch, is_interrupt, settle
 from b24api.execution.rate import (
     CoordinatorBudgetError,
     DeadlineBudget,
@@ -45,7 +46,7 @@ from b24api.transport import httpx as httpx_transport_module
 from tests.scripting import Blocker, ResponderTransport, client_for, replies
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Iterable
+    from collections.abc import Awaitable, Generator, Iterable
 
     from tests.scripting import ClientFactory, Responder
 
@@ -337,8 +338,8 @@ async def test_a_cancellation_a_transport_turns_into_a_failure_ends_the_batch() 
 
 
 @pytest.mark.asyncio
-async def test_a_stream_cleanup_failure_still_delivers_the_reader_cancellation() -> None:
-    """The cleanup failure is raised from the cancelled read; the cancellation lands at the next await."""
+async def test_a_stream_cleanup_failure_behind_the_reader_cancellation_raises_the_cancellation() -> None:
+    """The cancellation came first: the cancelled read raises it, and the cleanup failure is in the report."""
 
     class CloseFailedError(Exception):
         pass
@@ -356,16 +357,14 @@ async def test_a_stream_cleanup_failure_still_delivers_the_reader_cancellation()
     blocker = Blocker()
     steps: list[str] = []
     async with client_for(ResponderTransport(blocker)) as api:
+        stream = api.batch_outcomes(Source(), batch_size=2)
 
         async def reader() -> None:
-            with contextlib.suppress(CloseFailedError):
-                async for _outcome in api.batch_outcomes(Source(), batch_size=2):
-                    pass
-            steps.append("cleanup failure raised")
             try:
-                await asyncio.sleep(0)
+                async for _outcome in stream:
+                    pass
             except asyncio.CancelledError:
-                steps.append("cancellation delivered")
+                steps.append("cancellation raised")
                 raise
 
         task = asyncio.create_task(reader())
@@ -374,7 +373,10 @@ async def test_a_stream_cleanup_failure_still_delivers_the_reader_cancellation()
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    assert steps == ["cleanup failure raised", "cancellation delivered"]
+    assert steps == ["cancellation raised"]
+    report = stream.report
+    assert report is not None
+    assert [violation.message for violation in report.violations] == ["stream cleanup also failed (InputSourceError)"]
 
 
 @pytest.mark.asyncio
@@ -1172,3 +1174,171 @@ async def test_success_model_contract_failures_are_typed_and_keep_http_evidence(
     assert captured.value.request_summary is not None
     assert captured.value.request_summary.method == "profile"
     assert isinstance(captured.value.__cause__, ValueError)
+
+
+@pytest.mark.parametrize("end", ["raised_none", "raised_its_interrupt"])
+def test_a_closed_latch_raises_one_interrupt_and_reports_every_other_late_one(end: str) -> None:
+    # Once its operation has ended, the latch keeps no escape. An operation raises one interrupt at most: the first
+    # caught after an end that raised none leaves the event loop from a callback, once however many catchers record
+    # it; every other late interrupt goes to the exception handler, once, and the one the end raised never again.
+    handed: list[tuple[object, ...]] = []
+    reported: list[object] = []
+    own, late, later = KeyboardInterrupt("own"), SystemExit("late"), KeyboardInterrupt("later")
+
+    async def main() -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _loop, context: reported.append(context["exception"]))
+        call_soon = loop.call_soon
+        loop.call_soon = lambda _callback, *args, **_kwargs: handed.append(args)  # type: ignore[assignment,method-assign]
+        try:
+            latch = OperationLatch()
+            if end == "raised_its_interrupt":
+                latch.record(own)
+            assert latch.close() is (own if end == "raised_its_interrupt" else None)
+            for error in (late, late, own, RuntimeError("no interrupt"), None, later, later):
+                latch.record(error)
+            # Another end of the operation (a read a concurrent close ended) raises what the first did, no late one.
+            assert latch.close() is (own if end == "raised_its_interrupt" else None)
+        finally:
+            loop.call_soon = call_soon  # type: ignore[method-assign]
+
+    asyncio.run(main())
+    if end == "raised_its_interrupt":
+        assert (handed, reported) == ([], [late, later])
+    else:
+        assert (handed, reported) == ([(late,)], [own, later])
+
+
+@pytest.mark.parametrize("state", ["running", "ending"])
+def test_a_second_interrupt_the_running_operation_latches_is_reported_at_its_end(state: str) -> None:
+    # Two interrupts in one operation, running or ending: its end raises the first and reports the second to the
+    # loop's exception handler, once however many catchers record it; nothing more leaves the loop.
+    handed: list[tuple[object, ...]] = []
+    reported: list[object] = []
+    first, second = KeyboardInterrupt("first"), SystemExit("second")
+
+    async def main() -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _loop, context: reported.append(context["exception"]))
+        call_soon = loop.call_soon
+        loop.call_soon = lambda _callback, *args, **_kwargs: handed.append(args)  # type: ignore[assignment,method-assign]
+        try:
+            latch = OperationLatch()
+            latch.record(first)
+            if state == "ending":
+                latch.end()
+            for error in (second, second, first):
+                latch.record(error)
+            assert latch.close() is first
+        finally:
+            loop.call_soon = call_soon  # type: ignore[method-assign]
+
+    asyncio.run(main())
+    assert (handed, reported) == ([], [second])
+
+
+@pytest.mark.parametrize("loop_state", ["running", "closed"])
+def test_an_abandoned_latch_reports_every_undelivered_escape_and_raises_none(loop_state: str) -> None:
+    # An operation nothing ended: as its latch is collected, every escape still undelivered, a second interrupt
+    # included, goes to its loop's exception handler, once each, in order; nothing is raised, on a closed loop too.
+    reported: list[object] = []
+    first, second, other = KeyboardInterrupt("first"), SystemExit("second"), _Escape("other")
+    loop = asyncio.new_event_loop()
+    loop.set_exception_handler(lambda _loop, context: reported.append(context["exception"]))
+
+    async def abandon() -> None:
+        latch = OperationLatch()
+        for error in (first, second, other, other):
+            latch.record(error)
+
+    try:
+        loop.run_until_complete(abandon())
+        if loop_state == "closed":
+            loop.close()
+        gc.collect()
+        assert reported == [second, other]
+    finally:
+        loop.close()
+
+
+def test_a_latch_wakes_its_owner_only_while_the_operation_runs() -> None:
+    # Running, the first interrupt wakes the owner, once (a second waits for the end, which reports it); ending, an
+    # interrupt is latched for the end, waking nothing; an interrupt the end handed to the loop (no reader raised it)
+    # is not handed again when a catcher records or hands it on later.
+    woken: list[bool] = []
+    handed: list[tuple[object, ...]] = []
+
+    async def main() -> None:
+        loop = asyncio.get_running_loop()
+        call_soon = loop.call_soon
+        loop.call_soon = lambda _callback, *args, **_kwargs: handed.append(args)  # type: ignore[assignment,method-assign]
+        try:
+            running = OperationLatch(lambda: woken.append(True))
+            first, second = KeyboardInterrupt("first"), SystemExit("second")
+            running.record(first)
+            running.record(second)
+            assert (running.first, woken) == (first, [True])
+            assert running.close() is first
+            ending = OperationLatch(lambda: woken.append(False))
+            ending.end()
+            ending.record(first)
+            assert (ending.first, ending.state, woken) == (first, LatchState.ENDING, [True])
+            ending.close_to_loop()
+            ending.hand_on(first)
+            ending.record(first)
+        finally:
+            loop.call_soon = call_soon  # type: ignore[method-assign]
+        assert handed == [(first,)]
+
+    asyncio.run(main())
+
+
+class _Escape(BaseException):
+    """A ``BaseException`` that is neither an interrupt nor a cancellation."""
+
+
+def test_a_latch_raises_the_first_undelivered_escape_once_and_hands_the_rest_to_the_event_loop() -> None:
+    # An escape that is no interrupt stays undelivered until the operation's end, whoever records it how often. The
+    # end takes the first, once; it hands every other to the event loop's exception handler, as it does one caught
+    # after the end, once each, with the report, and never the one it raised. Behind an interrupt, which the end
+    # raises, every one is handed on. A failure, a cancellation and a coroutine's close are not the latch's.
+    handled: list[dict[str, object]] = []
+
+    async def main() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: handled.append(context))
+        latch = OperationLatch()
+        first, second, late = _Escape("first"), _Escape("second"), _Escape("late")
+        for error in (first, first, second, asyncio.CancelledError(), GeneratorExit(), RuntimeError("failure"), None):
+            latch.record(error)
+        latch.report = report = object()
+        assert latch.close() is first
+        assert latch.close() is None
+        for error in (late, late, first, second):
+            latch.record(error)
+        assert [context["exception"] for context in handled] == [second, late]
+        assert all(context["report"] is report for context in handled)
+        handled.clear()
+        behind = OperationLatch()
+        interrupt, raw = KeyboardInterrupt("first"), _Escape("behind")
+        behind.record(raw)
+        behind.record(interrupt)
+        assert behind.close() is interrupt
+        assert behind.close() is interrupt
+        assert [context["exception"] for context in handled] == [raw]
+
+    asyncio.run(main())
+
+
+def test_a_settled_task_lets_its_coroutine_be_closed() -> None:
+    # A coroutine closed while it waits (the garbage collector closes those a stopped loop left) gets GeneratorExit:
+    # that is no way its work ended, so settle lets it through rather than return it as a failure.
+    class _Suspends:
+        def __await__(self) -> Generator[None]:
+            yield
+
+    coroutine = settle(_Suspends())
+    coroutine.send(None)
+    coroutine.close()
+    assert not is_interrupt(GeneratorExit())
+    assert is_interrupt(KeyboardInterrupt())
+    assert is_interrupt(SystemExit())

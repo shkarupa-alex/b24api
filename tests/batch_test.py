@@ -548,7 +548,7 @@ async def test_partial_kernel_chunk_is_not_dispatched_before_source_error() -> N
 
 
 @pytest.mark.asyncio
-async def test_batch_iteration_cancellation_propagates_source_cleanup_error() -> None:
+async def test_batch_iteration_cancellation_outranks_a_source_cleanup_error() -> None:
     pulling = asyncio.Event()
 
     class RaisingCloseSource:
@@ -575,30 +575,27 @@ async def test_batch_iteration_cancellation_propagates_source_cleanup_error() ->
         batch_size=1,
     )
     assert isinstance(await anext(stream), BatchSuccess)
-    observed: list[tuple[str, object]] = []
+    observed: list[str] = []
 
     async def consume() -> None:
-        current = asyncio.current_task()
-        assert current is not None
         try:
             await anext(stream)
-        except RuntimeError as error:
-            observed.append((str(error), current.cancelling()))
-        try:
-            await asyncio.sleep(0)
         except asyncio.CancelledError as cancellation:
-            observed.append((str(cancellation), current.cancelling()))
-        while current.cancelling():
-            current.uncancel()
+            observed.append(str(cancellation))
+            raise
 
     task = asyncio.create_task(consume())
     await pulling.wait()
     task.cancel("external-caller")
 
-    await task
-    assert observed == [("batch close boom", 1), ("external-caller", 1)]
-    assert stream.report.state is KernelState.FAILED
-    assert [violation.code for violation in stream.report.violations] == ["cleanup_failure"]
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # The caller's cancellation came first: it is raised, and the failed close is recorded behind it.
+    assert observed == ["external-caller"]
+    assert stream.report.state is KernelState.CANCELLED
+    assert [(violation.code, violation.message) for violation in stream.report.violations] == [
+        ("cleanup_failure", "stream cleanup also failed (RuntimeError)")
+    ]
 
 
 @pytest.mark.asyncio

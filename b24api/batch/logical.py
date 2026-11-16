@@ -29,7 +29,6 @@ from b24api.contracts.policy import (
 )
 from b24api.contracts.request import ReplaySafety
 from b24api.errors import (
-    B24ApiError,
     InputSourceError,
     ProtocolError,
 )
@@ -60,13 +59,9 @@ if TYPE_CHECKING:
 type CommandSource[C] = Iterable[Command[C]] | AsyncIterable[Command[C]]
 
 
-class _CommandLocalValidationError(TypeError):
-    """A yielded source item is not a public Command value."""
-
-
 def _accept_command(command: object, _index: int) -> _BatchItem:
     if not isinstance(command, Command):
-        raise _CommandLocalValidationError("batch source must yield Command values")
+        raise TypeError("batch source must yield Command values")
     return _BatchInput(command.request, command.correlation)
 
 
@@ -76,7 +71,12 @@ def command_source[C](
 ) -> OwnedSource[_BatchItem]:
     """Own a logical command source; ``audit`` observes each admitted request."""
     observe = None if audit is None else (lambda item: audit(cast("_BatchInput", item).request))
-    return OwnedSource.adapt(commands, accept=_accept_command, observe=observe)
+    return OwnedSource.adapt(commands, accept=_accept_command, observe=observe, failure=_source_failure)
+
+
+def _source_failure(_error: Exception) -> InputSourceError:
+    """Map anything the caller's source raised, its own ``B24ApiError`` included, to the source's failure."""
+    return InputSourceError("Logical batch input source failed")
 
 
 class _BatchWindowError(Exception):
@@ -88,14 +88,11 @@ class _BatchWindowError(Exception):
         self,
         outcomes: tuple[CommandOutcome[object], ...],
         *,
-        source_error: BaseException | None = None,
+        source_error: Exception | None = None,
     ) -> None:
         self.outcomes = outcomes
         errors = (getattr(outcome, "error", None) for outcome in outcomes)
-        carried = next((error for error in errors if isinstance(error, BaseException)), None)
-        if source_error is not None:
-            carried = InputSourceError("Logical batch input source failed")
-            carried.__cause__ = source_error
+        carried = source_error or next((error for error in errors if isinstance(error, BaseException)), None)
         self.report_cause: BaseException = carried if carried is not None else self
         super().__init__("logical batch physical window failed")
 
@@ -112,8 +109,6 @@ def _public_outcomes(outcomes: tuple[KernelSuccess | KernelFailure, ...]) -> tup
             )
             continue
         error = outcome.error
-        if not isinstance(error, B24ApiError):
-            error = ProtocolError("batch command failed without a typed safe error")
         # The variant follows the execution facts; only the physical decoder proves a command withheld.
         summary = outcome.request.summary
         ambiguity = ambiguity_of(
@@ -187,6 +182,11 @@ class LogicalBatchKernelStream[C]:
         return self._context
 
     @property
+    def cleanup_failure(self) -> BaseException | None:
+        """Return the cleanup failure this stream raised as its end (``OperationRunner.cleanup_failure``)."""
+        return self._runner.cleanup_failure
+
+    @property
     def completion_gate(self) -> object:
         """Expose the live logical-command completion gate."""
         return self._completion.gate
@@ -247,10 +247,10 @@ class LogicalBatchKernelStream[C]:
                 self.buffered_commands_high_water,
                 len(chunk.commands),
             )
-            if chunk.source_error is not None:
+            if (failure := chunk.source_error) is not None:
                 reason = (
                     NotExecutedReason.LOCAL_VALIDATION_FAILED
-                    if isinstance(chunk.source_error, _CommandLocalValidationError)
+                    if failure.__cause__ is not None and failure.__cause__ is self._source.rejected
                     else NotExecutedReason.SOURCE_FAILED
                 )
                 pending = tuple(
@@ -258,14 +258,12 @@ class LogicalBatchKernelStream[C]:
                     for command in chunk.commands
                 )
                 if self._fail_fast:
-                    raise _BatchWindowError(
-                        cast("tuple[CommandOutcome[object], ...]", pending), source_error=chunk.source_error
-                    )
+                    raise _BatchWindowError(cast("tuple[CommandOutcome[object], ...]", pending), source_error=failure)
                 for pending_outcome in pending:
                     self._emitted += 1
                     yield pending_outcome
                     self._completion.terminal(pending_outcome.index, BindingClosure.FAILURE)
-                raise InputSourceError("Logical batch input source failed") from chunk.source_error
+                raise failure
             for command in chunk.commands:
                 self._completion.binding(command.index).scheduled()
             self._batch_commands += len(chunk.commands)
@@ -299,22 +297,17 @@ class LogicalBatchKernelStream[C]:
                 raise chunk.refusal
 
     async def _read_chunk(self, controller: AsyncIteratorController[_BatchItem], start_index: int) -> _Chunk:
-        """Read the next chunk; a source that fails before its first command fails the stream."""
-        try:
-            return await _next_chunk(
-                controller,
-                min(
-                    self._batch_size,
-                    self._context.policy.max_buffered_commands,
-                    self._context.policy.max_buffered_rows,
-                ),
-                start_index=start_index,
-                context=self._context,
-            )
-        except B24ApiError:
-            raise
-        except Exception as error:
-            raise InputSourceError("Logical batch input source failed") from error
+        """Read the next chunk; a source that fails before its first command fails the stream (``InputSourceError``)."""
+        return await _next_chunk(
+            controller,
+            min(
+                self._batch_size,
+                self._context.policy.max_buffered_commands,
+                self._context.policy.max_buffered_rows,
+            ),
+            start_index=start_index,
+            context=self._context,
+        )
 
     async def _close_controller(self) -> None:
         # One close attempt: a failed close is recorded once and never retried by a later aclose().

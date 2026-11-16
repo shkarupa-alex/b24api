@@ -3,9 +3,12 @@
 from __future__ import annotations
 import asyncio
 import contextlib
+import inspect
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol, TypeGuard
+from enum import Enum
+from typing import TYPE_CHECKING, Protocol, TypeGuard, cast
 from uuid import uuid4
 
 from b24api.contracts.policy import BudgetCounters, ExecutionPolicy
@@ -18,6 +21,13 @@ if TYPE_CHECKING:
 
     type Clock = Callable[[], float]
 
+
+# The work tokens of the stream runners whose isolated pull or cleanup owns the current task. Each runs in its
+# own task, and every task started while it runs copies its context, so the marker reaches all work done
+# on its behalf: a family's workers and the caller code they run (a page-stop callback, a transport, and a
+# source, whose own context the source owner gives the marker of each step it runs). A token, not the runner,
+# so a task that outlives the stream never keeps it alive.
+WORK_OWNERS: ContextVar[tuple[object, ...]] = ContextVar("b24api_work_owners", default=())
 
 REQUEST_BUDGET_EXHAUSTED = "physical request budget exhausted"
 # A request's own retry window closed before the operation's deadline: that request alone is refused, whatever the
@@ -444,6 +454,247 @@ class OwnedPull[T](Protocol):
         ...
 
 
+def is_interrupt(error: BaseException | None) -> bool:
+    """Whether ``error`` interrupts the program rather than fails work: a ``KeyboardInterrupt`` or ``SystemExit``.
+
+    These are what the event loop raises out of ``asyncio.run`` from a callback; it logs and drops any other
+    exception there.
+    """
+    return isinstance(error, KeyboardInterrupt | SystemExit)
+
+
+def is_escape(error: BaseException | None) -> bool:
+    """Whether ``error`` is no failure and no cancellation: the operation's latch's (``OperationLatch``).
+
+    Only an ``Exception`` is a failure. An interrupt (``is_interrupt``) is an escape, and so is any other
+    ``BaseException`` but a cancellation and a ``GeneratorExit`` (a coroutine being closed): it propagates as it is,
+    never caught as a failure, wrapped, ranked or made an outcome.
+    """
+    return error is not None and not isinstance(error, Exception | asyncio.CancelledError | GeneratorExit)
+
+
+class LatchState(Enum):
+    """Where an operation's ``OperationLatch`` stands: running, ending, or ended."""
+
+    # The operation runs: the first interrupt latched wakes its owner, which ends the operation at once.
+    ARMED = "armed"
+    # The operation is cleaning up: an interrupt latched now is raised at its end, waking nothing (its cleanup runs
+    # then, an inline kernel's in the very read a wake would cancel).
+    ENDING = "ending"
+    # The end is out: what it raised is raised, and anything latched from now on goes to the event loop.
+    CLOSED = "closed"
+
+
+class OperationLatch:
+    """Every escape (``is_escape``) an operation's own code caught, wherever it caught it, until its end raises it.
+
+    Library code that catches an escape in an operation's work either raises it at once or hands it to the latch
+    (``latch_escape``); there is no third way. Having handed it on, it goes on as with any end: turns it into a
+    binding's end, a page's failure or a task's ``Settled`` result, or leaves it on a future a close cancelled.
+    ``settle`` hands on whatever a library task ends in, so every task the library starts around caller code is
+    such a site.
+
+    The first interrupt ends the operation: latched while it runs, it wakes its owner. Any other escape, a second
+    interrupt included, stays undelivered until the operation's end. That end (``close``) raises the interrupt, ahead
+    of anything else, or else the first undelivered escape, once, as from a ``finally``. The escapes it does not
+    raise, and any caught once it is out, go to the event loop (``hand_on``), once each. The operation raises one
+    interrupt at most: one caught after an end that raised none is raised out of ``asyncio.run`` as any task's is,
+    and every other escape, a second interrupt included, goes to the loop's exception handler, with the operation's
+    report. An operation nothing
+    ends (a stream left unclosed when ``asyncio.run`` shuts down, or dropped) reports every escape still undelivered
+    to that handler as the latch is collected, as asyncio reports a task's exception nobody retrieved. So no route an
+    escape takes (an event, a future, a task's result, a cancelled pull) loses it silently.
+    """
+
+    __slots__ = ("_loop", "_out", "_undelivered", "_wake", "first", "report", "state")
+
+    def __init__(self, wake: Callable[[], None] | None = None) -> None:
+        """Hold no escape yet; ``wake`` ends the operation at once when an interrupt is latched while it runs."""
+        self.first: BaseException | None = None
+        self.state = LatchState.ARMED
+        # The operation's published report, for an escape handed to the event loop after it.
+        self.report: object | None = None
+        self._wake = wake
+        # The escapes caught and not raised yet, in the order they were caught: one each catcher records.
+        self._undelivered: list[BaseException] = []
+        # The loop the first undelivered escape was caught on, whose exception handler the latch's collection uses.
+        self._loop: asyncio.AbstractEventLoop | None = None
+        # The escapes that are out, each once however many catchers record it: raised by the operation's end, or
+        # handed to the event loop.
+        self._out: list[BaseException] = []
+
+    def end(self) -> None:
+        """The operation is ending: an interrupt latched from now on is raised at its end, waking nothing."""
+        if self.state is LatchState.ARMED:
+            self.state = LatchState.ENDING
+
+    def close(self) -> BaseException | None:
+        """The operation's end: return what it raises, and hand every other undelivered escape to the event loop.
+
+        That is the interrupt, which every end raises (a read a concurrent close ended raises it too), or else the
+        first undelivered escape, which only the first end raises. Nothing is latched from now on: the latch
+        outlives the operation in the context of any task its work started, so it lets go of its owner.
+        """
+        self.state = LatchState.CLOSED
+        self._wake = None
+        undelivered, self._undelivered = self._undelivered, []
+        raised = self.first
+        if raised is None and undelivered:
+            raised = undelivered.pop(0)
+        if raised is not None and not self._is_out(raised):
+            self._out.append(raised)
+        for error in undelivered:
+            self.hand_on(error)
+        return raised
+
+    def close_to_loop(self) -> None:
+        """The operation's end with no read or close to raise to: what ``close`` returns leaves the event loop instead.
+
+        An interrupt is raised out of ``asyncio.run`` from a callback, anything else is reported to its handler.
+        """
+        if (raised := self.close()) is not None:
+            self._deliver(raised, raise_it=is_interrupt(raised))
+
+    def record(self, error: BaseException | None) -> None:
+        """Latch ``error`` when it is an escape; anything else is not this latch's.
+
+        Once the operation's end is out, an escape goes to the event loop instead, unless the end raised it.
+        """
+        if error is None or not is_escape(error) or error is self.first:
+            return
+        if self.state is LatchState.CLOSED:
+            self.hand_on(error)
+        elif is_interrupt(error) and self.first is None:
+            self.first = error
+            if self.state is LatchState.ARMED and self._wake is not None:
+                self._wake()
+        else:
+            # Any other escape, a second interrupt included, waits for the end, which hands on what it does not raise.
+            self._loop = self._loop or asyncio.get_running_loop()
+            self._undelivered.append(error)
+
+    def hand_on(self, error: BaseException) -> None:
+        """Hand ``error`` to the event loop, once: no read or close of the operation will raise it.
+
+        The operation raises one interrupt at most: the loop raises an interrupt out of ``asyncio.run`` from a callback
+        only while none of the operation's is out yet (its end raised none). Raising another would stop the loop again
+        while the caller unwinds from the first (its client's close, say), so every other escape, a second interrupt
+        included, is reported to the loop's exception handler.
+        """
+        if self._is_out(error):
+            return
+        raise_it = is_interrupt(error) and not any(is_interrupt(out) for out in self._out)
+        self._out.append(error)
+        self._deliver(error, raise_it=raise_it)
+
+    def __del__(self) -> None:
+        """Report every escape no end raised to its loop's exception handler: nothing ended the operation.
+
+        As asyncio reports a task's exception nobody retrieved, it reports and never raises, an interrupt included,
+        on a closed loop too.
+        """
+        if self._loop is not None:
+            for error in self._undelivered:
+                if not self._is_out(error):
+                    self._out.append(error)
+                    self._report(error, self._loop)
+
+    def _is_out(self, error: BaseException) -> bool:
+        """Return whether ``error`` is out already: raised by an end, or handed to the event loop."""
+        return any(out is error for out in self._out)
+
+    def _deliver(self, error: BaseException, *, raise_it: bool) -> None:
+        """Raise ``error`` out of the running loop from a callback, or report it to the loop's exception handler."""
+        loop = asyncio.get_running_loop()
+        if raise_it:
+            loop.call_soon(_raise, error)
+        else:
+            self._report(error, loop)
+
+    def _report(self, error: BaseException, loop: asyncio.AbstractEventLoop) -> None:
+        """Report ``error`` to ``loop``'s exception handler, with the operation's report."""
+        context: dict[str, object] = {
+            "message": "b24api: an operation could no longer deliver this exception to a read or a close",
+            "exception": error,
+        }
+        if self.report is not None:
+            context["report"] = self.report
+        loop.call_exception_handler(context)
+
+
+def _raise(error: BaseException) -> None:
+    """Raise ``error`` from an event loop callback: an interrupt leaves the loop from there, out of ``asyncio.run``."""
+    raise error
+
+
+# The latch of the operation whose work runs the current code: its runner sets it in its read and cleanup tasks, and
+# every task they start inherits it.
+OPERATION_LATCH: ContextVar[OperationLatch | None] = ContextVar("b24api_operation_latch", default=None)
+
+
+def latch_escape(error: BaseException) -> None:
+    """Hand ``error`` to the current operation's ``OperationLatch`` when it is an escape (``is_escape``)."""
+    if (latch := OPERATION_LATCH.get()) is not None:
+        latch.record(error)
+
+
+class Settled[T]:
+    """How a library task's work ended, returned as the task's result: a value, or the failure its owner raises.
+
+    A task the library starts around caller code (a source's pull or close, a stream's read or cleanup) returns this
+    instead of ending in the failure. ``asyncio.run`` reports every task that its shutdown cancelled and that then
+    ended in an exception, whether or not its owner retrieves it later, so only a task that never ends in one keeps
+    the failure its owner's alone. That includes ``KeyboardInterrupt`` and ``SystemExit``: a task ending in one
+    stops the event loop from inside that task, leaving the owner waiting. An escape (``is_escape``) is latched on the
+    operation besides (``OperationLatch``), which raises it as its end whatever the owner does with the result, or
+    hands it to the event loop once the operation has ended.
+    """
+
+    __slots__ = ("error", "value")
+
+    def __init__(self, value: T | None = None, *, error: BaseException | None = None) -> None:
+        """Hold the work's value, or the failure it ended in."""
+        self.value = value
+        self.error = error
+
+    def unwrap(self) -> T:
+        """Return the value, or raise the failure."""
+        if self.error is not None:
+            raise self.error
+        return cast("T", self.value)
+
+
+async def settle[T](work: Awaitable[T]) -> Settled[T]:
+    """Await ``work`` and return how it ended (``Settled``); a cancellation still ends the task cancelled.
+
+    A ``GeneratorExit`` is no way the work ended: the task's coroutine is being closed (a loop that stopped leaves it
+    to the garbage collector), so it passes through.
+    """
+    try:
+        return Settled(await work)
+    except (asyncio.CancelledError, GeneratorExit):
+        raise
+    except BaseException as error:  # noqa: BLE001 - returned for the task's owner to raise: the task ends without it
+        latch_escape(error)
+        settled: Settled[T] = Settled(error=error)
+    # The work's cleanup may have re-armed a cancellation it absorbed on this task, which would end it cancelled and
+    # lose the failure. Whoever cancelled it learns how it ended from its owner, so the task takes the cancellation.
+    if (task := asyncio.current_task()) is not None and task.cancelling():
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.sleep(0)
+    return settled
+
+
+def spawn_settled[T](work: Awaitable[T]) -> asyncio.Task[Settled[T]]:
+    """Start ``work`` as a task that returns how it ended (``Settled``) and never ends in a failure."""
+    task = asyncio.ensure_future(settle(work))
+    if inspect.iscoroutine(work):
+        # A task cancelled before its first step never starts ``settle``, which would leave ``work`` never awaited;
+        # once the task is done, ``work`` has finished or never started, so closing it is safe.
+        task.add_done_callback(lambda _task: work.close())
+    return task
+
+
 class AsyncIteratorController[T]:
     """Own one async source pull and retain cleanup past a public deadline."""
 
@@ -458,8 +709,9 @@ class AsyncIteratorController[T]:
         self._source = source
         self._input_error = input_error
         self._cleanup_error = cleanup_error
-        self._active_pull: asyncio.Task[T] | None = None
-        self._cleanup_task: asyncio.Task[None] | None = None
+        # Both run caller code; neither ends in its failure (``spawn_settled``).
+        self._active_pull: asyncio.Task[Settled[T]] | None = None
+        self._cleanup_task: asyncio.Task[Settled[None]] | None = None
 
     async def get(self, context: ExecutionContext) -> T:
         """Pull one item within the operation's budget: its time left, and a request budget that refused nothing."""
@@ -470,10 +722,10 @@ class AsyncIteratorController[T]:
         if context.requests_refused:
             # No item pulled now could be sent: the operation ends with its request budget, as with its time budget.
             raise context.operation_refusal(REQUEST_BUDGET_EXHAUSTED)
-        pull: asyncio.Task[T] | None = None
+        pull: asyncio.Task[Settled[T]] | None = None
         try:
             async with context.deadline(self._input_error):
-                pull = asyncio.create_task(anext(self._source))
+                pull = spawn_settled(anext(self._source))
                 self._active_pull = pull
                 await asyncio.wait((pull,))
         except BaseException:
@@ -483,7 +735,7 @@ class AsyncIteratorController[T]:
                 self._retain_close_after(pull)
             raise
         try:
-            return await pull
+            return (await pull).unwrap()
         finally:
             self._active_pull = None
 
@@ -496,7 +748,7 @@ class AsyncIteratorController[T]:
         if self._cleanup_task is None:
             active = self._active_pull
             if active is None:
-                self._retain_cleanup(asyncio.create_task(self._close_source()))
+                self._cleanup_task = spawn_settled(self._close_source())
             else:
                 active.cancel()
                 self._retain_close_after(active)
@@ -505,32 +757,27 @@ class AsyncIteratorController[T]:
             return
         done, _ = await asyncio.wait((cleanup,), timeout=context.cleanup_window())
         if done:
-            await cleanup
+            (await cleanup).unwrap()
             return
         raise CleanupOverrunError(self._cleanup_error)
 
-    def _retain_close_after(self, pull: asyncio.Task[T]) -> None:
+    def _retain_close_after(self, pull: asyncio.Task[Settled[T]]) -> None:
         if self._cleanup_task is None:
-            self._retain_cleanup(asyncio.create_task(self._close_after(pull)))
+            self._cleanup_task = spawn_settled(self._close_after(pull))
 
-    def _retain_cleanup(self, cleanup: asyncio.Task[None]) -> None:
-        self._cleanup_task = cleanup
-        cleanup.add_done_callback(_observe_background_cleanup)
-
-    async def _close_after(self, pull: asyncio.Task[T]) -> None:
+    async def _close_after(self, pull: asyncio.Task[Settled[T]]) -> None:
         pull_error: BaseException | None = None
-        try:
-            await pull
-        except (asyncio.CancelledError, StopAsyncIteration):
-            pass
-        except Exception as error:  # noqa: BLE001 - preserve the source error through owned cleanup
-            pull_error = error
+        with contextlib.suppress(asyncio.CancelledError):
+            pull_error = (await pull).error
+        if isinstance(pull_error, StopAsyncIteration):
+            pull_error = None
         if self._active_pull is pull:
             self._active_pull = None
         try:
             await self._close_source()
         except BaseException as close_error:
-            if pull_error is not None:
+            # A close failure that already chains to its own cause (the source's exception) keeps it.
+            if pull_error is not None and close_error.__cause__ is None:
                 raise close_error from pull_error
             raise
         if pull_error is not None:
@@ -540,15 +787,15 @@ class AsyncIteratorController[T]:
         (await self._source.aclose()).raise_failure()
 
 
-def _observe_background_cleanup(task: asyncio.Future[None]) -> None:
+def _observe_background_cleanup(task: asyncio.Future[object]) -> None:
     """Retrieve late exceptions while preserving them for any later await."""
     if not task.cancelled():
         task.exception()
 
 
-async def await_cancellation_resistant(awaitable: Awaitable[None]) -> asyncio.CancelledError | None:
+async def await_cancellation_resistant(awaitable: Awaitable[object]) -> asyncio.CancelledError | None:
     """Finish an owned state transition and return the last concurrent cancellation."""
-    task: asyncio.Future[None] = asyncio.ensure_future(awaitable)
+    task = _owned_task(awaitable)
     cancellation: asyncio.CancelledError | None = None
     while not task.done():
         try:
@@ -556,12 +803,25 @@ async def await_cancellation_resistant(awaitable: Awaitable[None]) -> asyncio.Ca
         except asyncio.CancelledError as error:
             cancellation = error
     try:
-        await task
+        _ended(await task)
     except asyncio.CancelledError:
         if cancellation is not None:
             return cancellation
         raise
     return cancellation
+
+
+def _owned_task(work: Awaitable[object]) -> asyncio.Future[object]:
+    """Run ``work`` as a task of its own that never ends in its failure, unless it already is a task."""
+    if isinstance(work, asyncio.Future):
+        return work
+    return cast("asyncio.Future[object]", spawn_settled(work))
+
+
+def _ended(result: object) -> None:
+    """Raise the failure an owned task returned (``Settled``) instead of ending in it."""
+    if isinstance(result, Settled):
+        result.unwrap()
 
 
 @dataclass(frozen=True, slots=True)
@@ -571,7 +831,7 @@ class CleanupResult:
     cancellation: asyncio.CancelledError | None
     error: BaseException | None
     # Cleanup a deadline stopped waiting for, still running; its owner must keep a reference to it.
-    unfinished: asyncio.Future[None] | None = field(default=None, kw_only=True)
+    unfinished: asyncio.Future[object] | None = field(default=None, kw_only=True)
 
     def raise_failure(self) -> None:
         """Raise the deferred cancellation first, then the cleanup failure."""
@@ -582,7 +842,7 @@ class CleanupResult:
 
 
 async def await_cleanup_resistant(
-    awaitable: Awaitable[None],
+    awaitable: Awaitable[object],
     *,
     deadline: float | None = None,
     cancelled: bool = False,
@@ -594,7 +854,7 @@ async def await_cleanup_resistant(
     to finish in the background, returned as ``unfinished`` with a ``BudgetExceededError``. Without a
     cancellation, or without a deadline, cleanup is awaited to its end.
     """
-    task: asyncio.Future[None] = asyncio.ensure_future(awaitable)
+    task = _owned_task(awaitable)
     cancellation: asyncio.CancelledError | None = None
     loop = asyncio.get_running_loop()
     while not task.done():
@@ -611,7 +871,7 @@ async def await_cleanup_resistant(
             overrun = CleanupOverrunError("cleanup exceeded the operation time budget")
             return CleanupResult(cancellation, overrun, unfinished=task)
     try:
-        await task
+        _ended(await task)
     except asyncio.CancelledError as error:
         if cancellation is not None:
             return CleanupResult(cancellation, None)

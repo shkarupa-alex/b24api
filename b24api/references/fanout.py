@@ -16,8 +16,9 @@ from b24api.contracts.command import (
     CommandSuccess,
 )
 from b24api.contracts.request import ReplaySafety
-from b24api.errors import B24ApiError, BatchFailed, CapabilityError, InputSourceError
+from b24api.errors import BatchFailed, InputSourceError
 from b24api.execution.facts import ambiguity_of
+from b24api.execution.failure import outcome_error
 from b24api.references.dispatch import (
     _KernelFanOutSuccess,
     _ReferenceWindowError,
@@ -53,6 +54,11 @@ class FanOutKernelStream(Protocol):
     @property
     def operation_context(self) -> ExecutionContext:
         """Return the operation context."""
+        ...
+
+    @property
+    def cleanup_failure(self) -> BaseException | None:
+        """Return the cleanup failure the stream raised as its end."""
         ...
 
     def __aiter__(self) -> Self:
@@ -119,7 +125,7 @@ class _FanOutMapper:
                 event.response,
             )
         context = cast("_CommandContext", event.correlation)
-        error = event.error if isinstance(event.error, B24ApiError) else CapabilityError("fan-out command failed")
+        error = outcome_error(event.error, "fan-out command failed")
         summary = event.request.summary
         # The variant follows the execution facts, not the exception type, which stays the cause.
         ambiguity = ambiguity_of(

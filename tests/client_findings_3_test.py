@@ -1293,7 +1293,11 @@ async def test_reference_fail_fast_classifies_underlying_pagination_failure() ->
     assert any(item.code == "pagination_invariant" for item in captured.value.report.violations)
     assert captured.value.report.terminal_reason == "PaginationError"
     assert "_ReferenceWindowError" not in repr(captured.value.report)
-    assert "_PageRejectionError" not in repr(captured.value.report)
+    # The failure chains to a public error, which names the page check that rejected the page.
+    cause = captured.value.__cause__
+    assert type(cause) is PaginationError
+    assert cause.rejection_code is PageRejectionCode.DUPLICATE_IDENTITY
+    assert cause.to_safe_dict()["type"] == "PaginationError"
 
 
 @pytest.mark.asyncio
@@ -1547,3 +1551,16 @@ async def test_page_stride_accepts_an_aligned_initial_offset() -> None:
     rows = [item async for item in stream]
     assert len(rows) == PAGE_SIZE
     assert starts == [900, 900 + PAGE_SIZE]
+
+
+@pytest.mark.parametrize("code", ["duplicate_identity", 1, object()])
+def test_a_pagination_error_refuses_a_rejection_code_that_is_not_one(code: object) -> None:
+    # The code names the page check that rejected a page, as its ``PageRecord`` does: a raw value is no such name.
+    with pytest.raises(TypeError, match="rejection_code must be a PageRejectionCode"):
+        PaginationError("rejected", rejection_code=code)  # type: ignore[arg-type]
+
+
+def test_a_pagination_error_keeps_its_rejection_code() -> None:
+    assert PaginationError("rejected").rejection_code is None
+    error = PaginationError("rejected", rejection_code=PageRejectionCode.TOTAL_DRIFT)
+    assert error.rejection_code is PageRejectionCode.TOTAL_DRIFT

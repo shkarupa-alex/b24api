@@ -13,6 +13,9 @@ from b24api.execution.facts import Execution, settled_as, settlement
 if TYPE_CHECKING:
     from b24api.contracts.completion import CommandSettlement
 
+if TYPE_CHECKING:
+    from b24api.errors import B24ApiError
+
 STABLE_KEY_MAXIMUM = 100
 
 
@@ -137,7 +140,7 @@ class BatchFailure:
     command_index: int
     stable_key: str
     request: Request = field(repr=False)
-    error: object = field(repr=False)
+    error: B24ApiError = field(repr=False)
     replay_safety: ReplaySafety = ReplaySafety.UNKNOWN
     replay_disposition: ReplayDisposition = ReplayDisposition.NOT_ELIGIBLE
     correlation: object = field(default=None, repr=False)

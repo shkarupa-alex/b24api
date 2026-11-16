@@ -57,7 +57,6 @@ from b24api.traversal.identity import (
     _identity_store,
     _IdentityStore,
     _Page,
-    _PageRejectionError,
     _validate_confirmation_policy,
 )
 from b24api.traversal.inclusive_window import InclusiveWindowStrategy
@@ -565,12 +564,12 @@ class PaginationDriver:
             )
         fingerprint, track_fingerprint = _page_fingerprint_policy(items, self.plan)
         if fingerprint in self._fingerprints and track_fingerprint:
-            raise _PageRejectionError(
+            raise PaginationError(
                 # Without a unique identity in the rows, a page equal to an earlier one is indistinguishable
                 # from a server that ignored the page control, so content-equal pages fail closed.
                 "repeated page fingerprint detected: a page equal to an earlier one cannot be told apart from an "
                 "ignored page control; rows that repeat by content need a unique identity",
-                PageRejectionCode.REPEATED_FINGERPRINT,
+                rejection_code=PageRejectionCode.REPEATED_FINGERPRINT,
             )
         accepted_count = len(items) if qualified_count is None else qualified_count
         self._validate_response_total(response, accepted_count)
@@ -602,9 +601,15 @@ class PaginationDriver:
             local.add(value)
         self._last_page_unique_mask = tuple(unique_mask)
         if duplicates and self._duplicate_policy is DuplicatePolicy.ERROR:
-            raise _PageRejectionError("duplicate identity detected", PageRejectionCode.DUPLICATE_IDENTITY)
+            raise PaginationError(
+                "duplicate identity detected",
+                rejection_code=PageRejectionCode.DUPLICATE_IDENTITY,
+            )
         if self._expected_total is not None and self.validated_rows + accepted_count > self._expected_total:
-            raise _PageRejectionError("traversal exceeded its exact total", PageRejectionCode.TOTAL_DRIFT)
+            raise PaginationError(
+                "traversal exceeded its exact total",
+                rejection_code=PageRejectionCode.TOTAL_DRIFT,
+            )
         new_values = tuple(dict.fromkeys(value for value in identities if not self._store.contains(value)))
         self._store.ensure_capacity(len(new_values))
         self.validated_rows += accepted_count
@@ -625,7 +630,10 @@ class PaginationDriver:
         if not duplicates:
             return
         if self._duplicate_policy is DuplicatePolicy.ERROR:
-            raise _PageRejectionError("duplicate identity detected", PageRejectionCode.DUPLICATE_IDENTITY)
+            raise PaginationError(
+                "duplicate identity detected",
+                rejection_code=PageRejectionCode.DUPLICATE_IDENTITY,
+            )
         if self._duplicate_policy is DuplicatePolicy.REPORT:
             self.duplicate_identities += duplicates
             self.violations.append(
@@ -729,7 +737,7 @@ class PaginationDriver:
             code = PageRejectionCode.PAGE_ADAPTATION
         elif isinstance(error, ResultShapeError):
             code = PageRejectionCode.SHAPE_CONTRACT
-        elif isinstance(error, _PageRejectionError):
+        elif isinstance(error, PaginationError) and error.rejection_code is not None:
             code = error.rejection_code
         else:
             code = PageRejectionCode.RANGE_CONTRADICTION
@@ -784,7 +792,10 @@ class PaginationDriver:
             elif self._expected_total is None:
                 self._expected_total = response.total
             elif response.total != self._expected_total:
-                raise _PageRejectionError("traversal exact total drifted", PageRejectionCode.TOTAL_DRIFT)
+                raise PaginationError(
+                    "traversal exact total drifted",
+                    rejection_code=PageRejectionCode.TOTAL_DRIFT,
+                )
         elif self._total_semantics is TotalSemantics.ADVISORY and response.total is not None and response.total >= 0:
             self._advisory_totals.add(response.total)
             if len(self._advisory_totals) > 1 and not self._advisory_total_drift_reported:
@@ -803,7 +814,10 @@ class PaginationDriver:
 
     def _validate_total_not_overshot(self) -> None:
         if self._expected_total is not None and self.validated_rows > self._expected_total:
-            raise _PageRejectionError("traversal exceeded its exact total", PageRejectionCode.TOTAL_DRIFT)
+            raise PaginationError(
+                "traversal exceeded its exact total",
+                rejection_code=PageRejectionCode.TOTAL_DRIFT,
+            )
 
     def _validate_terminal_total(self) -> None:
         if self._total_semantics is TotalSemantics.ADVISORY:
@@ -826,9 +840,9 @@ class PaginationDriver:
         if self._expected_total is None:
             raise CapabilityError("terminal traversal lacks its filtered exact total")
         if self.validated_rows != self._expected_total:
-            raise _PageRejectionError(
+            raise PaginationError(
                 "traversal terminated before its exact total",
-                PageRejectionCode.TOTAL_DRIFT,
+                rejection_code=PageRejectionCode.TOTAL_DRIFT,
             )
 
     def _append_page_record(self, record: PageRecord) -> None:

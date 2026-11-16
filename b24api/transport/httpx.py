@@ -226,23 +226,33 @@ class HttpxTransport:
         tracker = _PhaseTracker()
         http_request: httpx.Request | None = None
         outcome: WireResponse | BaseException
-        with HTTPX_LOG_SHIELD.request(webhook=webhook) as ownership:
-            try:
-                # HTTPX refuses some values only while building, a header it cannot encode for example. The
-                # method URL carries the token, so no local of this frame holds it.
-                http_request = self._build_request(request, headers, _method_url(webhook, request))
-                ownership.claim(http_request)
-                http_request.extensions["trace"] = tracker
-                timeouts = dict.fromkeys(("connect", "read", "write", "pool"), attempt_timeout)
-                http_request.extensions["timeout"] = timeouts
-                response = await self._client.send(http_request, stream=True, auth=ownership.guard(self._client.auth))
-            except asyncio.CancelledError as error:
-                outcome = asyncio.CancelledError(*error.args)
-            except Exception as error:  # noqa: BLE001 - every escape is classified, never chained
-                outcome = _client_failure(error, tracker.phase, request.summary, built=http_request is not None)
-            else:
-                outcome = await _read_response(response, tracker, max_response_bytes, request.summary)
-                del response
+        try:
+            with HTTPX_LOG_SHIELD.request(webhook=webhook) as ownership:
+                try:
+                    # HTTPX refuses some values only while building, a header it cannot encode for example. The
+                    # method URL carries the token, so no local of this frame holds it.
+                    http_request = self._build_request(request, headers, _method_url(webhook, request))
+                    ownership.claim(http_request)
+                    http_request.extensions["trace"] = tracker
+                    timeouts = dict.fromkeys(("connect", "read", "write", "pool"), attempt_timeout)
+                    http_request.extensions["timeout"] = timeouts
+                    response = await self._client.send(
+                        http_request, stream=True, auth=ownership.guard(self._client.auth)
+                    )
+                except asyncio.CancelledError as error:
+                    outcome = asyncio.CancelledError(*error.args)
+                except Exception as error:  # noqa: BLE001 - every escape is classified, never chained
+                    outcome = _client_failure(error, tracker.phase, request.summary, built=http_request is not None)
+                else:
+                    outcome = await _read_response(response, tracker, max_response_bytes, request.summary)
+                    del response
+        except BaseException as escaped:
+            # What no handler classifies (an interrupt, an exit, this coroutine's close) leaves as it is, but without
+            # the frames it was raised through, HTTPX's and this one, whose locals hold the credential-bearing
+            # request, and without the exception it interrupted, which may be HTTPX's own.
+            http_request = response = None
+            escaped.__traceback__ = escaped.__context__ = escaped.__cause__ = None
+            raise
         http_request = None
         if isinstance(outcome, BaseException):
             raise outcome

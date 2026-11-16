@@ -34,6 +34,7 @@ from b24api.execution import (
     rearm_cancellation,
 )
 from b24api.execution.cleanup import OwnedStream, close_owned_resources
+from b24api.execution.context import Settled, spawn_settled
 from b24api.redaction import Redactor, secret_values
 from b24api.references.facade import reference_stream
 from b24api.references.fanout import CommandSource as FanOutCommandSource
@@ -118,7 +119,7 @@ class Bitrix24(_TraversalFacade):
         self._host = host
         self._closed = False
         self._unknown_request_audit = unknown_request_audit
-        self._close_task: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[Settled[None]] | None = None
         self._streams: weakref.WeakSet[OwnedStream] = weakref.WeakSet()
 
     @classmethod
@@ -183,10 +184,14 @@ class Bitrix24(_TraversalFacade):
         primary: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Close owned work without replacing a primary body exception."""
+        """Close owned work; a failed or cancelled close never replaces a primary body exception.
+
+        Anything else the close raises, an escape (``is_escape``: an interrupt, or any other ``BaseException`` that is
+        no failure), replaces it as from a ``finally``, with the body's exception as its context.
+        """
         try:
             await self.aclose()
-        except BaseException as cleanup_error:
+        except (Exception, asyncio.CancelledError) as cleanup_error:
             if primary is not None:
                 raise primary.with_traceback(traceback) from cleanup_error
             raise
@@ -203,7 +208,7 @@ class Bitrix24(_TraversalFacade):
             raise RuntimeError("client cannot be closed from inside the pull or cleanup of one of its streams")
         if self._close_task is None:
             self._closed = True
-            self._close_task = asyncio.create_task(
+            self._close_task = spawn_settled(
                 close_owned_resources(tuple(self._streams), self._owned_transport, self._owned_coordinator),
             )
         cleanup = await await_cleanup_resistant(self._close_task)

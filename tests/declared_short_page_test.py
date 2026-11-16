@@ -64,7 +64,7 @@ from b24api.contracts import (
 )
 from b24api.contracts.policy import ConfirmationPolicy, DuplicatePolicy, SnapshotRequirement, TotalSemantics
 from b24api.encoding import encode_php_query
-from b24api.errors import CapabilityError, IncompleteTraversalError, PaginationError
+from b24api.errors import CapabilityError, IncompleteTraversalError, InputSourceError, PaginationError
 from b24api.traversal.offset_rules import sequential_offset_plan
 from b24api.traversal.plans import OffsetSequentialPlan, OffsetTerminalRule
 from tests.scripting import ResponderTransport, client_for
@@ -928,8 +928,10 @@ async def test_cleanup_failure_is_never_an_exhausted_or_stronger_outcome(early: 
                     if early:
                         break
 
-        with pytest.raises(RuntimeError, match="binding source cleanup failed"):
+        # The source's failed close is its failure, raised as a failed pull is.
+        with pytest.raises(InputSourceError) as caught:
             await consume()
+        assert str(caught.value.__cause__) == "binding source cleanup failed"
 
     report = stream.report
     assert report is not None

@@ -277,7 +277,7 @@ def test_failure_repr_excludes_request_error_and_payload_values() -> None:
         command_index=0,
         stable_key="_0",
         request=request,
-        error={"auth": EXAMPLE_CREDENTIAL},
+        error=RuntimeError(EXAMPLE_CREDENTIAL),
         correlation={"secret": EXAMPLE_CREDENTIAL},
     )
 

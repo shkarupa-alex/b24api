@@ -5,7 +5,7 @@ from __future__ import annotations
 import b24api.errors as error_types
 from b24api import IdentityCoercion, OperationReport, ResultSelector, TerminalState
 from b24api.contracts import AmbiguityReason, ReplayDisposition, ResultCollectionShape
-from b24api.execution.failure import classify_failure, finalize_failure
+from b24api.execution.failure import classify_failure, finalize_failure, outcome_error
 
 
 def test_failure_classification_matches_the_public_contract_table() -> None:
@@ -90,3 +90,15 @@ def test_incomplete_traversal_exposes_its_original_cause_and_replay_decision() -
     assert error.replay_disposition is ReplayDisposition.ELIGIBLE
     assert error.to_safe_dict()["cause"] == cause.to_safe_dict()
     assert error.to_safe_dict()["replay_disposition"] == "eligible"
+
+
+def test_an_outcome_carries_the_librarys_error_as_it_is_and_any_other_exception_as_its_cause() -> None:
+    # The one rule every outcome family maps a failure by: a library error as it is, any other Exception wrapped in a
+    # CapabilityError with the given message, whose cause it is.
+    library = error_types.PaginationError("page")
+    assert outcome_error(library, "reference failed") is library
+    other = ValueError("caller code failed")
+    carried = outcome_error(other, "reference failed")
+    assert type(carried) is error_types.CapabilityError
+    assert str(carried) == "reference failed"
+    assert carried.__cause__ is other

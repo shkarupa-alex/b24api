@@ -89,7 +89,7 @@ class KernelReferenceFailure:
 
     reference_key: str = field(repr=False)
     request: Request = field(repr=False)
-    error: object = field(repr=False)
+    error: Exception = field(repr=False)
     _cursor: FrozenJson = field(repr=False)
     page_state: int = 0
     partial_rows: int = 0
@@ -102,7 +102,7 @@ class KernelReferenceFailure:
         self,
         reference_key: str,
         request: Request,
-        error: object,
+        error: Exception,
         cursor: object = None,
         page_state: int = 0,
         partial_rows: int = 0,

@@ -79,6 +79,7 @@ from tests.scripting import HANG_BOUND, ResponderTransport, client_for, json_res
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+    from typing import Any
 
     from b24api.contracts import JsonValue
     from b24api.contracts.completion import CompletionEvidence
@@ -2095,7 +2096,7 @@ async def test_fast_bounded_consumption_freezes_an_early_close_report(operation:
     assert partial.report.unique_rows == expected
     assert partial.report.buffered_rows_high_water <= ExecutionPolicy().max_buffered_rows
     assert stream._source._runtime.plan is None
-    assert not stream._source._buffer
+    assert stream._source._runtime.transactions.buffer_balance == 0
     assert stream._source._runtime.transactions.anchor_rows == {}
 
 
@@ -2150,9 +2151,9 @@ async def test_fast_close_finishes_cleanup_before_propagating_cancellation(
         await closing
 
     assert scheduler.closed is True
-    assert source._closed is True
     assert scheduler.transactions.buffer_balance == 0
-    assert not source._buffer
+    with pytest.raises(StopAsyncIteration):
+        await anext(source)
 
 
 @pytest.mark.asyncio
@@ -2891,3 +2892,103 @@ async def test_a_finish_page_the_server_refuses_settles_as_a_failure_and_fails_i
 async def _drain_rows(stream: AsyncIterator[object]) -> None:
     async for _ in stream:
         pass
+
+
+def _fail_runtime_cleanup(monkeypatch: pytest.MonkeyPatch, stream: object) -> None:
+    def fail() -> None:
+        raise RuntimeError("runtime cleanup failed")
+
+    monkeypatch.setattr(cast("Any", stream)._source._runtime.admission, "discard_unadmitted_raw", fail)
+
+
+@pytest.mark.asyncio
+async def test_fast_early_close_whose_cleanup_fails_reports_that_failure_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The close is what failed: the report says so once, and nothing else about how the stream ended.
+    stream = _stream(KeysetTransport(tuple(range(1, 80))), RangeKeysetExecution(StableIntegerKeysetContract()))
+    await anext(stream)
+    _fail_runtime_cleanup(monkeypatch, stream)
+
+    with pytest.raises(RuntimeError, match="runtime cleanup failed") as raised:
+        await stream.aclose()
+
+    report = stream.report
+    assert report is not None
+    assert report.state is TerminalState.EARLY_CLOSED
+    assert report.terminal_reason == "stream cleanup failed"
+    assert [(item.code, item.message) for item in report.violations] == [
+        ("cleanup_failure", "stream cleanup failed (RuntimeError)")
+    ]
+    assert getattr(raised.value, "report", None) is report
+    assert not hasattr(raised.value, "__notes__")
+
+
+@pytest.mark.asyncio
+async def test_fast_failure_keeps_a_failed_cleanup_in_its_report_not_in_a_note(monkeypatch: pytest.MonkeyPatch) -> None:
+    stream = _stream(
+        KeysetTransport(tuple(range(1, 80))),
+        RangeKeysetExecution(StableIntegerKeysetContract()),
+        policy=ExecutionPolicy(max_requests=1),
+    )
+    _fail_runtime_cleanup(monkeypatch, stream)
+
+    with pytest.raises(IncompleteTraversalError) as raised:
+        _ = [row async for row in stream]
+
+    report = stream.report
+    assert report is not None
+    assert report.state is TerminalState.INCOMPLETE
+    # The failure is primary: its violation comes first, the failed cleanup behind it last.
+    assert [(item.code, item.message) for item in report.violations[-2:]] == [
+        ("budget_exhausted", "iter_list_keyset failed (BudgetExceededError)"),
+        ("cleanup_failure", "stream cleanup also failed (RuntimeError)"),
+    ]
+    assert raised.value.report is report
+    assert not hasattr(raised.value, "__notes__")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timing", ["between_reads", "during_a_read"])
+async def test_fast_cancelled_reader_whose_cleanup_then_fails_is_cancelled_whenever_the_cancellation_lands(
+    monkeypatch: pytest.MonkeyPatch, timing: str
+) -> None:
+    # As in every family: the reader's cancellation came first, so the failed cleanup is behind it.
+    transport = KeysetTransport(tuple(range(1, 80)))
+    stream = _stream(transport, RangeKeysetExecution(StableIntegerKeysetContract()))
+    _fail_runtime_cleanup(monkeypatch, stream)
+    sending = asyncio.Event()
+    if timing == "during_a_read":
+
+        async def blocked(request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+            del request, attempt_timeout, max_response_bytes
+            sending.set()
+            await asyncio.Event().wait()
+            raise AssertionError("never answered")
+
+        monkeypatch.setattr(transport, "send", blocked)
+    raised: list[BaseException] = []
+
+    async def read() -> None:
+        try:
+            async for _row in stream:
+                if timing == "between_reads":
+                    task = asyncio.current_task()
+                    assert task is not None
+                    task.cancel()
+        except BaseException as error:  # noqa: BLE001 - the test inspects what the reader got
+            raised.append(error)
+
+    reader = asyncio.create_task(read())
+    if timing == "during_a_read":
+        await sending.wait()
+        reader.cancel()
+    await reader
+
+    assert [type(error) for error in raised] == [asyncio.CancelledError]
+    report = stream.report
+    assert report is not None
+    assert report.state is TerminalState.CANCELLED
+    assert report.terminal_reason == "iteration cancelled"
+    # The cleanup the test breaks stops before it settles a page in flight, which the gate records besides.
+    assert [item.message for item in report.violations if item.code == "cleanup_failure"] == [
+        "stream cleanup also failed (RuntimeError)"
+    ]

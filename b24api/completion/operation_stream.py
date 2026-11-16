@@ -3,7 +3,7 @@
 from __future__ import annotations
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import replace
-from typing import TYPE_CHECKING, Protocol, Self
+from typing import TYPE_CHECKING, Protocol, Self, cast
 
 from b24api.completion.gate import CompletionGate, CompletionReportFacts
 from b24api.contracts.completion import CleanupState
@@ -17,13 +17,19 @@ from b24api.contracts.report import (
     ViolationSeverity,
 )
 from b24api.errors import IncompleteTraversalError
-from b24api.execution.failure import finalize_failure
+from b24api.execution.failure import (
+    CANCELLED_REASON,
+    finalize_failure,
+    with_cleanup_failure_behind,
+    with_interrupt,
+)
 from b24api.execution.lifecycle import (
     CleanupAttempt,
     LifecycleHooks,
     OperationRunner,
     TerminalCause,
     cleanup_failed,
+    closed_behind_its_end,
     with_cleanup_attempt,
     with_fallback_cleanup,
 )
@@ -47,6 +53,11 @@ class _ClosableIterator[T](Protocol):
     @property
     def operation_context(self) -> ExecutionContext:
         """Return the operation context."""
+        ...
+
+    @property
+    def cleanup_failure(self) -> BaseException | None:
+        """Return the cleanup failure the source raised as its end (``OperationRunner.cleanup_failure``)."""
         ...
 
     def __aiter__(self) -> Self:
@@ -109,6 +120,7 @@ class MappedOperationStream[S, T]:
         self._keyset_selection = keyset_selection
         self._source_violations = source_violations
         self._deregister = deregister
+        # The report this stream built, which the runner publishes (an interrupt's shape on it, ``with_interrupt``).
         self._report: OperationReport | None = None
         self._early_closed = False
         self._cleanup: tuple[TerminalCause, CleanupAttempt] | None = None
@@ -126,6 +138,8 @@ class MappedOperationStream[S, T]:
                 cleanup=self._source.aclose,
                 propagate=self._propagate,
                 cleanup_budget=self._cleanup_window,
+                delivered=self._delivered,
+                interrupted=with_interrupt,
             ),
             works_between_reads=source.works_between_reads,
         )
@@ -133,7 +147,7 @@ class MappedOperationStream[S, T]:
     @property
     def report(self) -> OperationReport | None:
         """Return the same frozen terminal report after cleanup."""
-        return self._report
+        return self._runner.report
 
     @property
     def inside_own_work(self) -> bool:
@@ -184,19 +198,25 @@ class MappedOperationStream[S, T]:
             item = await _resolve(self._mapper(source_item))
             if self._count_admitted is None or self._count_admitted(item):
                 self._admitted += 1
-            self._emitted += 1
             self._record_variant(item)
             yield item
 
     def _finalize(self, cause: TerminalCause, _reason: str | None, attempt: CleanupAttempt) -> OperationReport:
         self._cleanup = (cause, attempt)
+        return self._ended_report(cause)
+
+    def _ended_report(self, cause: TerminalCause) -> OperationReport:
         error = self._runner.primary_error
+        if cause is TerminalCause.INTERRUPTED:
+            return self._publish(forced_state=TerminalState.FAILED)
         if cause is TerminalCause.EARLY_CLOSED:
             self._early_closed = True
             return self._publish(forced_state=TerminalState.EARLY_CLOSED)
         if cause is TerminalCause.CANCELLED:
-            return self._publish(forced_state=TerminalState.CANCELLED)
-        if cause is TerminalCause.EXHAUSTED or error is None:
+            # The reader's cancellation ends the stream whatever its source had reached (read out, say): its reason.
+            return self._publish(forced_state=TerminalState.CANCELLED, reason=CANCELLED_REASON)
+        if cause is TerminalCause.EXHAUSTED or error is None or error is self._source.cleanup_failure:
+            # A failed close of a source read to its end is in the source's report already: the close is what failed.
             return self._publish()
         if self._error_items is not None:
             for item in self._error_items(error):
@@ -213,9 +233,7 @@ class MappedOperationStream[S, T]:
         self._cleanup = (cause, attempt)
         if self._report is not None:
             return self._report
-        failed = with_fallback_cleanup(
-            KernelReport(state=KernelState.FAILED, terminal_reason=reason), cause, attempt, subject="stream"
-        )
+        failed = with_fallback_cleanup(KernelReport(state=KernelState.FAILED, terminal_reason=reason), cause, attempt)
         facts = self._facts(failed, forced_state=TerminalState.FAILED)
         facts = replace(
             facts,
@@ -234,6 +252,9 @@ class MappedOperationStream[S, T]:
 
     def _propagate(self, error: BaseException, report: OperationReport) -> BaseException:
         return self._error_mapper(error, report) if self._error_mapper is not None else error
+
+    def _delivered(self) -> None:
+        self._emitted += 1
 
     def _record_variant(self, item: T) -> None:
         variant = self._classify(item) if self._classify is not None else "success"
@@ -275,7 +296,7 @@ class MappedOperationStream[S, T]:
             keyset_selection=self._keyset_selection,
         )
 
-    def _publish(self, *, forced_state: TerminalState | None = None) -> OperationReport:
+    def _publish(self, *, forced_state: TerminalState | None = None, reason: str | None = None) -> OperationReport:
         gate = self._gate()
         if self._cleanup is not None and not self._cleanup[1].finished:
             # Cleanup given up at the deadline: the source never recorded its terminal, so the gate closes
@@ -283,18 +304,29 @@ class MappedOperationStream[S, T]:
             gate.close_after_failure(CleanupState.FAILURE)
         elif self._source.report.state is KernelState.NOT_STARTED:
             gate.abort_unstarted()
-        gate.attach_report(self._facts(self._source_report(), forced_state=forced_state))
+        source = self._source_report()
+        if reason is not None:
+            source = replace(source, terminal_reason=reason)
+        gate.attach_report(self._facts(source, forced_state=forced_state))
         self._report = gate.finish()
         self._terminated()
         return self._report
 
     def _source_report(self) -> KernelReport:
-        """Return the source's report with this stream's own cleanup result when the source lacks one."""
+        """Return the source's report with this stream's own cleanup result when the source lacks one.
+
+        Closed early by this stream after its reader's cancellation or an interrupt, the source records its failed close
+        as what failed; here that end came first (``closed_behind_its_end``), so the close is recorded behind it.
+        """
         report = self._source.report
-        if self._cleanup is None or any(violation.code == "cleanup_failure" for violation in report.violations):
+        if self._cleanup is None:
             return report
         cause, attempt = self._cleanup
-        return with_cleanup_attempt(report, cause, attempt, subject="stream")
+        if closed_behind_its_end(cause, attempt):
+            return with_cleanup_failure_behind(report, cast("BaseException", attempt.error))
+        if any(violation.code == "cleanup_failure" for violation in report.violations):
+            return report
+        return with_cleanup_attempt(report, cause, attempt)
 
     def _terminated(self) -> None:
         if self._deregister is not None:

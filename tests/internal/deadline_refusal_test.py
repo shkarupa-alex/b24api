@@ -71,7 +71,7 @@ UNREFUSED_READERS = Counter(
         ("completion/operation_stream.py", "MappedOperationStream._cleanup_window", "cleanup_window"): 1,
         (CONTEXT, "AsyncIteratorController.aclose", "cleanup_window"): 1,
         ("references/dispatch.py", "_BatchPageDispatcher.aclose", "cleanup_window"): 1,
-        ("references/scheduler.py", "ReferenceScheduler._cleanup", "cleanup_window"): 1,
+        ("references/scheduler.py", "ReferenceScheduler._stop_work", "cleanup_window"): 1,
     }
 )
 UNREFUSED_METHODS = {method for _, _, method in UNREFUSED_READERS}
@@ -196,7 +196,7 @@ CONSTRUCTIONS = Counter(
         ): 1,
         (
             "references/scheduler.py",
-            "ReferenceScheduler._cleanup",
+            "ReferenceScheduler._stop_work",
             "CleanupOverrunError('reference task cleanup exceeded operation time budget')",
         ): 1,
     }

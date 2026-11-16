@@ -3,13 +3,11 @@
 from __future__ import annotations
 import asyncio
 import contextlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from b24api.completion.closure import DECLARED_SHORT_PAGE_REACHED, qualified_closure
 from b24api.contracts.completion import BindingClosure
 from b24api.contracts.dispatch import PORTAL_PAGE_ROWS
-from b24api.contracts.report import PageRecord, Violation, ViolationSeverity
-from b24api.execution.failure import report_reason
 from b24api.traversal.plans import (
     CountedOffsetPlan,
     DispatchPlan,
@@ -24,6 +22,8 @@ from b24api.traversal.plans import (
 if TYPE_CHECKING:
     from b24api.completion.reference_recorder import ReferenceCompletionRecorder
     from b24api.contracts.policy import ExecutionPolicy
+    from b24api.contracts.report import PageRecord
+    from b24api.execution.context import Settled
     from b24api.references.dispatch import _DoneEvent, _Event
     from b24api.traversal.driver import PaginationDriver
 
@@ -68,20 +68,9 @@ def _new_page_records(driver: PaginationDriver, previous_count: int) -> tuple[Pa
     return (driver.last_page_record,)
 
 
-def _record_cleanup_failure(violations: list[Violation], error: BaseException) -> None:
-    """Retain a bounded safe indication of reference cleanup failure."""
-    violations.append(
-        Violation(
-            severity=ViolationSeverity.BLOCKING,
-            code="cleanup_failure",
-            message=f"reference cleanup also failed ({report_reason(error)})",
-        )
-    )
-
-
-async def _wait_for_admission(producer: asyncio.Task[None], changed: asyncio.Event) -> None:
+async def _wait_for_admission(producer: asyncio.Task[Settled[None]], changed: asyncio.Event) -> None:
     if producer.done():
-        await producer
+        (await producer).unwrap()
         return
     waiter = asyncio.create_task(changed.wait())
     try:
@@ -90,14 +79,14 @@ async def _wait_for_admission(producer: asyncio.Task[None], changed: asyncio.Eve
             changed.clear()
             return
         if producer in done:
-            await producer
+            (await producer).unwrap()
     finally:
         if not waiter.done():
             waiter.cancel()
         await asyncio.gather(waiter, return_exceptions=True)
 
 
-async def _wait_for_event(queue: asyncio.Queue[_Event], producer: asyncio.Task[None]) -> _Event:
+async def _wait_for_event(queue: asyncio.Queue[_Event], producer: asyncio.Task[Settled[None]]) -> _Event:
     if producer.done():
         return await queue.get()
     getter = asyncio.create_task(queue.get())
@@ -111,19 +100,24 @@ async def _wait_for_event(queue: asyncio.Queue[_Event], producer: asyncio.Task[N
 
 
 async def _wait_for_cleanup_tasks(
-    tasks: tuple[asyncio.Task[None], ...],
+    tasks: tuple[asyncio.Task[Settled[Any]], ...],
     *,
     remaining: float,
-) -> tuple[set[asyncio.Task[None]], list[BaseException]]:
+) -> tuple[set[asyncio.Task[Settled[Any]]], list[BaseException]]:
     active = set(tasks)
     if not active:
         return set(), []
     done, pending = await asyncio.wait(active, timeout=remaining)
-    errors = [error for task in done if not task.cancelled() and (error := task.exception()) is not None]
+    errors = [error for task in done if (error := _failure(task)) is not None]
     for task in pending:
         task.cancel()
         task.add_done_callback(_consume_task_result)
     return pending, errors
+
+
+def _failure(task: asyncio.Task[Settled[Any]]) -> BaseException | None:
+    """Return the failure a finished task returned (``Settled``): a ``spawn_settled`` task ends in none."""
+    return None if task.cancelled() else task.result().error
 
 
 def _consume_task_result(task: asyncio.Task[object]) -> None:
@@ -131,9 +125,9 @@ def _consume_task_result(task: asyncio.Task[object]) -> None:
         task.result()
 
 
-async def _finish_task(tasks: dict[int, asyncio.Task[None]], index: int) -> None:
+async def _finish_task(tasks: dict[int, asyncio.Task[Settled[None]]], index: int) -> None:
     task = tasks.pop(index)
-    await task
+    (await task).unwrap()
 
 
 def _whole_result_share(dispatch: DispatchPlan, policy: ExecutionPolicy) -> int:

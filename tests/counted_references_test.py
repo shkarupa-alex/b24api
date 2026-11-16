@@ -7,6 +7,7 @@ queue; a reference binding's head and dense tail ride the shared dispatcher and 
 
 from __future__ import annotations
 import asyncio
+import gc
 import json
 from collections import Counter
 from typing import TYPE_CHECKING, Any
@@ -679,6 +680,43 @@ async def test_ax_cancelling_the_consumer_keeps_the_primary_cancellation() -> No
         with pytest.raises(asyncio.CancelledError):
             await task
     assert _report(stream).state is TerminalState.CANCELLED
+
+
+@pytest.mark.parametrize("call", [1, 3, 10])
+def test_an_interrupt_a_counted_tail_send_raises_leaves_the_loop_with_no_task_behind(call: int) -> None:
+    # A counted binding's tail pages are fetched by tasks of the library's own (the heads come first, in calls 1
+    # and 2): the transport's interrupt reaches the caller's task, with no library task ending in it or left behind.
+    reported: list[str] = []
+    reached: list[type[BaseException]] = []
+    pending: list[str] = []
+    answer = _dense(ROWS)
+    calls = 0
+
+    def interrupting(method: str, query: Query) -> Envelope:
+        nonlocal calls
+        calls += 1
+        if calls == call:
+            raise KeyboardInterrupt
+        return answer(method, query)
+
+    async def main() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
+        try:
+            await _outcomes(BatchPortal(interrupting), (1, 2), dispatch=BatchDispatch())
+        except BaseException as error:
+            reached.append(type(error))
+            raise
+        finally:
+            current = asyncio.current_task()
+            pending.extend(task.get_name() for task in asyncio.all_tasks() if task is not current)
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(main())
+    gc.collect()
+    # The interrupt reached the caller's own task, not a cancellation from a loop it stopped.
+    assert reached == [KeyboardInterrupt]
+    assert reported == []
+    assert pending == []
 
 
 # --- What a failed or abandoned page reports and how it settles ------------------------------------

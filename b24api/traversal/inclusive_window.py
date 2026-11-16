@@ -14,7 +14,7 @@ from b24api.contracts.report import PageRejectionCode
 from b24api.contracts.response import result_snapshot
 from b24api.errors import CapabilityError, ContinuationError, PaginationError
 from b24api.traversal.continuation import response_more
-from b24api.traversal.identity import _PageRejectionError, _request_with_controls
+from b24api.traversal.identity import _request_with_controls
 from b24api.traversal.keyset_eligibility import _path_lookup
 from b24api.traversal.strategy_context import PageStop, PageVerdict
 from b24api.traversal.values import _extract_optional_path
@@ -135,7 +135,10 @@ class InclusiveWindowStrategy:
             raise PaginationError("window page exceeded its decoded row ceiling")
         identities = ctx.extract_identities(source)
         if len(set(identities)) != len(identities):
-            raise _PageRejectionError("duplicate identity within a window page", PageRejectionCode.DUPLICATE_IDENTITY)
+            raise PaginationError(
+                "duplicate identity within a window page",
+                rejection_code=PageRejectionCode.DUPLICATE_IDENTITY,
+            )
         paging = self._classified(PageView(result_snapshot(response), source))
         boundaries = [self._timestamp(source[index]) for index in paging]
         self._check_window(boundaries)

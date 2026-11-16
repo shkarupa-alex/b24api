@@ -18,6 +18,7 @@ from b24api.completion.reference_recorder import ReferenceFastLedger
 from b24api.contracts.policy import KernelState
 from b24api.contracts.report import KeysetSelectionSummary, Violation, ViolationSeverity
 from b24api.errors import PaginationError
+from b24api.execution.context import latch_escape
 from b24api.references.budget_view import BindingBudgetView, RowLease
 from b24api.references.dispatch import _DoneEvent, _FailureEvent, _PageEvent
 from b24api.references.wave_engine import SharedWaveEngine, WaveHost
@@ -131,19 +132,21 @@ async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKe
     except asyncio.CancelledError:
         raise
     except BaseException as error:
-        # The scheduler's per-reference boundary turns the error into this binding's terminal event.
+        latch_escape(error)  # Latched before the await, so no cancellation of it can ever replace it.
         if runtime is not None and not runtime.closed:
             await runtime.aclose()
         ledger.close(successful=False, reason=KernelState.FAILED.value)
-        run.failure = _FailureEvent(
-            run.work,
-            error,
-            None,
-            run.page_state,
-            run.partial_rows,
-            () if runtime is None else _binding_violations(runtime.violations),
-            _page_records(host, run, trace),
-        )
+        if isinstance(error, Exception):
+            # A failure: the scheduler's per-reference boundary turns it into this binding's terminal event.
+            run.failure = _FailureEvent(
+                run.work,
+                error,
+                None,
+                run.page_state,
+                run.partial_rows,
+                () if runtime is None else _binding_violations(runtime.violations),
+                _page_records(host, run, trace),
+            )
         raise
     finally:
         if runtime is not None and not runtime.closed:

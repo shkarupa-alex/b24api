@@ -117,6 +117,130 @@
   row, so the report's `buffered_rows_high_water` could stay below what the window held. It now counts one row,
   as it was fitted.
 
+## One model for a source's failure and a failed close
+
+- **A failed close is reported the same way in every family.** The stream families that read a
+  caller's source described the same failed close differently: `batch()` and `batch_outcomes()`
+  recorded "batch cleanup failed (X)" plus an `internal_failure` "stream cleanup failed (X)", while
+  `fan_out()`, `fan_out_outcomes()` and the reference families took the error's class name as the
+  terminal reason and recorded "reference cleanup also failed (X)" even when the close was the only
+  failure, plus an `internal_failure` "fan_out failed (X)". All nine now build one report: when
+  nothing failed before the close, the terminal reason is "stream cleanup failed" and the report
+  carries one `cleanup_failure` violation "stream cleanup failed (X)", nothing else; behind an
+  earlier failure, that failure stays the terminal reason and the close adds a `cleanup_failure`
+  "stream cleanup also failed (X)". X is `InputSourceError` for a close that raised (next item) and
+  `CleanupOverrunError` for one that overran its window. The earlier failure's violation comes first
+  and the close's after it (a family that stops at the first failure listed the close first). `iter_list_keyset()` on its
+  fast path reports a failed close the same way: an early close whose cleanup failed has the terminal
+  reason "stream cleanup failed" (it was "stream closed before exhaustion"), and a failure it ends with
+  no longer carries "stream cleanup also failed (X)" as a note. Code that matched the old strings must
+  match these. A library error raised behind an earlier failure no longer carries that line as a note
+  (only `batch_outcomes()` added one); read it from the report the error carries (`error.report`). Your
+  own exception raised inside `async with stream`, which a failed close does not replace, carries one
+  note: the report's `cleanup_failure` violation word for word (it was "stream cleanup also failed (X)",
+  with X the raised class, `BatchFailed` for `batch()` and `fan_out()`; it is now "stream cleanup
+  failed (InputSourceError)" or "stream cleanup failed (CleanupOverrunError)"). A `KeyboardInterrupt` or
+  `SystemExit`, from a close or anywhere else in the operation, is never behind anything: it is what the
+  stream raises, whatever ended the stream before it (a failure, the reader's cancellation, a timeout, a
+  close from another task), and the report is `failed` with the terminal reason "operation interrupted":
+  the violations recorded before it stay (an earlier failure's first) and one `interrupted` violation,
+  "operation interrupted (X)" with its class as X, comes last. A close's interrupt is no longer recorded
+  as the close's failure.
+- **Breaking: a close that raises is the source failing.** A source's close that raised, from its
+  `aclose()`, its `close()` or a generator's `finally`, surfaced as the raw exception on `break` from a
+  synchronous source and wrapped from an asynchronous one. Every family now raises it as it raises a
+  failed pull: `InputSourceError` (`batch()` and `fan_out()`: `BatchFailed`, whose `__cause__` is that
+  `InputSourceError`), with the exception the close raised as its `__cause__`. Catch
+  `InputSourceError` (or `BatchFailed`) where you caught your own close's exception, and read it from
+  `__cause__`. A close that overran its window still raises `CleanupOverrunError`; a cancellation, an
+  interrupt or any other `BaseException` that is not an `Exception` is not wrapped.
+- **Breaking: anything a batch source raises is a source failure.** A source of `batch()` or
+  `batch_outcomes()` that raised a library error of its own (for example a `BudgetExceededError` it
+  caught elsewhere and let through) ended the stream as if that error were the operation's; the
+  reference families already wrapped it. Every `Exception` a source raises, from a pull or from its
+  close, is now `InputSourceError` chained to it in every family.
+- **The reference scheduler always closes its source.** When `fan_out()`, `fan_out_outcomes()` or a
+  reference traversal ended while its own tasks were still running past the cleanup window, it left
+  the caller's source unclosed. The source now gets its close in every case; the overrun is
+  recorded as "stream cleanup failed (CleanupOverrunError)", and the error's message names the work that
+  overran. With `DirectDispatch` the reference tasks send the commands: "reference task cleanup exceeded
+  operation time budget". With `BatchDispatch` the dispatcher's workers send them: "batch dispatcher
+  cleanup exceeded operation time budget" (and the first message when only the reference tasks overran,
+  the workers not).
+- **A close while a read is in flight is an early close like any other.** When another task closed
+  a stream while its reader waited, the read raised `CancelledError` and a failed close showed only as
+  a report violation. Neither a caller's cancellation, the budget nor a failure ended the stream, so
+  the close is an early close: the report is `early_closed`, and when the close failed, both the
+  close and the read it ended raise its failure (`InputSourceError` or `BatchFailed`, or
+  `CleanupOverrunError`), with the terminal reason "stream cleanup failed". When the close succeeds,
+  the read still raises `CancelledError` and the close returns. A read in flight when the client
+  closes raises the source's failure the same way.
+- **A rejected page chains to the public `PaginationError`.** Fail-fast `iter_references()` and
+  `fan_out()` raised `ReferenceFailed` whose `__cause__` was a private `PaginationError` subclass,
+  and a budget end could chain to a private window error. A foreign item a `batch()` or
+  `batch_outcomes()` source yielded chained `InputSourceError` to a private `TypeError` subclass; it
+  is now a plain `TypeError`, as in every other family. Public errors now chain only to public
+  errors or to your own exception. `PaginationError` has a `rejection_code` attribute
+  (`PageRejectionCode`, `None` unless a page check rejected a page), the code the rejected page's
+  `PageRecord` carries.
+- **`report.emitted` counts the items the reader got.** A reader cancelled just as a read produced
+  its item never got it, but the report counted it as emitted. An item now counts once the reader
+  has it.
+- **No library task ends in a failure at shutdown.** When the event loop shut down while a stream
+  ended (for example during the cleanup grace after the budget's end, or while a read waited in the
+  source), `asyncio.run()` reported a library task that ended in the source's failure: a source's pull
+  or close task, or a stream's read task. Every task the library starts around your code (a source's
+  pull and close, a reference traversal's binding tasks and page fetches, a stream's read and
+  cleanup, the client's close) now returns how it ended to its owner, which raises
+  the failure; only your own task receives it. That includes a `KeyboardInterrupt` or `SystemExit` your
+  transport raises under a reference family, which stopped the event loop from inside a library task:
+  it now reaches the read in flight, which raises it with the report. Raised between your reads, it
+  leaves the event loop at once, as before, and the stream's end follows: a later read raises
+  `StopAsyncIteration` and a close returns, the report attached to the interrupt as `.report`. Under
+  `asyncio.run` the interrupt stops the loop before that end begins: the end is the close the shutdown
+  runs as it cancels your tasks (an `async with stream` or the client's `async with`), which closes the
+  source and reports the interrupt. A read or close cancelled while it runs the end still lets it publish
+  ("stream cleanup also failed (CancelledError)"). With nothing to close the stream (you never close it
+  nor its client, or `asyncio.run` was already shutting down when the interrupt was raised) it gets no
+  end: its source stays open and there is no report.
+- **Breaking: only an `Exception` is a failure.** Any other `BaseException` that is neither an interrupt nor
+  a cancellation is no longer treated as an interrupt, which asyncio's loop only logged and dropped between
+  reads, nor as a failure: no family wraps it, makes it an outcome or ranks it. It propagates as Python
+  propagates it: you get it as it is from your read, whether your transport raised it in that read or
+  between reads, or your source's pull or close did; raised by your source's close it replaces whatever
+  ended the stream, as from a `finally`. It is never lost silently: what no read got, the close raises,
+  once; one the library could no longer deliver to a read or a close (raised after the stream ended, by
+  work that outlived its cleanup window, or in a stream nothing ever ends, once it is collected) is
+  reported to the event loop's exception handler, once. Your source is closed once and nothing hangs. Its
+  report and its rank behind other ends are not promised. Code that caught it as the `__cause__` of
+  `InputSourceError`, `BatchFailed` or `ReferenceFailed`, or read it from a failure outcome, catches it
+  directly.
+- **An outcome's failure from outside the library keeps its cause.** In the `iter_*_outcomes()` families,
+  a failure that is not the library's error (the exception your `page_stop` callback raises, say) was
+  carried as a `CapabilityError` ("reference failed") that dropped it. That `CapabilityError` now has it as
+  `__cause__`, as `ReferenceFailed` does in the fail-fast families; a traversal's error
+  (`IncompleteTraversalError`) keeps it in its chain.
+- **A cancelled stream gives the cancellation's reason.** A stream read to its end and cancelled
+  while its source closed reported `cancelled` with the terminal reason "input exhausted" (or
+  "reference input exhausted"). Every family now gives "iteration cancelled" whenever the reader's
+  cancellation ends the stream.
+- **A stream of yours read under a closed read is cancelled.** A stream your code read inside work an
+  outer stream's read started (a transport, for example), cancelled because the outer stream was
+  closed, reported `early_closed` as if closed itself. It now reports `cancelled`.
+- **Breaking: an asynchronous source keeps one context, copied when the stream is created.** Each
+  pull of an asynchronous source ran in a fresh copy of the reading task's context, so an async
+  generator that set a `ContextVar` before a `yield` could not reset its token after it (`ValueError`,
+  and the stream failed with the source). As a synchronous source already did, each source now runs
+  every pull and its close in one `contextvars.Context`, copied when the call that creates the stream
+  (`batch()`, `fan_out()`, a reference traversal) is made; the reading task drives each step, so
+  nothing else about the source's scheduling changes. A context variable set after that call is no
+  longer seen by the source: for example, a tracing span or request id set around the `async for`
+  loop. Set it before creating the stream.
+- **An interrupt through a send keeps no credential.** A `KeyboardInterrupt`, `SystemExit` or
+  `GeneratorExit` passing through `HttpxTransport` kept the transport's and HTTPX's frames in its
+  traceback, whose locals hold the request with the webhook token in its URL. The transport now
+  drops those frames, and the exception's chain, before re-raising it unchanged otherwise.
+
 ## The end of `max_elapsed` is not a cleanup failure
 
 - **Cleanup gets a grace past the budget.** Every stream but `iter_list()` waited for its source's
@@ -166,13 +290,17 @@
   `BudgetExceededError`, with an `incomplete` report. A page stopped for its request alone (its
   attempts, its retry window or a retry delay longer than the time left) is still a failed page: the
   terminal reason stays `IncompleteTraversalError`.
-- **A cancellation outranks a close that overruns its window.** A consumer cancelled while its
-  stream was running, whose source close then blocked past `max_elapsed`, received
-  `BudgetExceededError` ("... cleanup exceeded operation time budget") and a `budget_exhausted`
-  report. It now receives its `CancelledError`; the report is `cancelled`, with the overrun as a
-  `cleanup_failure`. This holds only for a cancellation that ended the stream: a consumer cancelled
-  after the budget (or a failure) ended it, while its cleanup waits, receives that error with an
-  `incomplete` (or `failed`) report, and the cancellation is delivered at its next `await`.
+- **A cancellation outranks a close that fails.** A consumer cancelled while its stream was running,
+  whose source close then blocked past `max_elapsed`, received `BudgetExceededError` ("... cleanup
+  exceeded operation time budget") and a `budget_exhausted` report. One whose source close raised
+  received the close's failure, with a `cancelled` report when the cancellation landed between reads and
+  a `failed` one when it landed while a read waited. In every family, the fast `iter_list_keyset()`
+  included, and whenever the cancellation lands, it now receives its `CancelledError`; the report is
+  `cancelled` with the terminal reason "iteration cancelled", and the close's failure is a
+  `cleanup_failure` "stream cleanup also failed (X)"; the `CancelledError` carries that failure as its
+  `__cause__` and the report as `.report`. An interrupt is the exception (first item). This holds only for a cancellation that ended the stream: a consumer cancelled after the
+  budget (or a failure) ended it, while its cleanup waits, receives that error with an `incomplete` (or
+  `failed`) report, and the cancellation is delivered at its next `await`.
 - **A cleanup overrun has its own public error and is reported as a failed close.** A close that
   overran its window raised `BudgetExceededError` from `aclose()` or the `async with` exit; on a
   stream read to its end, the report also took it for the budget's end (`incomplete`, with a
@@ -764,9 +892,10 @@ instead.
   `httpcore` DEBUG records carry the response headers, so a `Location` header that holds the token
   puts it in a record; see the HTTPX logging note in
   [Migrating to the issues architecture (2.3)](#migrating-to-the-issues-architecture-23). What is not
-  converted passes through unchanged: an exception that is not an `Exception` (`KeyboardInterrupt`,
-  `SystemExit`) raised by a hook, whose traceback runs through the HTTPX frames that hold the request,
-  and the arguments a canceller gives a cancellation. One limitation remains: over HTTP/2, HTTPX's
+  converted passes through as it is: an exception that is not an `Exception` (`KeyboardInterrupt`,
+  `SystemExit`) raised by a hook, which leaves without the transport's and HTTPX's frames that hold the
+  request and with its `__cause__` and `__context__` cleared, and the arguments a canceller gives a
+  cancellation. One limitation remains: over HTTP/2, HTTPX's
   HPACK header table keeps the request path with the token. That is connection state of HTTPX,
   reachable only by walking the client's internal objects, not by rendering an error.
 
@@ -933,13 +1062,17 @@ now unknown with reason `CONNECTION_LOST_AFTER_DISPATCH` and a cause chain that 
   that caller code does: each family wraps it as it wraps that code's other failures (for example
   `ReferenceFailed`, `BatchFailed`, `InputSourceError` or `TransportError`), and the `RuntimeError`
   stays in the cause chain. Raised in a source's `finally` during the stream's cleanup, it is the
-  cleanup failure: the close raises it and the report records `cleanup_failure`.
+  source's failed close: the close raises it as `InputSourceError` (`batch()`, `fan_out()`:
+  `BatchFailed`) and the report records `cleanup_failure`.
 - **A cancelled close or cleanup gives up at the operation deadline.** Stream cleanup deferred a
   cancellation of its caller until it ended, however long that took. It now defers it only while
   the operation's `ExecutionPolicy.max_elapsed` lasts; cleanup still running then finishes in the
   background, the close raises `BudgetExceededError` and the cancellation is delivered at the next
   await, and the report carries a `cleanup_failure` violation with the terminal reason "stream
-  cleanup failed". Without a cancellation, cleanup is still awaited to its end.
+  cleanup failed". Without a cancellation, cleanup is still awaited to its end. A read or close that
+  runs the end an interrupt between reads left is the exception: that end has no deadline of its own, so
+  the read or close defers its cancellation until the end is over, which the cleanup windows of its steps
+  bound (the operation's time left, at least the cleanup grace), not the operation's deadline.
 
 ## CLI exit code for a closed reader
 
@@ -1024,8 +1157,8 @@ now unknown with reason `CONNECTION_LOST_AFTER_DISPATCH` and a cause chain that 
   `INCOMPLETE`.
 - **A `BaseException` leaves a counted traversal as raised.** A `BaseException` that is not an
   `Exception`, such as an application's own shutdown signal, was wrapped in
-  `IncompleteTraversalError`. It now propagates unchanged with a `FAILED` report, as from
-  `iter_list()`; ordinary exceptions are wrapped as before.
+  `IncompleteTraversalError`. It now propagates unchanged, as from `iter_list()`; ordinary exceptions are
+  wrapped as before.
 
 ## Keyset traversal
 
@@ -1246,7 +1379,7 @@ details.
    - when cleanup fails after the source was exhausted, the report records a `cleanup_failure`
      violation and `CleanupState.FAILURE`, and the cleanup error is raised;
    - a failure during cleanup that follows another failure is kept as a secondary `cleanup_failure`
-     violation (for example `reference cleanup also failed (RuntimeError)`), so a report can carry
+     violation (for example `stream cleanup also failed (InputSourceError)`), so a report can carry
      more than one.
    - a stream closed before its first read, by `aclose()` or on leaving `async with`, still closes
      the iterator it took from your command or reference source, once, without reading from it; a

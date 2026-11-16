@@ -3,6 +3,8 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol
 
+from b24api.execution.context import OperationLatch
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
@@ -29,10 +31,10 @@ async def close_owned_resources(
     transport: CloseableResource | None,
     coordinator: CloseableResource | None = None,
 ) -> None:
-    """Attempt every owned close and preserve the first cleanup failure.
+    """Attempt every owned close and preserve the first cleanup failure; an escape outranks it (``OperationLatch``).
 
     Order: streams, then the owned rate coordinator (its cooldown wake task is awaited), then the
-    owned transport.
+    owned transport. The interrupt, else the first other escape, is raised; any other escape goes to the event loop.
     """
     ordered: list[tuple[CloseableResource, str]] = [(stream, "additional stream") for stream in streams]
     ordered.extend(
@@ -40,15 +42,19 @@ async def close_owned_resources(
         for resource, label in ((coordinator, "coordinator"), (transport, "transport"))
         if resource is not None
     )
+    escapes = OperationLatch()
     primary: BaseException | None = None
     for resource, label in ordered:
         try:
             await resource.aclose()
         except BaseException as error:  # noqa: BLE001 - every owned resource must still be closed
+            escapes.record(error)
             if primary is None:
                 primary = error
             else:
                 primary.add_note(f"{label} cleanup failure: {type(error).__name__}")
+    if (escape := escapes.close()) is not None:
+        raise escape
     if primary is not None:
         raise primary
 
