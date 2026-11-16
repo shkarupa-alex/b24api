@@ -29,6 +29,9 @@ _ZLIB_HEADER_CHECK = 31
 _ZLIB_DEFLATE_METHOD = 8
 _ZLIB_MAX_WINDOW_INFO = 7
 _GZIP_PADDING = b"\x00"
+#: The most raw input zlib is handed at once. What a call leaves unread past a gzip member's end is copied out
+#: (``unused_data``), so a bounded slice keeps that copy bounded and a body of many tiny members linear.
+_INFLATE_SLICE = 16 << 10
 
 
 class _DecodeRefusedError(Exception):
@@ -151,7 +154,9 @@ class _BoundedDecoder:
         if decompressor is None:  # pragma: no cover - feed always chooses a decompressor first
             raise RuntimeError("bounded decoder has no decompressor")
         pieces: list[bytes] = []
-        while data:
+        view = memoryview(data)
+        position = 0
+        while position < len(view):
             if decompressor.eof:
                 if self._coding != "gzip":
                     # Bytes after a zlib or raw deflate stream are dropped, never handed back to zlib, whose
@@ -159,12 +164,16 @@ class _BoundedDecoder:
                     break
                 # After a gzip member, zero padding is skipped and anything else must start the next member,
                 # as ``gzip.decompress`` reads them; the ceiling spans every member.
-                data = data.lstrip(_GZIP_PADDING)
-                if not data:
+                position = _skip_padding(view, position)
+                if position == len(view):
                     break
                 decompressor = self._decompressor = zlib.decompressobj(_GZIP_WBITS)
-            pieces.append(self._count(decompressor.decompress(data, self._limit - self._produced + 1)))
-            data = decompressor.unused_data if decompressor.eof else decompressor.unconsumed_tail
+            piece = view[position : position + _INFLATE_SLICE]
+            pieces.append(self._count(decompressor.decompress(piece, self._limit - self._produced + 1)))
+            # What zlib left of the slice is past the member's end; short of it, zlib stops only after the one byte
+            # past the ceiling, which ``_count`` has refused.
+            left = decompressor.unused_data if decompressor.eof else decompressor.unconsumed_tail
+            position += len(piece) - len(left)
         return b"".join(pieces)
 
     def _count(self, decoded: bytes) -> bytes:
@@ -172,6 +181,14 @@ class _BoundedDecoder:
         if self._produced > self._limit:
             raise _DecodedBodyTooLargeError("decoded response body exceeded the byte ceiling")
         return decoded
+
+
+def _skip_padding(view: memoryview, position: int) -> int:
+    """Return the position of the first byte at or after ``position`` that is no gzip zero padding."""
+    while position < len(view) and view[position] == 0:
+        window = view[position : position + _INFLATE_SLICE]
+        position += len(window) - len(bytes(window).lstrip(_GZIP_PADDING))
+    return position
 
 
 @dataclass(frozen=True, slots=True)
