@@ -132,7 +132,7 @@ async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKe
     except asyncio.CancelledError:
         raise
     except BaseException as error:
-        latch_escape(error)  # Latched before the await, whose cancellation would replace it.
+        latch_escape(error)  # Latched before the await, so no cancellation of it can ever replace it.
         if runtime is not None and not runtime.closed:
             await runtime.aclose()
         ledger.close(successful=False, reason=KernelState.FAILED.value)

@@ -312,8 +312,8 @@ outcome.
   worker thread a cancelled synchronous pull still waits for, a binding, a tail page, a cleanup); the
   reference scheduler's binding end and cleanup collectors; the batch dispatcher's senders, whose pages a
   close may have cancelled; every handler that awaits before it raises again (a fast keyset binding's, a
-  counted head's, a counted traversal's), which hands it on first, since a cancellation of that await
-  would replace it; and `OperationRunner.__anext__` where a read ends, which is where an inline kernel
+  counted head's, a counted traversal's), which hands it on first, so that await can never replace it (none
+  of them suspends today; the rule keeps it so if one ever does); and `OperationRunner.__anext__` where a read ends, which is where an inline kernel
   (`batch()`, `iter_list*`, the fast keyset) first catches what its own send raised. That kernel's end
   raises it as its FAILED primary, which a failed cleanup never replaces. An interrupt is different: the
   kernel's end may raise something else in its place (its failed cleanup, say), so the latch is what keeps

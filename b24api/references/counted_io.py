@@ -116,7 +116,7 @@ class SharedCountedWaveIO:
         try:
             dispatched = await self._host.dispatch_page(self._run, request)
         except BaseException as error:
-            latch_escape(error)  # Latched before the await, whose cancellation would replace it.
+            latch_escape(error)  # Latched before the await, so no cancellation of it can ever replace it.
             await self._host.abandon_page(self._run)
             raise
         return HeadAttempt(

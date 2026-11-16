@@ -170,7 +170,7 @@ class CountedItemStream:
             raise incomplete from cause
         except BaseException as error:
             # A BaseException that is not an Exception is no traversal failure to wrap: it leaves as raised.
-            latch_escape(error)  # Latched before the await, whose cancellation would replace it.
+            latch_escape(error)  # Latched before the await, so no cancellation of it can ever replace it.
             primary = error
             await self._finalize(KernelState.FAILED, type(error).__name__)
             _attach_report(error, self.report)
