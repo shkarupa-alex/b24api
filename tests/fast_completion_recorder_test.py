@@ -13,7 +13,7 @@ from b24api.contracts.completion import (
     PageScheduled,
 )
 from b24api.contracts.policy import KernelState
-from b24api.contracts.report import PageOutcome, TerminalState
+from b24api.contracts.report import TerminalState
 
 if TYPE_CHECKING:
     import pytest
@@ -26,7 +26,7 @@ def test_discarded_nonempty_probe_cannot_claim_source_exhaustion() -> None:
     recorder.schedule("probe")
     recorder.settle("probe", CommandSettlement.SUCCESS)
     recorder.validated("probe")
-    recorder.recorded("probe", PageOutcome.COMMITTED)
+    recorder.recorded("probe", None)
 
     recorder.terminal(
         KernelState.COMPLETED,

@@ -1909,3 +1909,124 @@ async def test_a_flat_keyset_request_its_cancellation_interrupts_on_the_wire_tra
     report = stream.report
     assert report is not None
     assert _failed_pages(report) == traced
+
+
+# --- A keyset page's completion record retires it with its trace's code ------------------------------
+
+
+def _retired(monkeypatch: pytest.MonkeyPatch) -> list[PageRejected]:
+    """Collect every PageRejected the completion gate emits."""
+    rejected: list[PageRejected] = []
+    emit = CompletionGate.emit
+
+    def observe(gate: CompletionGate, event: CompletionEvidence) -> None:
+        if isinstance(event, PageRejected):
+            rejected.append(event)
+        emit(gate, event)
+
+    monkeypatch.setattr(CompletionGate, "emit", observe)
+    return rejected
+
+
+def _refuse_second_then_undecodable(portal: BatchPortal) -> ResponderTransport:
+    """Answer the first batch's first command and refuse its second (QUERY_LIMIT_EXCEEDED); lose the replay's answer."""
+    sends = [0]
+
+    async def respond(request: Request) -> WireResponse:
+        sends[0] += 1
+        if sends[0] > 1:  # the refused command's replay
+            return _UNDECODABLE
+        answer = await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 22)
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        second = list(commands)[1]
+        body = json.loads(answer.body)
+        result = body["result"]
+        del result["result"][second]
+        result["result_error"] = {second: {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow"}}
+        return WireResponse(200, answer.headers, json.dumps(body).encode())
+
+    return ResponderTransport(respond, host=portal.host)
+
+
+def _breaks_descending_identity(answer: Callable[..., Envelope]) -> Callable[..., Envelope]:
+    """Serve ``answer``, but the descending boundary probe's first row breaks the identity contract."""
+
+    def broken(method: str, query: Query) -> Envelope:
+        envelope = answer(method, query)
+        if query.get("order[id]") == "DESC":
+            rows = envelope["result"]
+            assert isinstance(rows, list)
+            return {"result": [{"id": f"0{rows[0]['id']}"}, *rows[1:]]}
+        return envelope
+
+    return broken
+
+
+async def _keyset_run(path: str, transport: BatchPortal | ResponderTransport) -> OperationReport:
+    """Run one AUTO keyset traversal, flat or as the one binding of a reference operation; return its report."""
+    async with client_for(transport, policy=ExecutionPolicy(page_trace_limit=1024)) as client:
+        if path == "shared":
+            # A binding fails with the traversal's failure.
+            shared = client.iter_reference_outcomes(
+                _base(), [_parent("p0")], traversal=_traversal(AutoKeysetExecution(_CONTRACT)), dispatch=BatchDispatch()
+            )
+            _outcomes, report = await _drain(shared)
+            return report
+        flat = client.iter_list_keyset(
+            _base(),
+            selector=ResultSelector.root(),
+            identity=_identity(),
+            page_size=PAGE,
+            keyset=_keyset(),
+            execution=AutoKeysetExecution(_CONTRACT),
+        )
+        with pytest.raises((IncompleteTraversalError, RecursionError)):  # a flat traversal raises its failure
+            await _drain(flat)
+    flat_report = flat.report
+    assert flat_report is not None
+    return flat_report
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["flat", "shared"])
+@pytest.mark.parametrize("scenario", ["stop-page", "wave-aborted-by-validation"])
+async def test_a_keyset_page_s_completion_record_retires_it_with_the_code_its_trace_records(
+    monkeypatch: pytest.MonkeyPatch, path: str, scenario: str
+) -> None:
+    # The boundary wave fails: its answered probe is rejected with it (``transaction_aborted``), while the other
+    # probe's replay answer is lost (unknown), or its row breaks the identity contract (``identity_contract``). Each
+    # rejected page whose command succeeded is retired in the completion evidence with the code its trace records.
+    retired = _retired(monkeypatch)
+    rows = tuple(range(1, 46))
+    answer = _answer({"p0": rows}) if path == "shared" else _flat_answer(rows)
+    if scenario == "stop-page":
+        transport: BatchPortal | ResponderTransport = _refuse_second_then_undecodable(BatchPortal(answer))
+        traced = [
+            ("boundary", 0, PageOutcome.REJECTED, PageRejectionCode.TRANSACTION_ABORTED),
+            ("boundary", 1, *_UNKNOWN_PAGE),
+        ]
+    else:
+        transport = BatchPortal(_breaks_descending_identity(answer))
+        traced = [
+            ("boundary", 0, PageOutcome.REJECTED, PageRejectionCode.TRANSACTION_ABORTED),
+            ("boundary", 1, PageOutcome.REJECTED, PageRejectionCode.IDENTITY_CONTRACT),
+        ]
+
+    report = await _keyset_run(path, transport)
+
+    assert sorted(
+        (
+            (
+                None if record.phase is None else record.phase.value,
+                record.batch_index,
+                record.outcome,
+                record.rejection_code,
+            )
+            for record in report.page_trace
+            if record.outcome is not PageOutcome.COMMITTED
+        ),
+        key=str,
+    ) == sorted(traced, key=str)
+    rejected = [code.value for _phase, _index, outcome, code in traced if outcome is PageOutcome.REJECTED]
+    assert sorted(event.reason for event in retired) == sorted(rejected)

@@ -33,6 +33,19 @@ def failed_page(error: object, settled: CommandSettlement) -> tuple[PageOutcome,
     return PageOutcome.REJECTED, PageRejectionCode.COMMAND_FAILURE
 
 
+def rejection_reason(outcome: PageOutcome, code: PageRejectionCode | None) -> str | None:
+    """Return the reason a page's completion record retires it with, or ``None`` for a committed page.
+
+    A page the trace does not commit is retired with the code its trace records: one fact, one reason, on every
+    path (the traversal driver and the keyset runtime alike).
+    """
+    if outcome is PageOutcome.COMMITTED:
+        return None
+    if code is None:
+        raise RuntimeError("an uncommitted page's trace lacks its rejection code")
+    return code.value
+
+
 def _batch_envelope_failure(error: object) -> bool:
     """Return whether a failure is the physical batch envelope's own protocol failure, not one command's."""
     if not isinstance(error, ProtocolError):
@@ -41,4 +54,4 @@ def _batch_envelope_failure(error: object) -> bool:
     return summary is not None and summary.method == "batch"
 
 
-__all__ = ["failed_page"]
+__all__ = ["failed_page", "rejection_reason"]

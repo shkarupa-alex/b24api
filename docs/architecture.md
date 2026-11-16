@@ -71,7 +71,9 @@ it from its send (the budget, a closed client, a cancellation); the settlement d
 other failed page the traversal records. That page is unknown only when it may have run, otherwise
 rejected; a page whose own command succeeded is rejected as `transaction_aborted`, the code of a page
 dropped with the unit around it, not as a `command_failure`, and its completion record retires it with the same
-code (`PageRejected`), as it retires a page the traversal read but never consumed. Whatever ended the page
+code (`PageRejected`), as it retires a page the traversal read but never consumed. One function couples the
+two (`page_failure.rejection_reason`): the driver and the keyset runtime both retire a page they trace as
+rejected with the trace's code. Whatever ended the page
 decides nothing: a page cancelled on the wire may have run and is traced unknown, as one whose answer was lost.
 A traversal records the failed page it stops
 at, not every page its failure leaves behind: a counted tail stops at a binding's first failed page in

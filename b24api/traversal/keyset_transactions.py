@@ -260,7 +260,7 @@ def _trace_failed_call(
 
     The call left no outcome per command to validate; the engine settled each page from what its command did
     (``WaveEngine.failed_pages``), and the trace reads that same fact, with the command's index in its physical
-    batch: a page never sent is not traced. A cancelled call is no failure of its pages.
+    batch: a page never sent is not traced, and whatever ended the call, a cancellation included, decides nothing.
     """
     pages = host.engine.failed_pages(error)
     if pages is None:

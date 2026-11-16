@@ -63,7 +63,7 @@ from b24api.traversal.identity import (
 from b24api.traversal.inclusive_window import InclusiveWindowStrategy
 from b24api.traversal.keyset import KeysetStrategy
 from b24api.traversal.page_adaptation import PageTokens, _SourcePageState, adapt_page
-from b24api.traversal.page_failure import failed_page
+from b24api.traversal.page_failure import failed_page, rejection_reason
 from b24api.traversal.plans import (
     ContinuationPlan,
     CountedOffsetPlan,
@@ -708,8 +708,14 @@ class PaginationDriver:
                 rejection_code=code,
             ),
         )
-        if settled is CommandSettlement.SUCCESS and code is not None and self.completion_recorder is not None:
-            self.completion_recorder.rejected(code.value)
+        if settled is CommandSettlement.SUCCESS:
+            self._retire_rejected(outcome, code)
+
+    def _retire_rejected(self, outcome: PageOutcome, code: PageRejectionCode) -> None:
+        """Retire the active page in its completion record with the reason its trace gives (``rejection_reason``)."""
+        reason = rejection_reason(outcome, code)
+        if reason is not None and self.completion_recorder is not None:
+            self.completion_recorder.rejected(reason)
 
     def _record_rejected_page(
         self,
@@ -741,8 +747,7 @@ class PaginationDriver:
                 rejection_code=code,
             ),
         )
-        if self.completion_recorder is not None:
-            self.completion_recorder.rejected(code.value)
+        self._retire_rejected(PageOutcome.REJECTED, code)
 
     def extract_identities(self, items: tuple[FrozenJson, ...]) -> list[IdentityValue]:
         """Return the identities of the page's items."""

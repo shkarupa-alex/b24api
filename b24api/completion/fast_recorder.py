@@ -22,7 +22,6 @@ from b24api.contracts.completion import (
     StreamTerminal,
 )
 from b24api.contracts.policy import KernelState
-from b24api.contracts.report import PageOutcome
 
 
 @dataclass(slots=True)
@@ -92,19 +91,19 @@ class FastPageLedger:
             raise RuntimeError("fast page validation lacks a unique successful settlement")
         page.validated = True
 
-    def recorded(self, command_id: str, outcome: PageOutcome) -> None:
-        """Retire a semantically accepted or rejected scheduler page."""
+    def recorded(self, command_id: str, rejected: str | None) -> None:
+        """Retire a semantically accepted page, or one ``rejected`` with that reason (its trace's code)."""
         page = self._active.get(command_id)
         if page is None:
             return  # a negative physical settlement already retired it
         if not page.settled:
             raise RuntimeError("fast observation preceded physical settlement")
-        if outcome is PageOutcome.COMMITTED:
+        if rejected is None:
             if not page.validated:
                 raise RuntimeError("fast accepted page was not validated")
             page.recorded = True
         else:
-            self._emit_page(PageRejected, page.page_id, reason=outcome.value)
+            self._emit_page(PageRejected, page.page_id, reason=rejected)
             self._negative = True
             del self._active[command_id]
 

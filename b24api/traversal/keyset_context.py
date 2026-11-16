@@ -112,8 +112,8 @@ class WaveEngine(Protocol):
     def failed_pages(self, error: BaseException) -> tuple[FailedWavePage, ...] | None:
         """Return each page of the latest call that raised ``error``, as the engine settled it, in the call's order.
 
-        ``None`` when ``error`` is not a failure of the pages the latest call sent: the call was refused before
-        any page, or it was cancelled.
+        ``None`` when ``error`` is not what the latest call raised: it ended the operation outside the engine. A call
+        that raised, a cancelled one included, keeps every page, each settled from what its command did.
         """
         ...
 
