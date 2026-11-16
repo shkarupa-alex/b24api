@@ -300,12 +300,17 @@ outcome.
   a read or between reads. An interrupt (`is_interrupt`: a `KeyboardInterrupt` or `SystemExit`, what
   the event loop raises out of `asyncio.run` from a callback, where it only logs and drops anything else)
   is never secondary. Only an `Exception` is a failure (`InputSourceError`, `BatchFailed`,
-  `ReferenceFailed` or a failure outcome, whose error carries it by one rule, `outcome_error`); any other
-  `BaseException` but a cancellation is neither, yet ranks and is reported exactly as an `Exception` at the
-  same point, only never wrapped, and reaches the reader, never the event loop. A reference binding that ends
-  in one publishes `_EndedEvent` as its terminal event, as a failure publishes `_FailureEvent`
-  (`ReferenceScheduler._end_binding`): the reader raises it as it is where the binding's outcome would be, in
-  the stream's delivery order, and a close that comes first drops it with what nobody read. One piece of state carries an interrupt: each operation has one
+  `ReferenceFailed` or a failure outcome, whose error carries it by one rule, `outcome_error`): every catch
+  site that decides a failure catches `Exception`. Any other `BaseException` but an interrupt or a
+  cancellation is no failure and nothing classifies, wraps or ranks it; it propagates as Python propagates
+  it. The library only delivers it: to the reader as it is, from a read, from work between reads or from
+  the source's pull or close, the source closed once, no hang and nothing for the event loop. A cleanup
+  that raises it replaces whatever ended the stream, as a `finally` does (`OperationRunner._terminate`; the
+  cleanup collectors pass any `BaseException` on to their owner). A reference binding that ends in one
+  publishes `_EndedEvent` as its terminal event (`ReferenceScheduler._end_binding`), only so that the reader
+  raises it where the binding's end would be instead of waiting for an end that never comes; a coroutine
+  closed by hand or at collection (`GeneratorExit`) publishes nothing. One piece of state carries an
+  interrupt: each operation has one
   `InterruptLatch`, the isolated runner's, which its pull and cleanup tasks publish through `INTERRUPTS`
   so the tasks they start inherit it (an inline kernel uses the latch of the runner it serves). Every
   place where library code first catches a caller's `BaseException` latches the first interrupt and goes

@@ -202,18 +202,21 @@
   source and reports the interrupt. A read or close cancelled while it runs the end still lets it publish
   ("stream cleanup also failed (CancelledError)"). With nothing to close the stream (you never close it
   nor its client, or `asyncio.run` was already shutting down when the interrupt was raised) it gets no
-  end: its source stays open and there is no report. Any other `BaseException` (neither an interrupt nor a
-  cancellation) is no longer treated as an interrupt, which asyncio's loop only logged and dropped between
-  reads. It ranks and is reported exactly as an `Exception` raised at the same point, in every family; it
-  is only never wrapped: the stream raises it as it is where it would raise `InputSourceError`,
-  `BatchFailed` or `ReferenceFailed`, and an outcome family, which cannot yield it as an outcome, ends with
-  it as a fail-fast family would. Code that caught it as the `__cause__` of one of those errors, or read it
-  from a failure outcome, catches it directly.
-- **An outcome's failure from outside the library keeps its cause.** In `fan_out_outcomes()` and the
-  `iter_*_outcomes()` families, a failure that is not the library's error (the exception your `page_stop`
-  callback raises, say) was carried as a `CapabilityError` ("fan-out command failed", "reference failed")
-  that dropped it. That `CapabilityError` now has it as `__cause__`, as `BatchFailed` and `ReferenceFailed`
-  do in the fail-fast families; a traversal's error (`IncompleteTraversalError`) keeps it in its chain.
+  end: its source stays open and there is no report.
+- **Breaking: only an `Exception` is a failure.** Any other `BaseException` that is neither an interrupt nor
+  a cancellation is no longer treated as an interrupt, which asyncio's loop only logged and dropped between
+  reads, nor as a failure: no family wraps it, makes it an outcome or ranks it. It propagates as Python
+  propagates it: you get it as it is from your read, whether your transport raised it in that read or
+  between reads, or your source's pull or close did; raised by your source's close it replaces whatever
+  ended the stream, as from a `finally`. Your source is closed once, nothing hangs and nothing reaches the
+  event loop. Its report and its rank behind other ends are not promised. Code that caught it as the
+  `__cause__` of `InputSourceError`, `BatchFailed` or `ReferenceFailed`, or read it from a failure outcome,
+  catches it directly.
+- **An outcome's failure from outside the library keeps its cause.** In the `iter_*_outcomes()` families,
+  a failure that is not the library's error (the exception your `page_stop` callback raises, say) was
+  carried as a `CapabilityError` ("reference failed") that dropped it. That `CapabilityError` now has it as
+  `__cause__`, as `ReferenceFailed` does in the fail-fast families; a traversal's error
+  (`IncompleteTraversalError`) keeps it in its chain.
 - **A cancelled stream gives the cancellation's reason.** A stream read to its end and cancelled
   while its source closed reported `cancelled` with the terminal reason "input exhausted" (or
   "reference input exhausted"). Every family now gives "iteration cancelled" whenever the reader's
@@ -1151,8 +1154,8 @@ now unknown with reason `CONNECTION_LOST_AFTER_DISPATCH` and a cause chain that 
   `INCOMPLETE`.
 - **A `BaseException` leaves a counted traversal as raised.** A `BaseException` that is not an
   `Exception`, such as an application's own shutdown signal, was wrapped in
-  `IncompleteTraversalError`. It now propagates unchanged with a `FAILED` report, as from
-  `iter_list()`; ordinary exceptions are wrapped as before.
+  `IncompleteTraversalError`. It now propagates unchanged, as from `iter_list()`; ordinary exceptions are
+  wrapped as before.
 
 ## Keyset traversal
 

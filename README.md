@@ -968,17 +968,18 @@ with the terminal reason "operation interrupted", every violation recorded befor
 failure's first), and one `interrupted` violation last, "operation interrupted (X)", where X is
 `KeyboardInterrupt` or `SystemExit`. The raised interrupt carries that report as `.report`, as the
 `CancelledError` does. A close that fails after an interrupt ended the stream is "stream cleanup also
-failed (X)", as behind any other end that came first. Any other `BaseException` (neither an interrupt
-nor a cancellation), from your source's pull or close, your transport or a callback, ranks and is reported
-exactly as an `Exception` raised at the same point; the one difference is that it is never wrapped. Where
-an `Exception` becomes `InputSourceError`, `BatchFailed` or `ReferenceFailed`, it is raised as it is, and the
-report names its class: "<family> failed (X)", "stream cleanup failed (X)" from the source's close (also on
-an early close), "stream cleanup also failed (X)" from a close behind an earlier failure, which is what you
-get, and the `__cause__` of the `CancelledError` behind your cancellation. It can be no failure outcome, so
-in an outcome family it ends the stream as a fail-fast family's failure would. Raised by a reference's send,
-it takes that reference's place: in `DeliveryOrder.INPUT` it reaches your read after the outcomes of the
-references before it, in `READY` when it comes; a close before your read gets there drops it, as it drops a
-failure nobody read. It never goes to the event loop, which would only log it.
+failed (X)", as behind any other end that came first.
+
+A failure is an `Exception`. Any other `BaseException` that is neither an interrupt nor a cancellation is
+no failure: the library never catches it as one, never wraps it, never makes it an outcome and never ranks
+it; it propagates as Python propagates it. Raised by your source's close it replaces whatever ended the
+stream, as an exception raised in a `finally` does, and under `async with` it replaces your own exception,
+which becomes its `__context__`. The library guarantees only this, in every family: it reaches you as it
+is, whether your transport raised it in your read or between your reads (in the stream's background work),
+or your source's pull or close did; the source is closed once; nothing hangs waiting for an end it took
+the place of; and nothing reaches the event loop's exception handler or is left in a task whose exception
+nobody retrieves. What the report says about it, and how it ranks behind other ends, is not promised.
+
 An interrupt raised while no read is waiting (by a send the stream runs between your reads, while you work
 on an item) does not wait for your next read: it leaves the event loop at once, out of `asyncio.run`, as
 asyncio raises any task's, and the operation's end follows: its work cancelled, its source closed and its
