@@ -761,7 +761,10 @@ async def test_counted_bindings_cancelled_while_a_replay_is_on_the_wire_settle_e
     assert (CommandSettlement.NOT_EXECUTED in settled) is (stage == "tail")
 
 
-_TRAVERSALS = {"counted": CountedTraversal(page_size=WIDTH), "sequential": SequentialTraversal(page_size=WIDTH)}
+_TRAVERSALS: dict[str, CountedTraversal | SequentialTraversal] = {
+    "counted": CountedTraversal(page_size=WIDTH),
+    "sequential": SequentialTraversal(page_size=WIDTH),
+}
 
 
 @pytest.mark.asyncio
