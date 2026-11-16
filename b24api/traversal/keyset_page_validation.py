@@ -220,7 +220,11 @@ def validate_boundary_direction(
     ascending: LaneReceipt,
     descending: LaneReceipt,
 ) -> ReceiptRejection | None:
-    """Reject an ignored descending direction before boundary admission."""
+    """Reject boundary pages whose directions contradict each other before boundary admission.
+
+    Each direction's first page starts at its end of one selection: the ascending page at its least identity, the
+    descending page at its greatest. Neither may then hold an identity beyond the other's end.
+    """
     if bool(ascending.identities) != bool(descending.identities):
         return ReceiptRejection(
             descending.lane_ordinal,
@@ -247,6 +251,13 @@ def validate_boundary_direction(
             descending.command_id,
             Violation(ViolationSeverity.BLOCKING, "direction_contradiction", "descending boundary precedes head"),
             "descending boundary precedes head",
+        )
+    if ascending.identities and descending.identities and min(descending.identities) < min(ascending.identities):
+        return ReceiptRejection(
+            descending.lane_ordinal,
+            descending.command_id,
+            Violation(ViolationSeverity.BLOCKING, "direction_contradiction", "descending boundary passes head"),
+            "descending boundary passes head",
         )
     return None
 

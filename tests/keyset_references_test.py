@@ -1683,7 +1683,7 @@ async def test_a_flat_keyset_finish_page_sent_directly_records_no_batch_index() 
     ]
 
 
-# --- A descending finish page the admission frontier refuses ------------------------------------------
+# --- A descending boundary below the ascending head ---------------------------------------------------
 
 
 def _hides_low_rows_ascending(parents: frozenset[str]) -> Callable[..., Envelope]:
@@ -1710,29 +1710,26 @@ def _descending(execution: Execution) -> KeysetTraversal:
     )
 
 
-def _finish_rejection(report: OperationReport) -> list[tuple[object, ...]]:
+def _boundary_rejection(report: OperationReport) -> list[tuple[object, ...]]:
     return [
         (
             record.reference_index,
-            record.dispatch,
+            None if record.phase is None else record.phase.value,
             record.batch_index,
             record.rows_selected,
             record.outcome,
             record.rejection_code,
         )
         for record in report.page_trace
-        if record.phase is not None and record.phase.value == "finish" and record.outcome is not PageOutcome.COMMITTED
+        if record.outcome is not PageOutcome.COMMITTED
     ]
 
 
 @pytest.mark.asyncio
-async def test_a_flat_descending_finish_page_the_admission_frontier_refuses_is_traced_as_a_range_contradiction() -> (
-    None
-):
-    # The boundary probes overlap ([5..12] ascending, [12..3] descending), so the traversal finishes below the
-    # ascending probe's lowest row, 5, while the descending head already admitted down to 3. The finish page
-    # answers [4, 3, 2, 1]: inside its lane, but behind the admitted frontier. The traversal fails with that
-    # contradiction, and the direct finish page is traced as one.
+async def test_a_flat_descending_boundary_below_the_ascending_head_fails_before_any_finish_page() -> None:
+    # The boundary probes contradict each other: the ascending one ends at its lowest row, 5 ([5..12], a short
+    # page), while the descending one reaches 3 ([12..3]). The traversal fails on the probes, sends no finish
+    # page, and traces both probes as the range contradiction, their rows discarded.
     portal = BatchPortal(_hides_low_rows_ascending(frozenset({""})))
     async with client_for(portal, policy=ExecutionPolicy(page_trace_limit=1024)) as client:
         stream = client.iter_list_keyset(
@@ -1747,23 +1744,23 @@ async def test_a_flat_descending_finish_page_the_admission_frontier_refuses_is_t
             await _drain(stream)
 
     assert isinstance(raised.value.__cause__, PaginationError)
-    assert "did not advance" in str(raised.value.__cause__)
-    assert portal.waves == [2, 1]
+    assert "descending boundary passes head" in str(raised.value.__cause__)
+    assert portal.waves == [2]
     report = stream.report
     assert report is not None
-    # The refused page selected its four rows and admitted none: they are discarded, not lost from the provenance.
-    assert _finish_rejection(report) == [
-        (None, PageDispatch.DIRECT, None, 4, PageOutcome.REJECTED, PageRejectionCode.RANGE_CONTRADICTION)
+    assert _boundary_rejection(report) == [
+        (None, "boundary", 0, 8, PageOutcome.REJECTED, PageRejectionCode.RANGE_CONTRADICTION),
+        (None, "boundary", 1, 10, PageOutcome.REJECTED, PageRejectionCode.RANGE_CONTRADICTION),
     ]
     assert report.keyset_execution is not None
-    assert report.keyset_execution.probe_rows_discarded == 4
+    assert report.keyset_execution.probe_rows_discarded == 18
 
 
 @pytest.mark.usefixtures("coalescing")
 @pytest.mark.asyncio
-async def test_a_reference_descending_finish_page_the_admission_frontier_refuses_fails_its_binding_alone() -> None:
-    # The same contradiction for the second of three parents: its binding fails with it, the others complete, and
-    # its finish page, first in the shared second batch, is traced as a range contradiction at index 0.
+async def test_a_reference_descending_boundary_below_the_ascending_head_fails_its_binding_alone() -> None:
+    # The same contradiction for the second of three parents: its binding fails with it before any finish page,
+    # the others complete, and its two probes, third and fourth in the shared first batch, are traced as it.
     portal = BatchPortal(_hides_low_rows_ascending(frozenset({"p1"})))
     async with client_for(portal, policy=ExecutionPolicy(page_trace_limit=1024)) as client:
         stream = client.iter_reference_outcomes(
@@ -1778,11 +1775,12 @@ async def test_a_reference_descending_finish_page_the_admission_frontier_refuses
     assert [failure.correlation for failure in failures] == ["p1"]
     assert isinstance(failures[0].error, IncompleteTraversalError)
     assert isinstance(failures[0].error.__cause__, PaginationError)
-    assert "did not advance" in str(failures[0].error.__cause__)
+    assert "descending boundary passes head" in str(failures[0].error.__cause__)
     assert set(_completes(outcomes)) == {"p0", "p2"}
-    assert portal.waves == [6, 3]
-    assert _finish_rejection(report) == [
-        (1, PageDispatch.BATCH, 0, 4, PageOutcome.REJECTED, PageRejectionCode.RANGE_CONTRADICTION)
+    assert portal.waves == [6, 2]
+    assert _boundary_rejection(report) == [
+        (1, "boundary", 2, 8, PageOutcome.REJECTED, PageRejectionCode.RANGE_CONTRADICTION),
+        (1, "boundary", 3, 10, PageOutcome.REJECTED, PageRejectionCode.RANGE_CONTRADICTION),
     ]
 
 

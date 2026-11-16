@@ -1921,6 +1921,42 @@ async def test_boundary_direction_contradiction_fails_before_emission() -> None:
     assert stream._source._runtime.transactions.boundary_totals == {}
 
 
+class _AscendingViewHidesTheLeast(KeysetTransport):
+    """Serve a selection whose ascending view lacks the identities below ``hidden_below``, which descending has."""
+
+    def __init__(self, identities: tuple[int, ...], *, hidden_below: int) -> None:
+        super().__init__(identities)
+        self.hidden_below = hidden_below
+
+    def _rows(self, parameters: dict[str, JsonValue]) -> list[dict[str, int]]:
+        order = parameters.get("order", {})
+        if isinstance(order, dict) and order.get("id") == "DESC":
+            return super()._rows(parameters)
+        visible = self.identities
+        self.identities = tuple(value for value in visible if value >= self.hidden_below)
+        try:
+            return super()._rows(parameters)
+        finally:
+            self.identities = visible
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("direction", ["ascending", "descending"])
+async def test_a_descending_boundary_below_the_ascending_head_fails_before_emission(direction: str) -> None:
+    # The ascending boundary page starts at the selection's least identity, 5, and ends short, so it holds the whole
+    # selection; the descending one holds 4 too. Both maxima agree, but one selection cannot have both pages: the
+    # boundary refuses them, whichever way the traversal runs, before a row is delivered or a further page is sent.
+    transport = _AscendingViewHidesTheLeast(tuple(range(1, 9)), hidden_below=5)
+    stream = _stream(transport, AutoKeysetExecution(StableIntegerKeysetContract()), direction=direction)
+
+    with pytest.raises(IncompleteTraversalError, match="descending boundary passes head"):
+        await anext(stream)
+
+    assert stream.report is not None
+    assert stream.report.emitted == 0
+    assert len(transport.requests) == 1  # the boundary wave alone
+
+
 @pytest.mark.asyncio
 async def test_internal_lane_validation_error_is_not_reclassified(
     monkeypatch: pytest.MonkeyPatch,
