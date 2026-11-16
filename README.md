@@ -803,10 +803,11 @@ delivery, once it is the next binding to deliver); a binding that cannot obtain 
 other binding can release rows fails with `BudgetExceededError`, and waiting for a share never
 outlasts `max_elapsed`.
 
-Fast and automatic keyset references need `BatchDispatch`. With a `page_stop`, automatic execution
-runs sequentially and reports `PAGE_STOP`; an explicit fast mode with a `page_stop` or
-`DirectDispatch` is refused before any request. A `KeysetSpec.boundary` remains unavailable in
-references.
+Fast and automatic keyset references need `BatchDispatch` with a `batch_size` of at least 2: every
+wave travels in one shared physical batch, and the first holds both boundary probes. With a
+`page_stop`, automatic execution runs sequentially and reports `PAGE_STOP`; an explicit fast mode with
+a `page_stop`, and either fast mode without one under `DirectDispatch` or `batch_size=1`, is refused
+before any request. A `KeysetSpec.boundary` remains unavailable in references.
 
 ### Counted references
 

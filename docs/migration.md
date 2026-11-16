@@ -352,6 +352,12 @@
   after delivering them. Such boundary pages now fail the traversal before any row is delivered or any
   further page is sent: `IncompleteTraversalError` with the blocking `direction_contradiction` violation
   ("descending boundary passes head"), or, in a reference traversal, that binding's failure.
+- **Breaking: fast and automatic keyset references refuse `BatchDispatch(batch_size=1)` before any
+  request.** Their boundary wave is two commands and every wave travels in one physical batch, so such
+  a binding never sent a request and failed with an internal `ValueError` ("fast keyset wave must
+  contain 1..50 commands"), as a `ReferenceFailed` or a `ReferenceFailure`. The operation now raises
+  `CapabilityError` when it is created, as it does for `DirectDispatch`; in a heterogeneous operation the
+  source is a correlated local non-execution.
 
 ## Auto keyset partitioning under a small row buffer
 

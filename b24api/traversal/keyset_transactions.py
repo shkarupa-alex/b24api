@@ -82,7 +82,7 @@ async def execute_wave(
 ) -> tuple[LaneReceipt, ...]:
     """Execute and validate one atomic correlated batch wave."""
     if not plans or len(plans) > host.engine.portal_command_cap:
-        raise ValueError("fast keyset wave must contain 1..50 commands")
+        raise ValueError("fast keyset wave must contain 1..portal_command_cap commands")
     reserved_rows = sum(plan.reserved_rows for plan in plans)
     charged_rows = 0
     if reserved_rows > host.context.policy.max_buffered_rows - host.transactions.buffer_balance:

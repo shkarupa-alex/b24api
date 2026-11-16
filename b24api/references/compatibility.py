@@ -10,12 +10,13 @@ facades keep failing per binding at dispatch, as in 2.5.2.
 from __future__ import annotations
 from typing import TYPE_CHECKING
 
-from b24api.contracts.dispatch import DirectDispatch
+from b24api.contracts.dispatch import BatchDispatch, DirectDispatch
 from b24api.contracts.keyset_execution import AutoKeysetExecution, SequentialKeysetExecution
 from b24api.contracts.request import RouteKind
 from b24api.contracts.traversal import CountedTraversal, KeysetTraversal
 from b24api.contracts.wire import BodyEncoding
 from b24api.errors import CapabilityError
+from b24api.traversal.keyset_eligibility import BOUNDARY_WAVE_COMMANDS
 
 if TYPE_CHECKING:
     from b24api.contracts.dispatch import DispatchSpec
@@ -52,6 +53,11 @@ def source_incompatibility(
             return CapabilityError("page stop requires sequential keyset execution")
         if page_stop is None and isinstance(dispatch, DirectDispatch):
             return CapabilityError("fast keyset reference traversal requires BatchDispatch")
+        # Every wave travels in one shared physical batch, and the first one always holds both boundary probes.
+        if page_stop is None and isinstance(dispatch, BatchDispatch) and dispatch.batch_size < BOUNDARY_WAVE_COMMANDS:
+            return CapabilityError(
+                f"fast keyset reference traversal requires BatchDispatch batch_size of at least {BOUNDARY_WAVE_COMMANDS}"
+            )
     return None
 
 
