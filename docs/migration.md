@@ -209,14 +209,11 @@
   report `failed` ("<family> failed (X)", or "stream cleanup failed (X)" from the close). Code that caught
   it as the `__cause__` of `BatchFailed`, `ReferenceFailed` or `InputSourceError`, or read it from a
   failure outcome, catches it directly.
-- **An outcome's failure from outside the library keeps its cause, by one rule.** In the outcome
-  families, a failure that is not the library's error (an `Exception` from your code, such as a
-  `page_stop` callback) became an error that dropped it: a `CapabilityError` ("fan-out command failed",
-  "reference failed") in `fan_out_outcomes()` and the `iter_*_outcomes()` families, a `ProtocolError`
-  ("batch command failed without a typed safe error") in `batch_outcomes()`. Every outcome family now
-  carries it as a `CapabilityError` (`batch_outcomes()`: "batch command failed") whose `__cause__` it is,
-  as `BatchFailed` and `ReferenceFailed` do in the fail-fast families. Catch `CapabilityError` where
-  `batch_outcomes()` code caught that `ProtocolError`.
+- **An outcome's error follows one rule.** Every outcome family carries the library's error as it is
+  and any other `Exception` as a `CapabilityError` ("batch command failed", "fan-out command failed",
+  "reference failed") whose `__cause__` it is. Such an error used to drop it: a `CapabilityError` without
+  a cause in `fan_out_outcomes()` and the `iter_*_outcomes()` families, a `ProtocolError` ("batch command
+  failed without a typed safe error") in `batch_outcomes()`.
 - **A cancelled stream gives the cancellation's reason.** A stream read to its end and cancelled
   while its source closed reported `cancelled` with the terminal reason "input exhausted" (or
   "reference input exhausted"). Every family now gives "iteration cancelled" whenever the reader's
