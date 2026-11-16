@@ -261,7 +261,9 @@ outcome.
   window's pull, the counted tail and the fast keyset commands. Every later work the budget refuses names its
   own work but is that same end; a request's own refusal or a dropped result is not marked and fails its work
   alone. `AsyncIteratorController.get`, the one source pull of the batch streams, refuses further input once
-  a send was refused or the deadline has passed, so the operation ends with `BudgetExceededError`; the
+  a send was refused or the deadline has passed, so the operation ends with `BudgetExceededError`; a
+  source whose end it has read stays ended, so a later pull raises that end again and reads neither the
+  source nor the budget; the
   commands a batch window read before such a pull are sent as any window is, the budget refusing each,
   and the stream then raises the pull's refusal. A pull the budget refuses ends the reference
   scheduler's source as a read-out source ends (lease waiters are woken, and the source no longer

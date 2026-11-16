@@ -906,8 +906,9 @@ and while a source, synchronous or asynchronous, is pulled. A send in flight is 
 the operation or of its retry window, whichever is shorter. It does not bound the time the application
 spends while it holds control: in a `page_stop` callback, or as a consumer that is slow between pulls of
 the stream. Nothing interrupts the application when the budget runs out meanwhile; the next scheduling
-point ends the operation, even when all that is left is to read the end of the source. The report is
-then `incomplete`, with `BudgetExceededError` as its terminal reason and a `budget_exhausted` violation.
+point ends the operation, even when all that is left is to read the end of the source. Once that end
+was read, a deadline that passes while the application holds control ends nothing. A deadline that ends the
+operation leaves the report `incomplete`, with `BudgetExceededError` as its terminal reason and a `budget_exhausted` violation.
 The stream raises a plain `BudgetExceededError`, except that a fail-fast stream whose stop failed a
 command or a binding raises its wrapper (`BatchFailed` or `ReferenceFailed`, whose report carries that
 reason). A stop at a source pull or at the end-of-source check fails none by itself, but `batch()` and

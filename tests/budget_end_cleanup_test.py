@@ -1185,3 +1185,51 @@ async def test_a_source_raising_its_own_budget_error_is_a_source_failure(family:
     assert report is not None
     assert report.state is TerminalState.FAILED
     assert "budget_exhausted" not in _blocking(report)
+
+
+class _EndCounted:
+    """An asynchronous source of ``ITEMS`` commands that counts every pull after its end was raised."""
+
+    def __init__(self) -> None:
+        self.items = iter(_command(index) for index in range(ITEMS))
+        self.ended = False
+        self.pulls_after_end = 0
+
+    def __aiter__(self) -> _EndCounted:
+        return self
+
+    async def __anext__(self) -> Command[int]:
+        if self.ended:
+            self.pulls_after_end += 1
+        item = next(self.items, None)
+        if item is None:
+            self.ended = True
+            raise StopAsyncIteration
+        return item
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", ["batch", "batch_outcomes", "fan_out", "fan_out_outcomes"])
+async def test_a_deadline_passing_after_the_source_end_was_read_ends_nothing(
+    monkeypatch: pytest.MonkeyPatch, family: str
+) -> None:
+    # The window read the source out before it ran; the consumer then holds control past the deadline.
+    clock = _OperationClock(monkeypatch)
+    source = _EndCounted()
+    async with client_for(ResponderTransport(_one_row), policy=POLICY) as client:
+        stream = (
+            getattr(client, family)(source)
+            if family.startswith("batch")
+            else getattr(client, family)(source, dispatch=BatchDispatch())
+        )
+        delivered = 0
+        async with stream:
+            async for _outcome in stream:
+                delivered += 1
+                if delivered == ITEMS:
+                    assert source.ended
+                    clock.spend()
+
+    assert delivered == ITEMS
+    assert stream.report.state is TerminalState.COMPLETED
+    assert source.pulls_after_end == 0

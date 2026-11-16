@@ -281,6 +281,10 @@
   with `SOURCE_FAILED`. Those commands are now sent as any window is: the budget refuses each, so each
   is a `CommandFailure` with `BudgetExceededError`, nothing reaches the transport, and the stream
   raises `BudgetExceededError` (`batch()`: `BatchFailed`) with an `incomplete` report.
+- **A batch stream reads its source's end once.** `batch()` and `batch_outcomes()` pulled their source
+  again after it had raised `StopAsyncIteration`, so a deadline that passed while the consumer held the
+  last outcome ended a stream whose every command had run with `BudgetExceededError` and an `incomplete`
+  report. A source's end is now read once, as the other families read it: such a stream completes.
 - **A counted list's tail ends with the budget.** When `max_requests` or `max_elapsed` refused a page
   of the batched tail of `iter_list_counted()`, the report's terminal reason was
   `IncompleteTraversalError`, as for a page that failed. That refusal ends the operation, so the

@@ -46,18 +46,27 @@ def source_incompatibility(
     if isinstance(traversal, CountedTraversal) and page_stop is not None:
         return CapabilityError("counted physical batch tail does not support page stop")
     if isinstance(traversal, KeysetTraversal) and not isinstance(traversal.execution, SequentialKeysetExecution):
-        # AUTO with a page stop settles on sequential execution before planning; an explicit fast
-        # execution cannot honour a stop decided between ordered pages.
-        automatic = isinstance(traversal.execution, AutoKeysetExecution)
-        if page_stop is not None and not automatic:
-            return CapabilityError("page stop requires sequential keyset execution")
-        if page_stop is None and isinstance(dispatch, DirectDispatch):
-            return CapabilityError("fast keyset reference traversal requires BatchDispatch")
-        # Every wave travels in one shared physical batch, and the first one always holds both boundary probes.
-        if page_stop is None and isinstance(dispatch, BatchDispatch) and dispatch.batch_size < BOUNDARY_WAVE_COMMANDS:
-            return CapabilityError(
-                f"fast keyset reference traversal requires BatchDispatch batch_size of at least {BOUNDARY_WAVE_COMMANDS}"
-            )
+        return _fast_keyset_incompatibility(traversal, dispatch, page_stop)
+    return None
+
+
+def _fast_keyset_incompatibility(
+    traversal: KeysetTraversal, dispatch: DispatchSpec, page_stop: PageStopPolicy | None
+) -> CapabilityError | None:
+    """Return why a fast or automatic keyset source cannot run under the dispatch, or None when it can."""
+    # AUTO with a page stop settles on sequential execution before planning; an explicit fast
+    # execution cannot honour a stop decided between ordered pages.
+    if page_stop is not None:
+        if isinstance(traversal.execution, AutoKeysetExecution):
+            return None
+        return CapabilityError("page stop requires sequential keyset execution")
+    if isinstance(dispatch, DirectDispatch):
+        return CapabilityError("fast keyset reference traversal requires BatchDispatch")
+    # Every wave travels in one shared physical batch, and the first one always holds both boundary probes.
+    if isinstance(dispatch, BatchDispatch) and dispatch.batch_size < BOUNDARY_WAVE_COMMANDS:
+        return CapabilityError(
+            f"fast keyset reference traversal requires BatchDispatch batch_size of at least {BOUNDARY_WAVE_COMMANDS}"
+        )
     return None
 
 
