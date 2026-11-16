@@ -85,7 +85,7 @@ from b24api.references.dispatch import _RowBuffer
 from b24api.transport import WireResponse
 from b24api.traversal.keyset_fast_plan import fit_wave
 from b24api.traversal.keyset_runtime import KeysetRuntime
-from tests.scripting import HANG_BOUND, BatchPortal, ResponderTransport, client_for
+from tests.scripting import HANG_BOUND, BatchPortal, ResponderTransport, VirtualClock, client_for
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -1387,6 +1387,15 @@ async def test_a_keyset_command_its_own_budget_stops_fails_also_once_the_operati
 # --- A keyset page's batch index ---------------------------------------------------------------------
 
 
+@pytest.fixture
+def coalescing(monkeypatch: pytest.MonkeyPatch) -> VirtualClock:
+    """Make coalescing structural: a wave waits for the pages a bounded number of loop turns brings, not wall time.
+
+    The tests that read which commands share a physical batch hold on a loaded machine too.
+    """
+    return VirtualClock().install(monkeypatch)
+
+
 async def _indexed(
     portal: BatchPortal, execution: Execution, parents: int, policy: ExecutionPolicy | None = None
 ) -> list[tuple[int | None, str | None, int | None]]:
@@ -1420,6 +1429,7 @@ def _wire(portal: BatchPortal) -> list[list[tuple[str, str | None]]]:
     return sends
 
 
+@pytest.mark.usefixtures("coalescing")
 @pytest.mark.asyncio
 async def test_a_keyset_reference_page_records_its_index_in_the_shared_batch_it_was_sent_with() -> None:
     # Four one-row parents: the first batch carries three parents' boundary probes (ascending, descending), the
@@ -1451,6 +1461,7 @@ async def test_a_keyset_reference_page_records_its_index_in_the_shared_batch_it_
     ]
 
 
+@pytest.mark.usefixtures("coalescing")
 @pytest.mark.asyncio
 async def test_a_range_keyset_reference_body_page_records_its_index_in_the_shared_batch() -> None:
     # Three 40-row parents share a body batch of three range pages each: each body page records its index in it.
@@ -1465,6 +1476,7 @@ async def test_a_range_keyset_reference_body_page_records_its_index_in_the_share
     assert finish == [(0, 0), (1, 1), (2, 2)]
 
 
+@pytest.mark.usefixtures("coalescing")
 @pytest.mark.asyncio
 async def test_a_replayed_keyset_reference_page_keeps_the_index_of_the_batch_it_was_first_sent_with() -> None:
     # The first batch refuses the second parent's descending boundary probe (QUERY_LIMIT_EXCEEDED) at index 3; its
@@ -1505,6 +1517,7 @@ def _deny(answer: Callable[..., Envelope], parent: str, *, finish: bool) -> Call
 _ONE_ROW = {f"p{index}": (1,) for index in range(4)}
 
 
+@pytest.mark.usefixtures("coalescing")
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("answer", "failed"),
@@ -1663,6 +1676,7 @@ async def test_a_flat_descending_finish_page_the_admission_frontier_refuses_is_t
     assert report.keyset_execution.probe_rows_discarded == 4
 
 
+@pytest.mark.usefixtures("coalescing")
 @pytest.mark.asyncio
 async def test_a_reference_descending_finish_page_the_admission_frontier_refuses_fails_its_binding_alone() -> None:
     # The same contradiction for the second of three parents: its binding fails with it, the others complete, and
@@ -1726,6 +1740,7 @@ def _failed_pages(report: OperationReport) -> list[tuple[object, ...]]:
     ]
 
 
+@pytest.mark.usefixtures("coalescing")
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("failing_send", "phase"),
