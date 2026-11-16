@@ -206,6 +206,11 @@
   longer treated as an interrupt, which asyncio's loop only logged and dropped between reads: it is a
   failure like any other, which the stream raises to its reader (`BatchFailed` or `ReferenceFailed`,
   with it as `__cause__`) or an outcome family yields as that item's failure.
+- **An outcome's failure from outside the library keeps its cause.** In `fan_out_outcomes()` and the
+  `iter_*_outcomes()` families, a failure that is not the library's error (one your transport raises
+  that is not an `Exception`, say) became a `CapabilityError` ("fan-out command failed", "reference
+  failed") that dropped it. That `CapabilityError` now carries it as `__cause__`, as `BatchFailed` and
+  `ReferenceFailed` do in the fail-fast families.
 - **A cancelled stream gives the cancellation's reason.** A stream read to its end and cancelled
   while its source closed reported `cancelled` with the terminal reason "input exhausted" (or
   "reference input exhausted"). Every family now gives "iteration cancelled" whenever the reader's
