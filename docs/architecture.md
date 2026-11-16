@@ -303,37 +303,43 @@ outcome.
   `ReferenceFailed` or a failure outcome, whose error carries it by one rule, `outcome_error`): every catch
   site that decides a failure catches `Exception`. Any other `BaseException` but an interrupt or a
   cancellation is no failure and nothing classifies, wraps or ranks it; it propagates as Python propagates
-  it. The library only delivers it: to the reader as it is, from a read, from work between reads or from
-  the source's pull or close, the source closed once, no hang and nothing for the event loop, and it is
-  never lost: what no read raised, the close raises. The task it ends returns it (`Settled`), and the cleanup
-  collectors pass any `BaseException` on to their owner, so a cleanup ends in it; that replaces whatever
-  ended the stream, as a `finally` does (`OperationRunner._terminate`). A reference binding that ends in one
-  ends its task in it and puts `_EndedEvent` in its queue (`ReferenceScheduler._end_binding`), only so that a
-  read reaches the binding's place instead of waiting for an end that never comes; it raises the task's end
-  there (`_finish_task`), and a close that comes first raises it from the tasks it collects. A read a
-  concurrent close ended never raises it (that close does, from the read it settles): the read ends as the
-  close's cancellation of it would. A coroutine closed by hand or at collection (`GeneratorExit`) ends no
-  binding. One piece of state carries an
-  interrupt: each operation has one
-  `InterruptLatch`, the isolated runner's, which its pull and cleanup tasks publish through `INTERRUPTS`
-  so the tasks they start inherit it (an inline kernel uses the latch of the runner it serves). Every
-  place where library code first catches a caller's `BaseException` latches the first interrupt and goes
-  on as it would: `settle`, so every `spawn_settled` task; the reference scheduler's binding tasks; the
-  dispatcher's senders; and `OperationRunner.__anext__` where a read ends, which is where an inline
-  kernel (`batch()`, `iter_list*`, the fast keyset) first catches the interrupt its own send raised, its
-  end then raising what the kernel ends with (a failed cleanup, say). Whatever later handles that
-  failure (a scheduler's close, say) may drop it freely. The latch's state is explicit
+  it. One piece of state carries every such escape (`is_escape`: an interrupt, or any other
+  `BaseException` but a cancellation and a `GeneratorExit`): each operation has one `OperationLatch`, the
+  isolated runner's, which its pull and cleanup tasks publish through `OPERATION_LATCH` so the tasks they
+  start inherit it (an inline kernel uses the latch of the runner it serves). Every library site that
+  catches an escape either raises it at once or hands it to the latch (`latch_escape`); there is no third
+  way. The sites that hand it on: `settle`, so every `spawn_settled` task (a source's pull and close, the
+  worker thread a cancelled synchronous pull still waits for, a binding, a tail page, a cleanup); the
+  reference scheduler's binding end and cleanup collectors; the batch dispatcher's senders, whose pages a
+  close may have cancelled; and `OperationRunner.__anext__` where a read ends, which is where an inline
+  kernel (`batch()`, `iter_list*`, the fast keyset) first catches what its own send raised, its end then
+  raising what the kernel ends with (a failed cleanup, say). Whatever later handles it as an end (a
+  scheduler's close, a future a close cancelled) may drop it freely: the latch has it. The first interrupt
+  ends the operation; any other escape stays undelivered until an end raises it. The end raises the
+  interrupt, or else the first undelivered escape, once, as from a `finally`, ahead of whatever else would
+  leave (`OperationRunner._raise_latched`, `OperationLatch.close`): the read whose end it is, or the close
+  when no read got it. A read a concurrent close ended never raises it (that close took it): the read ends
+  as the close's cancellation of it would. An inline kernel's end raises the undelivered escape without
+  taking it, so it propagates to its owner's end. A reference binding that ends in one ends its task in it
+  and puts `_EndedEvent` in its queue (`ReferenceScheduler._end_binding`), waiting for room as any
+  terminal event does, only so that a read reaches the binding's place instead of waiting for an end that
+  never comes; it raises the task's end there (`_finish_task`). A coroutine closed by hand or at
+  collection (`GeneratorExit`) ends no binding. What an end does not raise (a second escape, or one behind
+  the interrupt) and whatever is latched once the end is out (work that outlived the cleanup window) goes
+  to the event loop (`OperationLatch.hand_on`), once each: an interrupt is raised out of `asyncio.run`,
+  any other escape goes to the loop's exception handler with the operation's report. An escape delivered
+  to a read or a close never reaches the loop. The latch's state is explicit
   (`LatchState`): `ARMED` while the operation runs, when the first interrupt wakes the owner; `ENDING`
   once cleanup starts, when an interrupt is latched for the end and wakes nothing (an inline kernel's
-  cleanup runs in the very read a wake would cancel); `CLOSED` once the interrupt is out. The wake
+  cleanup runs in the very read a wake would cancel); `CLOSED` once the end is out. The wake
   (`OperationRunner._interrupted`) decides delivery at once. A read in flight is cancelled and raises
   the interrupt (a read whose own task latched it and still returned an item raises it instead of the
-  item). With no read in flight, between reads, the wake closes the latch and hands the interrupt to
-  the event loop then and there (`InterruptLatch.hand_on`, the path of a late interrupt): nothing
-  later has to run for it to leave. The loop raises it once the callbacks already due in that loop turn
-  have run: a reader those wake (one waiting on what the interrupted work did, say) resumes first, and a
-  read or close it makes then finds the operation ended and runs its end; every other reader resumes
-  after the raise. The operation's
+  item). With no read in flight, between reads, the wake closes the latch and hands the interrupt, and any
+  escape undelivered yet, to the event loop then and there (`OperationLatch.hand_on`, the path of a late
+  interrupt): nothing later has to run for it to leave. The loop raises it once the callbacks already due
+  in that loop turn have run: a reader those wake (one waiting on what the interrupted work did, say)
+  resumes first, and a read or close it makes then finds the operation ended and runs its end; every other
+  reader resumes after the raise. The operation's
   end (cleanup and publication) is decoupled from that delivery: the phase turns `INTERRUPTED` (ended,
   its end not begun) and whoever comes first runs the end (`OperationRunner._end_between_reads`): a
   read or close, or the task the wake starts once the interrupt is handed on, which a read or close

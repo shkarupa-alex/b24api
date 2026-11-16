@@ -208,10 +208,12 @@
   reads, nor as a failure: no family wraps it, makes it an outcome or ranks it. It propagates as Python
   propagates it: you get it as it is from your read, whether your transport raised it in that read or
   between reads, or your source's pull or close did; raised by your source's close it replaces whatever
-  ended the stream, as from a `finally`. It is never lost: what no read got, the close raises, once. Your
-  source is closed once, nothing hangs and nothing reaches the event loop. Its report and its rank behind other ends are not promised. Code that caught it as the
-  `__cause__` of `InputSourceError`, `BatchFailed` or `ReferenceFailed`, or read it from a failure outcome,
-  catches it directly.
+  ended the stream, as from a `finally`. It is never lost silently: what no read got, the close raises,
+  once; one the library could no longer deliver to a read or a close (raised after the stream ended, by
+  work that outlived its cleanup window) is reported to the event loop's exception handler, once. Your
+  source is closed once and nothing hangs. Its report and its rank behind other ends are not promised.
+  Code that caught it as the `__cause__` of `InputSourceError`, `BatchFailed` or `ReferenceFailed`, or
+  read it from a failure outcome, catches it directly.
 - **An outcome's failure from outside the library keeps its cause.** In the `iter_*_outcomes()` families,
   a failure that is not the library's error (the exception your `page_stop` callback raises, say) was
   carried as a `CapabilityError` ("reference failed") that dropped it. That `CapabilityError` now has it as
