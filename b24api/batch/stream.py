@@ -77,6 +77,7 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
         self._batch_requests = 0
         self._batch_commands = 0
         self._emitted = 0
+        self._chunk_start = 0
         self.report = KernelReport()
         self._runner = OperationRunner(
             self._run(),
@@ -87,6 +88,14 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
     def __aiter__(self) -> Self:
         """Return this asynchronous iterator."""
         return self
+
+    @property
+    def chunk_start(self) -> int:
+        """Return the stream index of the first command of the batch the latest outcome came from.
+
+        An outcome's ``command_index`` counts the whole stream; less this, it is the command's index in its batch.
+        """
+        return self._chunk_start
 
     async def __anext__(self) -> BatchStreamItem:
         """Return the next asynchronous item."""
@@ -127,6 +136,7 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
             )
             if not chunk.commands:
                 break
+            self._chunk_start = next_index
             next_index += len(chunk.commands)
             if chunk.source_error is not None:
                 _raise_source_error(chunk.source_error)

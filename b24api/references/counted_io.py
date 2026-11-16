@@ -15,8 +15,8 @@ from typing import TYPE_CHECKING, Protocol
 from b24api.completion.closure import QUALIFIED_TOTAL_REACHED
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
-from b24api.errors import CapabilityError
-from b24api.references.dispatch import _BatchPageError, _failed_page
+from b24api.errors import B24ApiError, CapabilityError
+from b24api.references.dispatch import _BatchPageError, _failed_page, _SentPageError
 from b24api.traversal.counted_io import HeadAttempt, TailReceipt
 
 if TYPE_CHECKING:
@@ -122,7 +122,6 @@ class SharedCountedWaveIO:
             None,
             dispatched.dispatch,
             dispatched.batch_index,
-            sent=True,
             settlement=CommandSettlement.SUCCESS,
         )
 
@@ -134,7 +133,6 @@ class SharedCountedWaveIO:
             failed.error,
             self._host.page_dispatch,
             failed.batch_index,
-            sent=failed.sent,
             settlement=failed.settlement,
         )
 
@@ -340,20 +338,13 @@ class ReferenceTailStream:
         run = self._run
         try:
             dispatched = await task
-        except Exception as error:
+        except (_SentPageError, B24ApiError) as error:
+            # A failed page, whatever its command did, is the page's outcome, as on the flat tail: the binding takes
+            # it, and the tail's one trace site traces it by its settlement (``failed_page``), none if never sent.
             failed = _failed_page(error)
-            if not failed.sent:
-                raise  # never sent: the tail abandons the page, as it does every unsent one
-            # A sent page that failed, by its command's own failure or with its whole chunk, is the page's outcome.
             self._take(slot)
             return TailReceipt(
-                slot.ordinal,
-                None,
-                failed.batch_index,
-                failed.settlement,
-                sent=True,
-                error=failed.error,
-                failure=failed.failure,
+                slot.ordinal, None, failed.batch_index, failed.settlement, error=failed.error, failure=failed.failure
             )
         self._take(slot)
         run.page_state += 1

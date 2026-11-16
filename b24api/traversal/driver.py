@@ -42,7 +42,7 @@ from b24api.errors import (
     ResultShapeError,
 )
 from b24api.execution import WorkClass
-from b24api.execution.facts import execution, settlement
+from b24api.execution.facts import settlement
 from b24api.traversal.continuation import ContinuationStrategy
 from b24api.traversal.control_preflight import preflight_controls
 from b24api.traversal.counted_batch import CountedBatchStrategy, empty_source_head_eligible
@@ -307,7 +307,6 @@ class PaginationDriver:
                 batch_index=None,
                 error=error,
                 settled=settlement(error),
-                sent=execution(error).dispatched,
             )
             raise
         return response
@@ -684,14 +683,13 @@ class PaginationDriver:
         batch_index: int | None,
         error: BaseException,
         settled: CommandSettlement,
-        sent: bool,
     ) -> None:
-        """Record a page whose command failed, by the one rule of ``failed_page``.
+        """Record a page whose command failed, by the one rule of ``failed_page``: its settlement (``settled``).
 
-        ``sent`` is whether the page's command left the client (its execution's ``dispatched``); ``settled`` is what
-        the command did, as the page settles. A page that was sent is traced, and its settlement decides the code.
+        A page that never executed, because it was never sent, is not traced; the settlement decides the code of
+        every other page.
         """
-        traced = failed_page(error, settled, sent=sent)
+        traced = failed_page(error, settled)
         if traced is None:
             return
         outcome, code = traced

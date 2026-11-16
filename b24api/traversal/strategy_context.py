@@ -80,9 +80,8 @@ class StrategyContext(Protocol):
         batch_index: int | None,
         error: BaseException,
         settled: CommandSettlement,
-        sent: bool,
     ) -> None:
-        """Record a failed page that was sent (``sent``); its settlement (``settled``) decides the trace's code."""
+        """Record a failed page by its settlement (``settled``): none for a page never sent, else the trace's code."""
         ...
 
     def select_page(self, response: Response, *, single: bool = False) -> tuple[FrozenJson, ...]:

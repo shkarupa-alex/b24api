@@ -78,6 +78,12 @@
   still fails as a command. A fast keyset wave whose batch answer was ambiguous (a command's answer
   missing or repeated) no longer records `completion_unknown_binding_claimed_known`: its binding
   closes as unknown.
+- **A page the budget kept from its send is not traced.** A page of a counted traversal's batch tail
+  (`iter_list_counted()` and counted reference bindings), and a fast keyset wave or final confirmation,
+  that the budget kept from its send was traced in `page_trace` as `REJECTED` with `COMMAND_FAILURE`,
+  though no request carried it. A page that never executed because it was never sent (traversals never
+  halt a batch) now leaves no trace record on every path, as a direct or batch fan-out page the budget
+  refused already did. The binding's outcome, its settlement and the report's violations are unchanged.
 - **A range, partitioned or automatic keyset run that ends while a page is unsettled records no protocol
   violation.** When the final confirmation of `iter_list_keyset()` under these strategies failed (an
   error answer, a lost answer), or the caller cancelled the stream while a wave was in flight, the report
@@ -855,13 +861,11 @@ now unknown with reason `CONNECTION_LOST_AFTER_DISPATCH` and a cause chain that 
   cannot be decoded. A page refused conclusively (`ACCESS_DENIED`, for example) is `REJECTED` with
   `COMMAND_FAILURE`, as fast keyset waves record it. Before, every such page was `UNKNOWN`, and its code
   was `COMMAND_FAILURE` unless the failure was an `AmbiguousExecutionError`, so a page of a sequential
-  or counted traversal that lost its answer was `COMMAND_FAILURE` too. The trace records a request that
-  was sent: a page whose command never left the client (the budget refused its send, the client closed)
-  is not traced, on every path. A page of a counted traversal's batch tail, and a fast keyset wave or
-  final confirmation, that the budget kept from its send was traced `REJECTED` with `COMMAND_FAILURE`
-  though no request carried it; it is now absent from `page_trace`, as a direct or batch fan-out page the
-  budget refused already was. The binding's outcome, its settlement and the report's violations are
-  unchanged.
+  or counted traversal that lost its answer was `COMMAND_FAILURE` too.
+- **A flat counted tail page's `batch_index` is its index in its own batch.** In the report of
+  `iter_list_counted()`, a tail page's `PageRecord.batch_index` was its ordinal in the whole tail (the
+  fourth tail page was 3 whatever the batch size), unlike every other batch page, whose index is its
+  command's in the batch it was sent with. It is now that index, as on the reference path.
 - **An abandoned batch page is not sent.** A reference page fetched with `BatchDispatch` whose fetch was
   cancelled, or whose admission deadline passed, while its wave was being assembled was still sent with
   that wave and its answer discarded. Its wave now leaves without it, and a wave left with no page is

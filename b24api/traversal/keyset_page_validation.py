@@ -19,7 +19,6 @@ from b24api.errors import (
     PageAdaptationError,
     PaginationError,
 )
-from b24api.execution.facts import execution
 from b24api.traversal.keyset_geometry import closure_witness
 from b24api.traversal.page_adaptation import PageTokens, adapt_page
 from b24api.traversal.page_failure import failed_page
@@ -112,7 +111,7 @@ def classify_rejection(
 ) -> tuple[PageOutcome, PageRejectionCode] | None:
     """Classify one rejected receipt without inspecting unsafe values: its own contract failure first.
 
-    A failed command is traced by ``failed_page``'s one rule: ``None`` for a command that was never sent.
+    A failed command is traced by ``failed_page``'s one rule: ``None`` for a command that never executed.
     """
     if isinstance(receipt.error, PageAdaptationError):
         return PageOutcome.REJECTED, PageRejectionCode.PAGE_ADAPTATION
@@ -120,7 +119,7 @@ def classify_rejection(
         return PageOutcome.REJECTED, PageRejectionCode.IDENTITY_CONTRACT
     if not isinstance(outcome, BatchFailure):
         return PageOutcome.REJECTED, PageRejectionCode.RANGE_CONTRADICTION
-    return failed_page(outcome.error, settlement_of(outcome), sent=execution(outcome.error).dispatched)
+    return failed_page(outcome.error, settlement_of(outcome))
 
 
 def validate_lane_receipt(  # noqa: PLR0913

@@ -606,6 +606,8 @@ async def test_aflat_flat_counted_keeps_its_direct_head_wire_and_counter_sequenc
     assert resets[:2] == [WIDTH, 0]
     report = _report(stream)
     assert [record.dispatch for record in report.page_trace] == [PageDispatch.DIRECT] + [PageDispatch.BATCH] * 20
+    # Each tail page keeps its command's index in its own batch of ten, not its ordinal in the tail.
+    assert [record.batch_index for record in report.page_trace] == [None, *range(10), *range(10)]
     assert report.state is TerminalState.COMPLETED
 
 
@@ -1094,3 +1096,36 @@ async def test_flat_counted_tail_pages_the_budget_keeps_from_their_send_are_not_
     report = _report(stream)
     assert _failed_trace(report) == []
     assert [record.offset for record in report.page_trace] == [0, WIDTH, 2 * WIDTH, 3 * WIDTH]
+
+
+@pytest.mark.asyncio
+async def test_a_flat_counted_tail_page_answered_with_a_failure_keeps_its_index_in_its_own_batch() -> None:
+    # The second tail batch (three pages each) answers its first page with a failure. That page is traced rejected by
+    # its command, with its index in its own batch, as every committed tail page is.
+    def answer(method: str, query: Query) -> Envelope:
+        if query.get("start") == str(4 * WIDTH):
+            return {"error": "ACCESS_DENIED", "error_description": "denied"}
+        return _dense(301)(method, query)
+
+    portal = BatchPortal(answer)
+    async with _client(portal) as api:
+        stream = api.iter_list_counted(
+            Request.bare("crm.item.list", {"PARENT": 3}, ReplaySafety.SAFE), page_size=WIDTH, batch_size=3
+        )
+
+        async def drain() -> None:
+            async with stream:
+                async for _ in stream:
+                    pass
+
+        with pytest.raises(IncompleteTraversalError):
+            await drain()
+
+    report = _report(stream)
+    assert _failed_trace(report) == [
+        (None, 4 * WIDTH, PageDispatch.BATCH, 0, PageOutcome.REJECTED, PageRejectionCode.COMMAND_FAILURE)
+    ]
+    committed = [
+        (record.offset, record.batch_index) for record in report.page_trace if record.outcome is PageOutcome.COMMITTED
+    ]
+    assert committed == [(0, None), (WIDTH, 0), (2 * WIDTH, 1), (3 * WIDTH, 2)]

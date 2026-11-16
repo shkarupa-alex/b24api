@@ -60,24 +60,27 @@ facts (`facts.settlement`), a final batch outcome (`batch.outcome.settlement_of`
 (`BatchProgress.settlement`) and a shared wave's dispatch task. `b24api.execution.facts` holds the one
 mapping from that fact to the public outcome variant (`ambiguity_of`) and to the completion settlement
 (`Execution.settlement`), and `b24api.traversal.page_failure` holds the one rule of a failed page's
-trace: the trace records a request that was sent, so a page that was sent is traced and its settlement
-decides how. Whether it was sent is its command's own execution fact (`Execution.dispatched`: it left the
-client), read from the same source as its settlement; a page that the budget, a closed client or a
-cancellation kept from its send left no request to record and is not traced, on every path: direct and
-batch fan-out pages, a counted head and tail (reference and flat), keyset waves and finish pages. A traced
-page is unknown only when it may have run, otherwise rejected; a page whose own command succeeded is
-rejected as `transaction_aborted`, the code of a page dropped with the unit around it, not as a
-`command_failure`. A page's trace and its settlement read the same fact, the page's own: for a page of a
-chunk that failed as a whole, its command's in the chunk's `BatchProgress`. Every failure the batch page
-dispatcher gives a page it sent carries those facts (`_FailedPage`: what it reports, whether it was sent, how
-it settles, and the command's own failure when the batch answered or ended it), and every caller reads a
-failed page through one function (`_failed_page`), which falls back to the facts recorded on any other
-failure: the binding's failure, a page's settlement and trace, and a wave or a counted tail that takes a
-command's own failure as its outcome. `page_failure.failed_page` alone decides whether a failed page is
-traced and how, for `record_failed_page` and for keyset's `classify_rejection`; a counted tail page that was
-sent and fails with its whole chunk reaches the tail's one trace site as a receipt, as one that fails by its
-own command does, and one never sent ends the tail without a receipt. Classic and REST v3 batch, `call()`, direct and batch
-fan-out, references and list traversal all use them, and none of them chooses from the exception type,
+trace, from its settlement alone: a page that never executed because it was never sent (traversals never
+halt a batch, so no sent command is withheld) leaves no request to record and is not traced, whatever kept
+it from its send (the budget, a closed client, a cancellation); the settlement decides the code of every
+other failed page the traversal records. That page is unknown only when it may have run, otherwise
+rejected; a page whose own command succeeded is rejected as `transaction_aborted`, the code of a page
+dropped with the unit around it, not as a `command_failure`. A traversal records the failed page it stops
+at, not every page its failure leaves behind: a counted tail stops at a binding's first failed page in
+offset order, and the binding's later pages, sent or not, are settled and released without a trace record.
+A page's trace and its settlement read the same fact, the page's own: for a page of a chunk that failed as
+a whole, its command's in the chunk's `BatchProgress`. Every failure the batch page dispatcher gives a page
+it handed to a batch carries those facts (`_FailedPage`: what it reports, how it settles, and the command's
+own failure when the batch answered or ended it), and every caller reads a failed page through one function
+(`_failed_page`), which falls back to the facts recorded on any other failure: the binding's failure, a
+page's settlement and trace, and a wave or a counted tail that takes a command's own failure as its outcome.
+`page_failure.failed_page` alone decides whether a failed page is traced and how, for `record_failed_page`
+and for keyset's `classify_rejection`. Both counted tails, reference and flat, hand the tail's one trace
+site a receipt for every failed page they reach, sent or never sent, with its command's own failure or (on the
+reference path) its whole chunk's, and that site traces it by `failed_page` alone. A page's `batch_index` is
+its command's index in its batch (the one it was sent with, or handed to), on every path; a page with no
+batch command to point to, such as a direct page, has none. Classic and REST v3 batch, `call()`, direct and
+batch fan-out, references and list traversal all use them, and none of them chooses from the exception type,
 which names the cause of a failure and never proves that a command did not run. A sent command is
 unknown unless a listed refusal proves it did not run or a conclusive answer settles it. A conclusive
 answer is a structured Bitrix error, top-level or found in the result by the command's own contract, or
