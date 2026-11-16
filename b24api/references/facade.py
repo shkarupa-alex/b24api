@@ -47,7 +47,6 @@ from b24api.contracts.traversal import (
     TraversalSpec,
 )
 from b24api.errors import (
-    B24ApiError,
     CapabilityError,
     IncompleteTraversalError,
     PageAdaptationError,
@@ -295,7 +294,7 @@ class _ReferenceEventMapper:
         self._item_indexes.pop(context.index, None)
         if event.not_executed_reason is not None:
             return ReferenceNotExecuted(context.index, context.correlation, event.not_executed_reason)
-        error = event.error if isinstance(event.error, B24ApiError) else CapabilityError("reference failed")
+        error = event.typed_error("reference failed")
         # The variant follows the execution facts of the page that failed, as for a fan-out command.
         ambiguity = ambiguity_of(
             error,

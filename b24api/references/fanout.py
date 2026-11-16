@@ -16,7 +16,7 @@ from b24api.contracts.command import (
     CommandSuccess,
 )
 from b24api.contracts.request import ReplaySafety
-from b24api.errors import B24ApiError, BatchFailed, CapabilityError, InputSourceError
+from b24api.errors import BatchFailed, InputSourceError
 from b24api.execution.facts import ambiguity_of
 from b24api.references.dispatch import (
     _KernelFanOutSuccess,
@@ -124,7 +124,7 @@ class _FanOutMapper:
                 event.response,
             )
         context = cast("_CommandContext", event.correlation)
-        error = event.error if isinstance(event.error, B24ApiError) else CapabilityError("fan-out command failed")
+        error = event.typed_error("fan-out command failed")
         summary = event.request.summary
         # The variant follows the execution facts, not the exception type, which stays the cause.
         ambiguity = ambiguity_of(
