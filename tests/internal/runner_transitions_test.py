@@ -805,7 +805,7 @@ class _BetweenReads:
     The work goes on, in the very step that latched the interrupt, with the steps the test adds (``after_latch``).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, cleanup_budget: Callable[[], float] | None = None) -> None:
         self.interrupt = KeyboardInterrupt("between reads")
         self.go = asyncio.Event()
         # Set just before the interrupt is latched: a read waiting for it resumes ahead of the end's own task.
@@ -813,13 +813,16 @@ class _BetweenReads:
         self.cleaning = asyncio.Event()
         self.cleanups = 0
         self.finalized: list[TerminalCause] = []
+        self.attempts: list[CleanupAttempt] = []
         self.release = asyncio.Event()
         self.after_latch: list[Callable[[], Awaitable[None]]] = []
         # Interrupts the cleanup latches once released, as more of the operation's own work fails.
         self.latched_in_cleanup: list[BaseException] = []
         self.runner: OperationRunner[int, KernelReport] = OperationRunner(
             self._body(),
-            LifecycleHooks(finalize=self._finalize, failure_report=_fallback, cleanup=self._cleanup),
+            LifecycleHooks(
+                finalize=self._finalize, failure_report=_fallback, cleanup=self._cleanup, cleanup_budget=cleanup_budget
+            ),
             works_between_reads=True,
         )
         self.work: list[asyncio.Future[None]] = []
@@ -839,6 +842,7 @@ class _BetweenReads:
 
     def _finalize(self, cause: TerminalCause, reason: str | None, attempt: CleanupAttempt) -> KernelReport:
         self.finalized.append(cause)
+        self.attempts.append(attempt)
         return _finalized(cause, reason, attempt)
 
     async def _cleanup(self) -> None:
@@ -925,6 +929,64 @@ def test_a_read_that_resumes_ahead_of_the_ends_task_runs_the_end_once() -> None:
     report = operation.runner.report
     assert report is not None
     assert getattr(error, "report", None) is report
+
+
+def test_a_read_running_the_end_between_reads_waits_for_its_cleanup_past_the_operations_deadline() -> None:
+    # The end of an operation an interrupt ended between reads has no deadline of its own: the operation's budget is
+    # spent, and the read that runs the end is cancelled while the cleanup waits. The read still waits for the
+    # cleanup, however long it takes, then raises its cancellation, recorded as cleanup's; nothing overran.
+    operation = _BetweenReads(cleanup_budget=lambda: 0.0)
+    readers: list[asyncio.Task[Any]] = []
+
+    async def main() -> None:
+        reader = asyncio.current_task()
+        assert reader is not None
+        readers.append(reader)
+        assert await anext(operation.runner) == 1
+        operation.go.set()
+        await operation.latching.wait()
+        # Resumed in the turn the interrupt is latched, ahead of the end's own task: this read runs the end.
+        await anext(operation.runner)
+
+    async def cancel_the_reader() -> None:
+        await operation.cleaning.wait()
+        readers[0].cancel()
+        await asyncio.sleep(0.05)  # more than enough for a read that does not wait for the cleanup to end
+        assert not readers[0].done()
+        operation.release.set()
+        await asyncio.gather(readers[0], return_exceptions=True)
+
+    error = raised_driving_the_loop(main, cancel_the_reader)
+    assert error is operation.interrupt
+    assert readers[0].cancelled()
+    assert (operation.cleanups, operation.finalized) == (1, [TerminalCause.INTERRUPTED])
+    [attempt] = operation.attempts
+    assert (attempt.error, attempt.finished) == (None, True)
+    assert isinstance(attempt.cancellation, asyncio.CancelledError)
+
+
+def test_a_read_from_the_operations_own_work_once_an_interrupt_ended_it_between_reads_ends_the_iteration() -> None:
+    # The work that latched the interrupt reads at once, before the end has begun: the operation is over, so the read
+    # ends the iteration rather than wait for an item the operation never yields. The end then runs once.
+    operation = _BetweenReads()
+    operation.release.set()
+    got: list[object] = []
+
+    async def read_from_the_work() -> None:
+        try:
+            async with asyncio.timeout(HANG_BOUND):
+                await anext(operation.runner)
+        except StopAsyncIteration as error:
+            got.append(type(error))
+
+    async def wait_for_the_end() -> None:
+        await operation.runner.aclose()
+
+    operation.after_latch.append(read_from_the_work)
+    error = raised_driving_the_loop(operation.read_one, wait_for_the_end)
+    assert error is operation.interrupt
+    assert got == [StopAsyncIteration]
+    assert (operation.cleanups, operation.finalized) == (1, [TerminalCause.INTERRUPTED])
 
 
 def test_a_close_runs_the_end_whose_own_task_was_cancelled_before_it_ran() -> None:

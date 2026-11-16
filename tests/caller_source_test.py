@@ -43,11 +43,9 @@ from b24api.contracts import Command, ReferenceSource
 from b24api.errors import (
     BatchFailed,
     BudgetExceededError,
-    CapabilityError,
     CleanupOverrunError,
     InputSourceError,
     PaginationError,
-    ReferenceFailed,
 )
 from tests.scripting import (
     DEADLINE_BUDGET,
@@ -156,7 +154,7 @@ class _Source:
     """A caller's source whose close returns, raises or blocks until released; it may fail after one item."""
 
     def __init__(
-        self, family: str, close: str, *, fail_after: int | None = None, failure: Exception | None = None
+        self, family: str, close: str, *, fail_after: int | None = None, failure: BaseException | None = None
     ) -> None:
         self._items = iter(_items(family))
         self._close = close
@@ -192,7 +190,7 @@ class _SyncSource:
     """``_Source`` as a synchronous iterator: pulled and closed in worker threads, its close blocking there."""
 
     def __init__(
-        self, family: str, close: str, *, fail_after: int | None = None, failure: Exception | None = None
+        self, family: str, close: str, *, fail_after: int | None = None, failure: BaseException | None = None
     ) -> None:
         self._items = iter(_items(family))
         self._close = close
@@ -200,6 +198,7 @@ class _SyncSource:
         self._failure = failure or ValueError("the caller's source failed")
         self._pulled = 0
         self.release = threading.Event()
+        self.closes = 0
 
     def __iter__(self) -> _SyncSource:
         return self
@@ -211,6 +210,7 @@ class _SyncSource:
         return next(self._items)
 
     def close(self) -> None:
+        self.closes += 1
         if self._close == "raises":
             raise RuntimeError("the caller's close failed")
         if self._close == "overruns":
@@ -1280,7 +1280,7 @@ def test_an_interrupt_on_any_route_ends_the_operation_and_leaves_asyncio_run(
 class _InterruptsBetweenReads:
     """Answer the first binding; the second binding's send raises the interrupt once the reader has an item."""
 
-    def __init__(self, interrupt: type[BaseException]) -> None:
+    def __init__(self, interrupt: type[BaseException] | None) -> None:
         self.interrupt = interrupt
         self.between = asyncio.Event()
         # Set as the interrupt is raised: a reader waiting for it reads again in the same loop turn as the latch's wake.
@@ -1291,7 +1291,10 @@ class _InterruptsBetweenReads:
         parameters = request.copy_parameters()
         owner_filter = parameters.get("filter")
         owner = parameters.get("id", owner_filter.get("OWNER") if isinstance(owner_filter, dict) else None)
-        if owner == 1:
+        commands = parameters.get("cmd")
+        if isinstance(commands, dict) and any(str(command).endswith("id=1") for command in commands.values()):
+            owner = 1  # a batch family's envelope of its one command
+        if owner == 1 and self.interrupt is not None:
             await reached(self.between)
             error = self.interrupt("between reads")
             self.raised.append(error)
@@ -1375,57 +1378,115 @@ def test_an_interrupt_latched_between_reads_goes_to_the_event_loop_at_once(
     assert getattr(error, "report", None) is report
 
 
-class _NotAnInterruptError(BaseException):
-    """A ``BaseException`` that is neither an interrupt nor a cancellation: a failure like any other."""
-
-
-@pytest.mark.parametrize("when", ["between", "in_read"])
 @pytest.mark.parametrize("family", REFERENCE_FAMILIES)
-def test_a_base_exception_that_is_no_interrupt_fails_the_operation_for_its_reader(family: str, when: str) -> None:
-    # Binding 1's send raises a ``BaseException`` that is neither ``KeyboardInterrupt`` nor ``SystemExit``, while the
-    # reader holds an item and reads again later (``between``) or while its read waits (``in_read``). The event loop
-    # would only log it and drop it, so it is never handed there: it is a failure like any other, its reader's. A
-    # fail-fast family raises it, as the cause of its failure, with the failed report; an outcome family yields that
-    # reference's failure outcome, the exception the cause of its error.
+def test_a_read_woken_with_the_interrupt_between_reads_closes_the_source_under_asyncio_run(family: str) -> None:
+    # The reader holds an item and waits for the moment another binding's send raises the interrupt: it reads again
+    # in the very turn the interrupt is latched, ahead of the event loop's raise, and that read runs the end. The
+    # shutdown ``asyncio.run`` begins at the raise cancels every task, the cleanup the read started among them before
+    # it took a step: the read starts it again, past the shutdown's cancellations, and the source is closed, once.
+    # The report is the interrupt's alone: a cleanup that never began failed nothing.
     reported: list[str] = []
-    got: list[object] = []
     streams: list[OperationStream[Any]] = []
-    transport = _InterruptsBetweenReads(_NotAnInterruptError)
+    transport = _InterruptsBetweenReads(KeyboardInterrupt)
+    source = _Source(family, "returns")
 
     async def main() -> None:
         asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
         async with client_for(ResponderTransport(transport), policy=POLICIES["returns"]) as client:
-            stream = _stream(client, family, _items(family), DirectDispatch(concurrency=2))
+            stream = _stream(client, family, source, DirectDispatch(concurrency=2))
+            streams.append(stream)
+            await anext(stream)
+            transport.between.set()
+            await reached(transport.raising)
+            await anext(stream)
+
+    error = raised_by_asyncio_run(main)
+    gc.collect()
+    assert error is transport.raised[0]
+    assert reported == []
+    assert source.closes == 1
+    report = streams[0].report
+    assert report is not None
+    assert report.terminal_reason == "operation interrupted"
+    assert _violations(report) == [("interrupted", "operation interrupted (KeyboardInterrupt)")]
+    assert getattr(error, "report", None) is report
+
+
+class _NotAnInterruptError(BaseException):
+    """A ``BaseException`` that is neither an interrupt nor a cancellation, so no failure either: it stays as it is."""
+
+
+class _ClosesRaising(_Source):
+    """``_Source`` whose close, once counted, raises ``_NotAnInterruptError``."""
+
+    async def aclose(self) -> None:
+        await super().aclose()
+        raise _NotAnInterruptError("close")
+
+
+def _not_an_interrupt_source(family: str, stage: str) -> _Source | _SyncSource:
+    failure = _NotAnInterruptError("pull")
+    if stage == "async_pull":
+        return _Source(family, "returns", fail_after=1, failure=failure)
+    if stage == "sync_pull":
+        return _SyncSource(family, "returns", fail_after=1, failure=failure)
+    if stage == "close":
+        return _ClosesRaising(family, "returns")
+    return _Source(family, "returns")
+
+
+@pytest.mark.parametrize(
+    ("family", "stage"),
+    [
+        (family, stage)
+        for family in FAMILIES
+        for stage in ("in_read", "between", "async_pull", "sync_pull", "close")
+        # A batch family sends only while it is read: nothing of it runs between reads.
+        if not (stage == "between" and family in {"batch", "batch_outcomes"})
+    ],
+)
+def test_a_base_exception_that_is_no_interrupt_reaches_the_reader_as_it_is(family: str, stage: str) -> None:
+    # A ``BaseException`` that is neither ``KeyboardInterrupt`` nor ``SystemExit`` (nor a cancellation) is no failure:
+    # no family turns it into its error or an outcome. Binding 1's send raises it while the reader's read waits
+    # (``in_read``) or while the reader holds an item and reads again later (``between``); the source's second pull
+    # raises it, on the loop (``async_pull``) or in its worker thread (``sync_pull``); or the source's close raises it
+    # (``close``). The reader gets it as it is, the source is closed once, and the report says the operation failed
+    # with it; the event loop never sees it.
+    reported: list[str] = []
+    streams: list[OperationStream[Any]] = []
+    transport = _InterruptsBetweenReads(_NotAnInterruptError if stage in {"in_read", "between"} else None)
+    source = _not_an_interrupt_source(family, stage)
+
+    async def main() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
+        async with client_for(ResponderTransport(transport), policy=POLICIES["returns"]) as client:
+            stream = _stream(client, family, source, DirectDispatch(concurrency=2))
             streams.append(stream)
             async with stream:
                 await anext(stream)
                 transport.between.set()
-                if when == "between":
+                if stage == "between":
                     await reached(transport.raising)
                     for _turn in range(HANDOVER_TURNS):
                         await asyncio.sleep(0)
-                try:
-                    got.extend([item async for item in stream])
-                except (BatchFailed, ReferenceFailed) as error:
-                    got.append(error)
+                async for _item in stream:
+                    pass
 
-    asyncio.run(main())
+    with pytest.raises(_NotAnInterruptError) as caught:
+        asyncio.run(main())
     assert reported == []
+    if stage in {"in_read", "between"}:
+        assert caught.value is transport.raised[0]
+    assert str(caught.value) == {"close": "close", "in_read": "between reads", "between": "between reads"}.get(
+        stage, "pull"
+    )
+    assert source.closes == 1
     report = streams[0].report
     assert report is not None
-    if family.endswith("_outcomes"):
-        failures = [getattr(item, "error", None) for item in got if hasattr(item, "error")]
-        assert len(failures) == 1
-        assert isinstance(failures[0], CapabilityError)
-        assert failures[0].__cause__ is transport.raised[0]
-        assert report.state is TerminalState.COMPLETED_WITH_FAILURES
-        return
-    error = got[-1]
-    assert isinstance(error, BatchFailed | ReferenceFailed)
-    assert error.__cause__ is transport.raised[0]
-    assert error.report is report
     assert report.state is TerminalState.FAILED
-    assert _violations(report)[-1][0] == "internal_failure"
+    assert [message for _code, message in _violations(report)] == [
+        f"{'stream cleanup' if stage == 'close' else report.operation} failed (_NotAnInterruptError)"
+    ]
 
 
 class _ClosesWhenReleased:
