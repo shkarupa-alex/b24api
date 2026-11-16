@@ -49,6 +49,7 @@ from b24api.contracts import (
     KeysetExecutionKind,
     KeysetSelectionReason,
     KeysetSelectionSummary,
+    PageDispatch,
     PageOutcome,
     PageRejectionCode,
     ReferenceComplete,
@@ -1464,3 +1465,100 @@ async def test_a_replayed_keyset_reference_page_keeps_the_index_of_the_batch_it_
     assert [len(send) for send in _wire(portal)][:2] == [6, 1]
     boundaries = [(binding, index) for binding, phase, index in pages if phase == "boundary"]
     assert boundaries == [(0, 0), (0, 1), (1, 2), (1, 3), (2, 4), (2, 5)]
+
+
+def _deny(answer: Callable[..., Envelope], parent: str, *, finish: bool) -> Callable[..., Envelope]:
+    """Answer ``parent``'s descending boundary probe, or its finish page, with ACCESS_DENIED."""
+
+    def denied(method: str, query: Query) -> Envelope:
+        page = "filter[>ID]" in query if finish else query.get("order[id]") == "DESC"
+        if query.get("filter[=parent]") == parent and page:
+            return {"error": "ACCESS_DENIED", "error_description": "denied"}
+        return answer(method, query)
+
+    return denied
+
+
+_ONE_ROW = {f"p{index}": (1,) for index in range(4)}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answer", "failed"),
+    [
+        # The second parent's boundary probes sit at 2 and 3 of the first batch: the denied one is rejected by its
+        # command, and its valid partner is rejected as aborted with the wave.
+        (
+            _deny(_answer(_ONE_ROW), "p1", finish=False),
+            [
+                (1, "boundary", 3, PageOutcome.REJECTED, PageRejectionCode.COMMAND_FAILURE),
+                (1, "boundary", 2, PageOutcome.REJECTED, PageRejectionCode.TRANSACTION_ABORTED),
+            ],
+        ),
+        # Its finish page sits at 3 of the second batch: denied, or answered with a row its range excludes.
+        (
+            _deny(_answer(_ONE_ROW), "p1", finish=True),
+            [(1, "finish", 3, PageOutcome.REJECTED, PageRejectionCode.COMMAND_FAILURE)],
+        ),
+        (
+            _answer(_ONE_ROW, ignore_bounds=frozenset({"p1"})),
+            [(1, "finish", 3, PageOutcome.REJECTED, PageRejectionCode.RANGE_CONTRADICTION)],
+        ),
+    ],
+    ids=["wave-denied-and-aborted", "finish-denied", "finish-range-contradiction"],
+)
+async def test_a_rejected_keyset_reference_page_records_its_index_in_the_shared_batch(
+    answer: Callable[..., Envelope],
+    failed: list[tuple[int, str, int, PageOutcome, PageRejectionCode]],
+) -> None:
+    # Four one-row parents share the batches as in the committed case; the second parent's failed pages record
+    # their commands' indexes in those shared batches, as its committed pages would.
+    portal = BatchPortal(answer)
+    async with client_for(portal, policy=ExecutionPolicy(page_trace_limit=1024)) as client:
+        stream = client.iter_reference_outcomes(
+            _base(),
+            [_parent(f"p{index}") for index in range(4)],
+            traversal=_traversal(AutoKeysetExecution(_CONTRACT)),
+            dispatch=BatchDispatch(),
+        )
+        outcomes, report = await _drain(stream)
+
+    assert [outcome.correlation for outcome in outcomes if isinstance(outcome, ReferenceFailure)] == ["p1"]
+    assert [
+        (
+            record.reference_index,
+            None if record.phase is None else record.phase.value,
+            record.batch_index,
+            record.outcome,
+            record.rejection_code,
+        )
+        for record in report.page_trace
+        if record.outcome is not PageOutcome.COMMITTED
+    ] == failed
+
+
+@pytest.mark.asyncio
+async def test_a_flat_keyset_finish_page_sent_directly_records_no_batch_index() -> None:
+    # The flat traversal's boundary probes share its own batch; its finish page is a direct request, with no batch
+    # command to point to.
+    portal = BatchPortal(_flat_answer((1,)))
+    async with client_for(portal, policy=ExecutionPolicy(page_trace_limit=1024)) as client:
+        stream = client.iter_list_keyset(
+            _base(),
+            selector=ResultSelector.root(),
+            identity=_identity(),
+            page_size=PAGE,
+            keyset=_keyset(),
+            execution=AutoKeysetExecution(_CONTRACT),
+        )
+        _items, report = await _drain(stream)
+
+    assert portal.waves == [2, 1]
+    assert [
+        (None if record.phase is None else record.phase.value, record.dispatch, record.batch_index)
+        for record in report.page_trace
+    ] == [
+        ("boundary", PageDispatch.BATCH, 0),
+        ("boundary", PageDispatch.BATCH, 1),
+        ("finish", PageDispatch.DIRECT, None),
+    ]

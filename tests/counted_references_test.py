@@ -1227,3 +1227,47 @@ async def test_flat_counted_tail_pages_cancelled_while_a_replay_is_on_the_wire_s
     }
     assert aborted == [2, 3]
     assert closure is BindingClosure.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_a_flat_counted_tail_page_whose_result_was_dropped_settles_as_its_outcome_did(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The row budget (101 rows) fits two pages per tail batch. The last batch answers its first page with a failure,
+    # where the traversal stops, and its second with more rows than the budget has left, which the stream drops as
+    # answered: that page, never reached, settles as its outcome did, a failure, not as the success its command was
+    # answered with.
+    events = _observed(monkeypatch)
+
+    def answer(method: str, query: Query) -> Envelope:
+        start = int(query.get("start", "0"))
+        if start == 5 * WIDTH:
+            return {"error": "ACCESS_DENIED", "error_description": "denied"}
+        if start == 6 * WIDTH:
+            return {"result": [{"ID": 600_000 + row} for row in range(120)], "total": 301}
+        return _dense(301)(method, query)
+
+    portal = BatchPortal(answer)
+    async with _client(portal) as api:
+        stream = api.iter_list_counted(
+            Request.bare("crm.item.list", {"PARENT": 3}, ReplaySafety.SAFE),
+            page_size=WIDTH,
+            batch_size=3,
+            policy=ExecutionPolicy(max_buffered_rows=101),
+        )
+
+        async def drain() -> None:
+            async with stream:
+                async for _ in stream:
+                    pass
+
+        with pytest.raises(IncompleteTraversalError):
+            await drain()
+
+    assert portal.waves == [1, 2, 2, 2]
+    settled, aborted, closure = _flat_settlement(events)
+    assert settled == dict.fromkeys(range(5), CommandSettlement.SUCCESS) | dict.fromkeys(
+        (5, 6), CommandSettlement.FAILURE
+    )
+    assert aborted == []
+    assert closure is BindingClosure.FAILURE
