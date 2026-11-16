@@ -349,8 +349,7 @@ outcome.
   (`OperationRunner._interrupted`) decides delivery at once. A read in flight is cancelled and raises
   the interrupt (a read whose own task latched it and still returned an item raises it instead of the
   item). With no read in flight, between reads, the wake closes the latch and hands the interrupt, and any
-  escape undelivered yet, to the event loop then and there (`OperationLatch.hand_on`, the path of a late
-  interrupt): nothing later has to run for it to leave. The loop raises it once the callbacks already due
+  escape undelivered yet, to the event loop then and there (`OperationLatch.close_to_loop`): nothing later has to run for it to leave. The loop raises it once the callbacks already due
   in that loop turn have run: a reader those wake (one waiting on what the interrupted work did, say)
   resumes first, and a read or close it makes then finds the operation ended and runs its end; every other
   reader resumes after the raise. The operation's
@@ -393,7 +392,8 @@ outcome.
   kept, one `interrupted` violation last). `close_owned_resources` raises the client's close's first
   interrupt the same way with a latch of its own. A closed latch keeps nothing: an interrupt caught
   after the operation ended (a task outlasting the cleanup window raises it, say) is handed to the event
-  loop, which raises it out of `asyncio.run` as it does any task's, once. The
+  loop, once, which raises it out of `asyncio.run` as it does any task's if the operation's end raised no
+  interrupt, and otherwise reports it to its exception handler: an operation raises one interrupt at most. The
   failure is primary: `finalize_failure` puts its violation ahead of the cleanup failures behind it.
   A library error never carries it as a note, a failed finalization's error included: it carries the
   report (`error.report`). The caller's own

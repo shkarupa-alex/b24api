@@ -495,11 +495,12 @@ class OperationLatch:
     such a site.
 
     The first interrupt ends the operation: latched while it runs, it wakes its owner. Any other escape, a second
-    interrupt included, stays undelivered until a read or close raises it. The operation's end (``close``) raises the
-    interrupt, ahead of anything else, or else the first undelivered escape, once, as from a ``finally``. The escapes
-    it does not raise, and any caught once it is out, go to the event loop (``hand_on``), once each: the operation's
-    one interrupt (an interrupt caught after an end that raised none) is raised out of ``asyncio.run`` as any task's
-    is, and every other escape goes to the loop's exception handler, with the operation's report. An operation nothing
+    interrupt included, stays undelivered until the operation's end. That end (``close``) raises the interrupt, ahead
+    of anything else, or else the first undelivered escape, once, as from a ``finally``. The escapes it does not
+    raise, and any caught once it is out, go to the event loop (``hand_on``), once each. The operation raises one
+    interrupt at most: one caught after an end that raised none is raised out of ``asyncio.run`` as any task's is,
+    and every other escape, a second interrupt included, goes to the loop's exception handler, with the operation's
+    report. An operation nothing
     ends (a stream left unclosed when ``asyncio.run`` shuts down, or dropped) reports every escape still undelivered
     to that handler as the latch is collected, as asyncio reports a task's exception nobody retrieved. So no route an
     escape takes (an event, a future, a task's result, a cancelled pull) loses it silently.
@@ -540,10 +541,19 @@ class OperationLatch:
         raised = self.first
         if raised is None and undelivered:
             raised = undelivered.pop(0)
+        if raised is not None and not self._is_out(raised):
             self._out.append(raised)
         for error in undelivered:
             self.hand_on(error)
         return raised
+
+    def close_to_loop(self) -> None:
+        """The operation's end with no read or close to raise to: what ``close`` returns leaves the event loop instead.
+
+        An interrupt is raised out of ``asyncio.run`` from a callback, anything else is reported to its handler.
+        """
+        if (raised := self.close()) is not None:
+            self._deliver(raised, raise_it=is_interrupt(raised))
 
     def record(self, error: BaseException | None) -> None:
         """Latch ``error`` when it is an escape; anything else is not this latch's.
@@ -566,18 +576,16 @@ class OperationLatch:
     def hand_on(self, error: BaseException) -> None:
         """Hand ``error`` to the event loop, once: no read or close of the operation will raise it.
 
-        The operation raises one interrupt at most, its first: the loop raises that one out of ``asyncio.run`` from a
-        callback (``first`` once the end is out, when that end raised none). Raising another would stop the loop again
+        The operation raises one interrupt at most: the loop raises an interrupt out of ``asyncio.run`` from a callback
+        only while none of the operation's is out yet (its end raised none). Raising another would stop the loop again
         while the caller unwinds from the first (its client's close, say), so every other escape, a second interrupt
         included, is reported to the loop's exception handler.
         """
         if self._is_out(error):
             return
-        if is_interrupt(error) and self.first in (None, error):
-            self.first = error
-            asyncio.get_running_loop().call_soon(_raise, error)
-            return
-        self._report(error, asyncio.get_running_loop())
+        raise_it = is_interrupt(error) and not any(is_interrupt(out) for out in self._out)
+        self._out.append(error)
+        self._deliver(error, raise_it=raise_it)
 
     def __del__(self) -> None:
         """Report every escape no end raised to its loop's exception handler: nothing ended the operation.
@@ -588,14 +596,20 @@ class OperationLatch:
         if self._loop is not None:
             for error in self._undelivered:
                 if not self._is_out(error):
+                    self._out.append(error)
                     self._report(error, self._loop)
 
     def _is_out(self, error: BaseException) -> bool:
-        """Mark ``error`` out, returning whether it was out already (raised by an end, or handed on)."""
-        if any(out is error for out in self._out):
-            return True
-        self._out.append(error)
-        return False
+        """Return whether ``error`` is out already: raised by an end, or handed to the event loop."""
+        return any(out is error for out in self._out)
+
+    def _deliver(self, error: BaseException, *, raise_it: bool) -> None:
+        """Raise ``error`` out of the running loop from a callback, or report it to the loop's exception handler."""
+        loop = asyncio.get_running_loop()
+        if raise_it:
+            loop.call_soon(_raise, error)
+        else:
+            self._report(error, loop)
 
     def _report(self, error: BaseException, loop: asyncio.AbstractEventLoop) -> None:
         """Report ``error`` to ``loop``'s exception handler, with the operation's report."""

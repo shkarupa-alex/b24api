@@ -1197,6 +1197,8 @@ def test_a_closed_latch_raises_one_interrupt_and_reports_every_other_late_one(en
             assert latch.close() is (own if end == "raised_its_interrupt" else None)
             for error in (late, late, own, RuntimeError("no interrupt"), None, later, later):
                 latch.record(error)
+            # Another end of the operation (a read a concurrent close ended) raises what the first did, no late one.
+            assert latch.close() is (own if end == "raised_its_interrupt" else None)
         finally:
             loop.call_soon = call_soon  # type: ignore[method-assign]
 
@@ -1261,8 +1263,8 @@ def test_an_abandoned_latch_reports_every_undelivered_escape_and_raises_none(loo
 
 def test_a_latch_wakes_its_owner_only_while_the_operation_runs() -> None:
     # Running, the first interrupt wakes the owner, once (a second waits for the end, which reports it); ending, an
-    # interrupt is latched for the end, waking nothing; an interrupt the end handed on (no reader raised it) is not
-    # handed again when a catcher records it later.
+    # interrupt is latched for the end, waking nothing; an interrupt the end handed to the loop (no reader raised it)
+    # is not handed again when a catcher records or hands it on later.
     woken: list[bool] = []
     handed: list[tuple[object, ...]] = []
 
@@ -1281,7 +1283,7 @@ def test_a_latch_wakes_its_owner_only_while_the_operation_runs() -> None:
             ending.end()
             ending.record(first)
             assert (ending.first, ending.state, woken) == (first, LatchState.ENDING, [True])
-            assert ending.close() is first
+            ending.close_to_loop()
             ending.hand_on(first)
             ending.record(first)
         finally:

@@ -562,23 +562,22 @@ class OperationRunner[T, R: _Report]:
         """React to the operation's first interrupt: the read in flight raises it, or, without one, the event loop.
 
         A read in flight is cancelled, unless the interrupt is ending it already, and raises it once the operation has
-        ended. Without one, between reads, the interrupt goes to the event loop now, once (``OperationLatch.hand_on``):
-        nothing waits on any later step to deliver it. The end (cleanup and publication) follows in a task of its own,
-        unless a read or close begins it first (``_end_between_reads``). That task is started after the interrupt is
-        handed on, so a loop the interrupt stops does so before that task's first step. Under ``asyncio.run`` the
-        shutdown then cancels the task, and the end is run by a close the shutdown runs as it unwinds a task it
-        cancelled (``async with stream``, the client's ``async with``): that cancellation has landed already, so the
-        cleanup runs to its end and closes the source. A read that resumed ahead of the loop's raise and claimed the end
-        sees its cleanup, which the shutdown cancels before it begins, started again (``_end``), past the shutdown's
-        cancellations. A stream nothing closes then gets no end and no report.
+        ended. Without one, between reads, the interrupt goes to the event loop now, once
+        (``OperationLatch.close_to_loop``): nothing waits on any later step to deliver it. The end (cleanup and
+        publication) follows in a task of its own, unless a read or close begins it first (``_end_between_reads``). That
+        task is started after the interrupt is handed on, so a loop the interrupt stops does so before that task's first
+        step. Under ``asyncio.run`` the shutdown then cancels the task, and the end is run by a close the shutdown runs
+        as it unwinds a task it cancelled (``async with stream``, the client's ``async with``): that cancellation has
+        landed already, so the cleanup runs to its end and closes the source. A read that resumed ahead of the loop's
+        raise and claimed the end sees its cleanup, which the shutdown cancels before it begins, started again
+        (``_end``), past the shutdown's cancellations. A stream nothing closes then gets no end and no report.
         """
         pull = self._pull
         if self._phase is _Phase.PULLING and pull is not None and pull is not asyncio.current_task():
             pull.cancel()
         elif self._phase is _Phase.NEW:
             self._phase = _Phase.INTERRUPTED
-            if (interrupt := self._own_latch.close()) is not None:
-                self._own_latch.hand_on(interrupt)
+            self._own_latch.close_to_loop()
             self._ending = spawn_settled(self._end_between_reads())
 
     async def _end_between_reads(self) -> None:
