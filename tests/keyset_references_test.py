@@ -68,7 +68,7 @@ from b24api.contracts.completion import (
     PageScheduled,
 )
 from b24api.contracts.page_stop import ContinuePage
-from b24api.contracts.policy import KernelState, RetryPolicy
+from b24api.contracts.policy import RetryPolicy
 from b24api.contracts.request import RouteKind
 from b24api.errors import (
     ApiResponseError,
@@ -774,9 +774,46 @@ async def test_a_batch_that_fails_as_a_whole_fails_its_binding_with_the_batch_s_
 
 
 @pytest.mark.asyncio
+async def test_a_flat_keyset_page_read_but_never_consumed_is_rejected_as_aborted() -> None:
+    # The caller stops after the first row while the traversal holds pages it read and validated: each is traced
+    # committed, as its transaction did, and rejected in the completion evidence as aborted with the traversal,
+    # as a counted page read but never consumed is, whatever ended the stream.
+    events: list[object] = []
+    emit = CompletionGate.emit
+
+    def observe(gate: CompletionGate, event: CompletionEvidence) -> None:
+        events.append(event)
+        emit(gate, event)
+
+    portal = BatchPortal(_flat_answer(tuple(range(1, 301))))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(CompletionGate, "emit", observe)
+        async with client_for(portal) as client:
+            stream = client.iter_list_keyset(
+                _base(),
+                selector=ResultSelector.root(),
+                identity=_identity(),
+                page_size=PAGE,
+                keyset=_keyset(),
+                execution=AutoKeysetExecution(_CONTRACT),
+            )
+            async with stream:
+                async for _item in stream:
+                    break
+
+    rejected = [event.reason for event in events if isinstance(event, PageRejected)]
+    assert rejected
+    assert set(rejected) == {PageRejectionCode.TRANSACTION_ABORTED.value}
+    scheduled = [event.page_id for event in events if isinstance(event, PageScheduled)]
+    retired = [event.page_id for event in events if isinstance(event, PageAcknowledged | PageRejected)]
+    assert sorted(retired) == scheduled
+
+
+@pytest.mark.asyncio
 async def test_a_binding_that_fails_retires_every_page_it_scheduled() -> None:
     # A binding whose pages contradict their ranges fails while a page it has accepted is still undelivered: it
-    # rejects that page as it fails, so each page it scheduled is acknowledged or rejected exactly once.
+    # rejects that page as it fails, as aborted with it (the code a counted binding rejects such a page with, not
+    # what ended the binding), so each page it scheduled is acknowledged or rejected exactly once.
     events: list[object] = []
     emit = CompletionGate.emit
 
@@ -797,7 +834,9 @@ async def test_a_binding_that_fails_retires_every_page_it_scheduled() -> None:
     scheduled = [event.page_id for event in events if isinstance(event, PageScheduled)]
     retired = [event.page_id for event in events if isinstance(event, PageAcknowledged | PageRejected)]
     assert sorted(retired) == scheduled
-    assert KernelState.FAILED.value in {event.reason for event in events if isinstance(event, PageRejected)}
+    assert PageRejectionCode.TRANSACTION_ABORTED.value in {
+        event.reason for event in events if isinstance(event, PageRejected)
+    }
 
 
 @pytest.mark.asyncio

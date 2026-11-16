@@ -15,7 +15,6 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol
 
 from b24api.completion.reference_recorder import ReferenceFastLedger
-from b24api.contracts.policy import KernelState
 from b24api.contracts.report import KeysetSelectionSummary, Violation, ViolationSeverity
 from b24api.errors import PaginationError
 from b24api.execution.context import latch_escape
@@ -113,7 +112,7 @@ async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKe
             await _deliver(host, run, runtime, rows)
         closure, witnesses = runtime.completion_closure()
         await runtime.aclose()
-        ledger.close(successful=True, reason=KernelState.COMPLETED.value)
+        ledger.close(successful=True)
         closure = _witnessed(closure, ledger)
         report = runtime.report_fragment()
         await host.publish_terminal(
@@ -135,7 +134,7 @@ async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKe
         latch_escape(error)  # Latched before the await, so no cancellation of it can ever replace it.
         if runtime is not None and not runtime.closed:
             await runtime.aclose()
-        ledger.close(successful=False, reason=KernelState.FAILED.value)
+        ledger.close(successful=False)
         if isinstance(error, Exception):
             # A failure: the scheduler's per-reference boundary turns it into this binding's terminal event.
             run.failure = _FailureEvent(
