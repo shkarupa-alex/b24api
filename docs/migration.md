@@ -204,16 +204,16 @@
   nor its client, or `asyncio.run` was already shutting down when the interrupt was raised) it gets no
   end: its source stays open and there is no report. Any other `BaseException` (neither an interrupt nor a
   cancellation) is no longer treated as an interrupt, which asyncio's loop only logged and dropped between
-  reads, nor as a failure: in every family, whether your transport, your source's pull or its close raised
-  it, it ends the stream, the source is closed once, and it reaches your read or close as it is, with the
-  report `failed` ("<family> failed (X)", or "stream cleanup failed (X)" from the close). Code that caught
-  it as the `__cause__` of `BatchFailed`, `ReferenceFailed` or `InputSourceError`, or read it from a
-  failure outcome, catches it directly.
-- **An outcome's error follows one rule.** Every outcome family carries the library's error as it is
-  and any other `Exception` as a `CapabilityError` ("batch command failed", "fan-out command failed",
-  "reference failed") whose `__cause__` it is. Such an error used to drop it: a `CapabilityError` without
-  a cause in `fan_out_outcomes()` and the `iter_*_outcomes()` families, a `ProtocolError` ("batch command
-  failed without a typed safe error") in `batch_outcomes()`.
+  reads. It ranks and is reported exactly as an `Exception` raised at the same point, in every family; it
+  is only never wrapped: the stream raises it as it is where it would raise `InputSourceError`,
+  `BatchFailed` or `ReferenceFailed`, and an outcome family, which cannot yield it as an outcome, ends with
+  it as a fail-fast family would. Code that caught it as the `__cause__` of one of those errors, or read it
+  from a failure outcome, catches it directly.
+- **An outcome's failure from outside the library keeps its cause.** In `fan_out_outcomes()` and the
+  `iter_*_outcomes()` families, a failure that is not the library's error (the exception your `page_stop`
+  callback raises, say) was carried as a `CapabilityError` ("fan-out command failed", "reference failed")
+  that dropped it. That `CapabilityError` now has it as `__cause__`, as `BatchFailed` and `ReferenceFailed`
+  do in the fail-fast families; a traversal's error (`IncompleteTraversalError`) keeps it in its chain.
 - **A cancelled stream gives the cancellation's reason.** A stream read to its end and cancelled
   while its source closed reported `cancelled` with the terminal reason "input exhausted" (or
   "reference input exhausted"). Every family now gives "iteration cancelled" whenever the reader's

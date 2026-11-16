@@ -969,11 +969,16 @@ failure's first), and one `interrupted` violation last, "operation interrupted (
 `KeyboardInterrupt` or `SystemExit`. The raised interrupt carries that report as `.report`, as the
 `CancelledError` does. A close that fails after an interrupt ended the stream is "stream cleanup also
 failed (X)", as behind any other end that came first. Any other `BaseException` (neither an interrupt
-nor a cancellation), whether your source's pull or close, your transport or a callback raised it, is no
-failure either: no family wraps it in its error or makes it a failure outcome. It ends the stream, whose
-source is closed once, and reaches your read or close as it is, with the report `failed`: "<family> failed
-(X)", or "stream cleanup failed (X)" when the source's close raised it. It never goes to the event loop,
-which would only log it.
+nor a cancellation), from your source's pull or close, your transport or a callback, ranks and is reported
+exactly as an `Exception` raised at the same point; the one difference is that it is never wrapped. Where
+an `Exception` becomes `InputSourceError`, `BatchFailed` or `ReferenceFailed`, it is raised as it is, and the
+report names its class: "<family> failed (X)", "stream cleanup failed (X)" from the source's close (also on
+an early close), "stream cleanup also failed (X)" from a close behind an earlier failure, which is what you
+get, and the `__cause__` of the `CancelledError` behind your cancellation. It can be no failure outcome, so
+in an outcome family it ends the stream as a fail-fast family's failure would. Raised by a reference's send,
+it takes that reference's place: in `DeliveryOrder.INPUT` it reaches your read after the outcomes of the
+references before it, in `READY` when it comes; a close before your read gets there drops it, as it drops a
+failure nobody read. It never goes to the event loop, which would only log it.
 An interrupt raised while no read is waiting (by a send the stream runs between your reads, while you work
 on an item) does not wait for your next read: it leaves the event loop at once, out of `asyncio.run`, as
 asyncio raises any task's, and the operation's end follows: its work cancelled, its source closed and its
