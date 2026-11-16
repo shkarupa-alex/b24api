@@ -1385,8 +1385,8 @@ def test_a_base_exception_that_is_no_interrupt_fails_the_operation_for_its_reade
     # Binding 1's send raises a ``BaseException`` that is neither ``KeyboardInterrupt`` nor ``SystemExit``, while the
     # reader holds an item and reads again later (``between``) or while its read waits (``in_read``). The event loop
     # would only log it and drop it, so it is never handed there: it is a failure like any other, its reader's. A
-    # fail-fast family raises it, as the cause of its failure, with the failed report; an outcome family yields it as
-    # that reference's failure outcome.
+    # fail-fast family raises it, as the cause of its failure, with the failed report; an outcome family yields that
+    # reference's failure outcome, the exception the cause of its error.
     reported: list[str] = []
     got: list[object] = []
     streams: list[OperationStream[Any]] = []
@@ -1414,8 +1414,10 @@ def test_a_base_exception_that_is_no_interrupt_fails_the_operation_for_its_reade
     report = streams[0].report
     assert report is not None
     if family.endswith("_outcomes"):
-        failures = [item for item in got if isinstance(getattr(item, "error", None), CapabilityError)]
+        failures = [getattr(item, "error", None) for item in got if hasattr(item, "error")]
         assert len(failures) == 1
+        assert isinstance(failures[0], CapabilityError)
+        assert failures[0].__cause__ is transport.raised[0]
         assert report.state is TerminalState.COMPLETED_WITH_FAILURES
         return
     error = got[-1]
