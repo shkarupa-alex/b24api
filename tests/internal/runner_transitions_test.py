@@ -815,6 +815,8 @@ class _BetweenReads:
         self.finalized: list[TerminalCause] = []
         self.release = asyncio.Event()
         self.after_latch: list[Callable[[], Awaitable[None]]] = []
+        # Interrupts the cleanup latches once released, as more of the operation's own work fails.
+        self.latched_in_cleanup: list[BaseException] = []
         self.runner: OperationRunner[int, KernelReport] = OperationRunner(
             self._body(),
             LifecycleHooks(finalize=self._finalize, failure_report=_fallback, cleanup=self._cleanup),
@@ -843,6 +845,8 @@ class _BetweenReads:
         self.cleanups += 1
         self.cleaning.set()
         await self.release.wait()
+        for interrupt in self.latched_in_cleanup:
+            latch_interrupt(interrupt)
 
     async def read_one(self) -> None:
         """Read the one item, let the work latch the interrupt, and go on working past the event loop's raise."""
@@ -1003,3 +1007,32 @@ def test_the_operations_own_work_cannot_close_it_once_an_interrupt_ended_it_betw
     report = operation.runner.report
     assert report is not None
     assert report.terminal_reason == "operation interrupted"
+
+
+def test_a_second_interrupt_latched_in_the_ends_cleanup_goes_to_the_event_loop_after_the_first() -> None:
+    # The end that follows an interrupt between reads begins once the event loop raised it. Its cleanup latches
+    # another interrupt, twice, and the first again: nobody reads to raise them, so the event loop raises the other
+    # one, once, as it raised the first; the first is never raised again.
+    operation = _BetweenReads()
+    second = SystemExit("in cleanup")
+    operation.latched_in_cleanup.extend([second, second, operation.interrupt])
+    operation.release.set()
+    raised: list[BaseException] = []
+    loop = asyncio.new_event_loop()
+    try:
+        work = loop.create_task(operation.read_one())
+        for step in (lambda: work, lambda: _ending(operation.runner)):
+            try:
+                loop.run_until_complete(step())
+            except BaseException as error:  # noqa: BLE001 - the test inspects what the loop raised
+                raised.append(error)
+        loop.run_until_complete(asyncio.wait_for(operation.runner.aclose(), HANG_BOUND))
+        work.cancel()
+        loop.run_until_complete(asyncio.gather(work, return_exceptions=True))
+    finally:
+        loop.close()
+    assert raised == [operation.interrupt, second]
+    assert (operation.cleanups, operation.finalized) == (1, [TerminalCause.INTERRUPTED])
+    report = operation.runner.report
+    assert report is not None
+    assert getattr(operation.interrupt, "report", None) is report
