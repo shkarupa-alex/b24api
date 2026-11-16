@@ -17,7 +17,7 @@ from b24api.batch.stream import _BatchOutcomeStream
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
 from b24api.errors import B24ApiError, CapabilityError, IncompleteTraversalError
-from b24api.execution.facts import settlement
+from b24api.execution.facts import execution, settlement
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -40,7 +40,8 @@ class HeadAttempt:
     error: BaseException | None = field(repr=False)
     dispatch: PageDispatch
     batch_index: int | None
-    # How the head's command settles, which decides its trace too: a head never sent is not traced.
+    # Whether the head's command left the client (its execution's `dispatched`): only a head that was sent is traced.
+    sent: bool
     settlement: CommandSettlement
 
 
@@ -52,6 +53,8 @@ class TailReceipt:
     response: Response | None = field(repr=False)
     batch_index: int | None
     settlement: CommandSettlement
+    # Whether a failed page's command left the client (its execution's `dispatched`): only a sent page is traced.
+    sent: bool = True
     # A failed page: what it reports, which its trace records, and its command's own failure when the batch
     # answered or ended it (``None`` for a page that failed with its whole chunk).
     error: BaseException | None = field(default=None, repr=False)
@@ -194,7 +197,15 @@ class _FlatTailStream:
                     if isinstance(error, BaseException)
                     else CapabilityError("parallel counted batch command failed")
                 )
-                yield TailReceipt(index, None, index, settlement_of(outcome), reported, outcome)
+                yield TailReceipt(
+                    index,
+                    None,
+                    index,
+                    settlement_of(outcome),
+                    sent=execution(error).dispatched,
+                    error=reported,
+                    failure=outcome,
+                )
                 continue
             if not isinstance(outcome, BatchSuccess) or outcome.response is None:
                 raise CapabilityError("parallel counted batch outcome lacks correlated response evidence")
@@ -260,6 +271,7 @@ class DirectCountedWaveIO:
             None,
             PageDispatch.DIRECT,
             None,
+            sent=True,
             settlement=CommandSettlement.SUCCESS,
         )
 
@@ -270,6 +282,7 @@ class DirectCountedWaveIO:
             error,
             PageDispatch.DIRECT,
             None,
+            sent=execution(error).dispatched,
             settlement=settlement(error),
         )
 

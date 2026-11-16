@@ -1310,6 +1310,8 @@ async def test_auto_ends_with_the_request_budget_as_explicit_sequential_traversa
     keyset = report.keyset_execution
     assert keyset is not None
     assert (keyset.selected_kind, keyset.final_selection_reason or keyset.preselection_reason) == (kind, reason)
+    # A page the budget kept from its send left no request to record: none is traced as a failed command.
+    assert [record for record in report.page_trace if record.outcome is not PageOutcome.COMMITTED] == []
 
 
 @pytest.mark.asyncio

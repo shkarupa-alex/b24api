@@ -662,6 +662,7 @@ class ReferenceScheduler:
                 batch_index=failed.batch_index,
                 error=failed.error,
                 settled=failed.settlement,
+                sent=failed.sent,
             )
             raise
         run.driver.set_page_dispatch(dispatch=dispatched.dispatch, batch_index=dispatched.batch_index)

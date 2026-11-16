@@ -184,7 +184,10 @@ def _validate_wave(
         rejections.append(receipt)
         if not _budget_end(host, receipt.error):
             host.violations.append(receipt.violation)
-        page_outcome, rejection_code = classify_rejection(outcome, receipt)
+        traced = classify_rejection(outcome, receipt)
+        if traced is None:
+            continue  # never sent: not traced
+        page_outcome, rejection_code = traced
         host.record_page(
             plan,
             index=index,
@@ -490,17 +493,19 @@ def _reject_finish_receipt(
     if not _budget_end(host, receipt.error):
         host.violations.append(receipt.violation)
     host.admission.record_raw(receipt.selected_rows, discarded=True)
-    page_outcome, rejection_code = classify_rejection(outcome, receipt)
-    host.record_page(
-        plan,
-        index=None,
-        selected=receipt.selected_rows,
-        admitted=0,
-        outcome=page_outcome,
-        rejection=rejection_code,
-        violation=receipt.violation,
-        dispatch=dispatch,
-    )
+    traced = classify_rejection(outcome, receipt)
+    if traced is not None:  # a finish page never sent is not traced
+        page_outcome, rejection_code = traced
+        host.record_page(
+            plan,
+            index=None,
+            selected=receipt.selected_rows,
+            admitted=0,
+            outcome=page_outcome,
+            rejection=rejection_code,
+            violation=receipt.violation,
+            dispatch=dispatch,
+        )
     _raise_rejection(host, receipt)
 
 

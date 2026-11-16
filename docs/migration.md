@@ -855,7 +855,13 @@ now unknown with reason `CONNECTION_LOST_AFTER_DISPATCH` and a cause chain that 
   cannot be decoded. A page refused conclusively (`ACCESS_DENIED`, for example) is `REJECTED` with
   `COMMAND_FAILURE`, as fast keyset waves record it. Before, every such page was `UNKNOWN`, and its code
   was `COMMAND_FAILURE` unless the failure was an `AmbiguousExecutionError`, so a page of a sequential
-  or counted traversal that lost its answer was `COMMAND_FAILURE` too.
+  or counted traversal that lost its answer was `COMMAND_FAILURE` too. The trace records a request that
+  was sent: a page whose command never left the client (the budget refused its send, the client closed)
+  is not traced, on every path. A page of a counted traversal's batch tail, and a fast keyset wave or
+  final confirmation, that the budget kept from its send was traced `REJECTED` with `COMMAND_FAILURE`
+  though no request carried it; it is now absent from `page_trace`, as a direct or batch fan-out page the
+  budget refused already was. The binding's outcome, its settlement and the report's violations are
+  unchanged.
 - **An abandoned batch page is not sent.** A reference page fetched with `BatchDispatch` whose fetch was
   cancelled, or whose admission deadline passed, while its wave was being assembled was still sent with
   that wave and its answer discarded. Its wave now leaves without it, and a wave left with no page is

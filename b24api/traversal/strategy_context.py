@@ -74,9 +74,15 @@ class StrategyContext(Protocol):
         ...
 
     def record_failed_page(
-        self, *, dispatch: PageDispatch, batch_index: int | None, error: BaseException, settled: CommandSettlement
+        self,
+        *,
+        dispatch: PageDispatch,
+        batch_index: int | None,
+        error: BaseException,
+        settled: CommandSettlement,
+        sent: bool,
     ) -> None:
-        """Record a page whose command failed, traced the way it settles (``settled``); a page never sent is not."""
+        """Record a failed page that was sent (``sent``); its settlement (``settled``) decides the trace's code."""
         ...
 
     def select_page(self, response: Response, *, single: bool = False) -> tuple[FrozenJson, ...]:

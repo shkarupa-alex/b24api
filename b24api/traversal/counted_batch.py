@@ -190,6 +190,7 @@ class CountedBatchStrategy:
                 batch_index=failed.batch_index,
                 error=failed.error if failed.error is not None else error,
                 settled=failed.settlement,
+                sent=failed.sent,
             )
             raise
         if recorder is not None:
@@ -319,6 +320,7 @@ class CountedBatchStrategy:
                 batch_index=receipt.batch_index,
                 error=receipt.error,
                 settled=receipt.settlement,
+                sent=receipt.sent,
             )
             raise tail.failure(receipt)
         response, total, stride = receipt.response, self._total, self._stride

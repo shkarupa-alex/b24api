@@ -21,7 +21,7 @@ from b24api.execution import (
     Executor,
     WorkClass,
 )
-from b24api.execution.facts import settlement
+from b24api.execution.facts import execution, settlement
 from b24api.references.outcome import (
     KernelReferenceFailure,
     KernelReferenceItem,
@@ -480,15 +480,17 @@ class _AdmissionState:
 
 @dataclass(frozen=True, slots=True)
 class _FailedPage:
-    """What a page whose dispatch raised reports, and how it settles, from what its command did.
+    """What a page whose dispatch raised reports, whether it was sent, and how it settles.
 
     Every reader of a failed page reads it through ``_failed_page``: the binding's failure and its replay
     disposition, the page's settlement and trace, and a command failure that a wave or a tail takes as an outcome.
-    The settlement is the one fact of what the command did: it decides whether the page is traced, and how.
+    A page that was sent is traced (``sent``); its settlement, what its command did, decides the trace's code.
     """
 
     error: BaseException
     settlement: CommandSettlement
+    # Whether the page's command was sent: it left the client, whatever its answer, if any, said.
+    sent: bool
     # The command's own final outcome, when the batch answered or ended it: a failure of that command alone.
     failure: BatchFailure | None = None
 
@@ -513,7 +515,12 @@ class _BatchPageError(_SentPageError):
         cause = failure.error
         super().__init__(
             "batch page command failed",
-            _FailedPage(cause if isinstance(cause, BaseException) else self, settlement_of(failure), failure),
+            _FailedPage(
+                cause if isinstance(cause, BaseException) else self,
+                settlement_of(failure),
+                sent=execution(cause).dispatched,
+                failure=failure,
+            ),
         )
 
 
@@ -527,15 +534,19 @@ class _ChunkPageError(_SentPageError):
     def __init__(self, error: Exception, progress: BatchProgress, position: int) -> None:
         super().__init__(
             "batch page failed with its chunk",
-            _FailedPage(error, progress.settlement(position)),
+            _FailedPage(error, progress.settlement(position), sent=progress.execution(position).dispatched),
         )
 
 
 def _failed_page(error: BaseException) -> _FailedPage:
-    """Return a failed page's facts: those the dispatcher gave it, or those recorded on its failure."""
+    """Return a failed page's facts: those the dispatcher gave a page it sent, or those recorded on its failure.
+
+    Whether the page was sent is read from what its command did, as its settlement is: from its own outcome, its
+    chunk's progress, or the facts recorded on its failure (a page cancelled after its wave left records them).
+    """
     if isinstance(error, _SentPageError):
         return error.page
-    return _FailedPage(error, settlement(error))
+    return _FailedPage(error, settlement(error), sent=execution(error).dispatched)
 
 
 class _RowBuffer:

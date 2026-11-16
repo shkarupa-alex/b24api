@@ -1226,6 +1226,8 @@ async def test_a_keyset_binding_finish_the_request_budget_refuses_ends_with_the_
     assert report is not None
     assert (report.state, report.terminal_reason) == (TerminalState.INCOMPLETE, "BudgetExceededError")
     assert {item.code for item in report.violations} == {"budget_exhausted", "reference_failure"}
+    # A page the budget kept from its send left no request to record: none is traced as a failed command.
+    assert [record for record in report.page_trace if record.outcome is not PageOutcome.COMMITTED] == []
 
 
 @pytest.mark.asyncio

@@ -122,6 +122,7 @@ class SharedCountedWaveIO:
             None,
             dispatched.dispatch,
             dispatched.batch_index,
+            sent=True,
             settlement=CommandSettlement.SUCCESS,
         )
 
@@ -133,6 +134,7 @@ class SharedCountedWaveIO:
             failed.error,
             self._host.page_dispatch,
             failed.batch_index,
+            sent=failed.sent,
             settlement=failed.settlement,
         )
 
@@ -340,11 +342,19 @@ class ReferenceTailStream:
             dispatched = await task
         except Exception as error:
             failed = _failed_page(error)
-            if failed.settlement is CommandSettlement.NOT_EXECUTED:
+            if not failed.sent:
                 raise  # never sent: the tail abandons the page, as it does every unsent one
             # A sent page that failed, by its command's own failure or with its whole chunk, is the page's outcome.
             self._take(slot)
-            return TailReceipt(slot.ordinal, None, failed.batch_index, failed.settlement, failed.error, failed.failure)
+            return TailReceipt(
+                slot.ordinal,
+                None,
+                failed.batch_index,
+                failed.settlement,
+                sent=True,
+                error=failed.error,
+                failure=failed.failure,
+            )
         self._take(slot)
         run.page_state += 1
         return TailReceipt(slot.ordinal, dispatched.response, dispatched.batch_index, CommandSettlement.SUCCESS)
