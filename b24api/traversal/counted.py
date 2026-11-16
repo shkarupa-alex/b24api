@@ -18,6 +18,7 @@ from b24api.contracts.policy import (
 )
 from b24api.contracts.report import retain_page_trace
 from b24api.errors import B24ApiError, CapabilityError, IncompleteTraversalError
+from b24api.execution.context import latch_escape
 from b24api.execution.failure import CANCELLED_REASON
 from b24api.execution.failure import attach_report as _attach_report
 from b24api.execution.snapshot import KernelReport
@@ -169,6 +170,7 @@ class CountedItemStream:
             raise incomplete from cause
         except BaseException as error:
             # A BaseException that is not an Exception is no traversal failure to wrap: it leaves as raised.
+            latch_escape(error)  # Latched before the await, whose cancellation would replace it.
             primary = error
             await self._finalize(KernelState.FAILED, type(error).__name__)
             _attach_report(error, self.report)

@@ -16,7 +16,7 @@ from b24api.completion.closure import QUALIFIED_TOTAL_REACHED
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
 from b24api.errors import B24ApiError, CapabilityError
-from b24api.execution.context import Settled, spawn_settled
+from b24api.execution.context import Settled, latch_escape, spawn_settled
 from b24api.references.dispatch import _BatchPageError, _failed_page, _SentPageError
 from b24api.traversal.counted_io import HeadAttempt, TailReceipt
 
@@ -115,7 +115,8 @@ class SharedCountedWaveIO:
         del context  # the shared dispatcher already runs on the operation context
         try:
             dispatched = await self._host.dispatch_page(self._run, request)
-        except BaseException:
+        except BaseException as error:
+            latch_escape(error)  # Latched before the await, whose cancellation would replace it.
             await self._host.abandon_page(self._run)
             raise
         return HeadAttempt(
