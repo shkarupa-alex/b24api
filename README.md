@@ -36,7 +36,7 @@ the smallest of its `concurrency`, `ExecutionPolicy.max_direct_concurrency`,
 physical batches, not requests: it keeps at most the smallest of its `concurrency`,
 `max_active_references` and the client limit in flight, and `max_direct_concurrency` does not limit it.
 When a REST 3.0 envelope of `SAFE` commands may have run without an answer, its unresolved commands are
-sent again one by one, all at once, bounded only by the client limit. `fan_out()` and
+sent again alone, one at a time, within the slot of that envelope's batch. `fan_out()` and
 `fan_out_outcomes()` divide `max_buffered_rows` among the results they may have in flight at once: the
 requests of a `DirectDispatch`, or `batch_size` commands per physical batch of a `BatchDispatch`, at most
 `max_active_references`. That share is the longest result a command may return, and a longer one ends
@@ -903,26 +903,26 @@ consumer takes.
 is admitted, while a send waits for its permit (a pause included), while a page waits for row capacity
 and while a source, synchronous or asynchronous, is pulled. A send in flight is cut at what is left of
 the operation or of its retry window, whichever is shorter. It does not bound the time the application
-spends while it holds control: in a `page_stop` callback, or as a consumer that is slow between pulls
-of the stream. Nothing interrupts the application when the budget runs out meanwhile; the next
-scheduling point ends the operation, even when all that is left is to read the end of the source. The
-report is then `incomplete`, with `BudgetExceededError` as its terminal reason and a `budget_exhausted`
-violation. The stream raises a plain `BudgetExceededError`, except that a fail-fast stream whose stop
-failed a command or a binding raises its wrapper (`BatchFailed` or `ReferenceFailed`, whose report
-carries that reason). A stop at a source pull or at the end-of-source check fails none by itself, but
-`batch()` and `batch_outcomes()` still send the commands they read into the window before it, which the
-budget refuses in turn (each a `CommandFailure` with `BudgetExceededError`), so `batch()` then raises
-`BatchFailed`. So it depends on where the budget stopped the stream, not on the operation: handle both,
-or read the report. A refusal of one request while time is left ends that request alone: a retry whose
-wait is longer than the time left, one whose own retry window closed first, a known pause that outlasts
-what it may wait, or a spent `max_attempts_per_request`. It ends with that refusal,
-`BudgetExceededError`, caused by the failure of the send it followed: a request or command that send
-proved not run fails with it, and one that send may have run is unknown (`AmbiguousExecutionError`,
-named after that send, with the refusal as its cause; a lone call raises the refusal). Nothing is
-recorded as the operation's refusal, and a tolerant stream goes on: with no other failure it ends
-`completed_with_failures`, with no `budget_exhausted`. Cleanup never ends a stream with the budget. A
-send cut in flight is another case: its command may have run, so it is unknown
-(`AmbiguousExecutionError`), and a fail-fast stream may end on that ambiguity instead.
+spends while it holds control: in a `page_stop` callback, or as a consumer that is slow between pulls of
+the stream. Nothing interrupts the application when the budget runs out meanwhile; the next scheduling
+point ends the operation, even when all that is left is to read the end of the source. The report is
+then `incomplete`, with `BudgetExceededError` as its terminal reason and a `budget_exhausted` violation.
+The stream raises a plain `BudgetExceededError`, except that a fail-fast stream whose stop failed a
+command or a binding raises its wrapper (`BatchFailed` or `ReferenceFailed`, whose report carries that
+reason). A stop at a source pull or at the end-of-source check fails none by itself, but `batch()` and
+`batch_outcomes()` still send the commands they read into the window before it, which the budget refuses
+in turn (each a `CommandFailure` with `BudgetExceededError`), so `batch()` then raises `BatchFailed`. So
+for a fail-fast stream it depends on where the budget stopped the stream, not on the operation (a
+tolerant stream raises the plain error): handle both, or read the report. A refusal of one request while
+time is left ends that request alone: a retry whose wait is longer than the time left, one whose own
+retry window closed first, a known pause that outlasts what it may wait, or a spent
+`max_attempts_per_request`. It ends with that refusal, `BudgetExceededError`, caused by the failure of
+the send it followed: a request or command that send proved not run fails with it, and one that send may
+have run is unknown (`AmbiguousExecutionError`, named after that send, with the refusal as its cause; a
+lone call raises the refusal). Nothing is recorded as the operation's refusal, and a tolerant stream
+goes on: with no other failure it ends `completed_with_failures`, with no `budget_exhausted`. Cleanup
+never ends a stream with the budget. A send cut in flight is another case: its command may have run, so
+it is unknown (`AmbiguousExecutionError`), and a fail-fast stream may end on that ambiguity instead.
 
 Cleanup runs once the operation has ended, often because `max_elapsed` ran out, so it is not cut at
 the budget: each of its steps (closing the source, stopping the operation's own tasks) waits for what

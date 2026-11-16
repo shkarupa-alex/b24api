@@ -44,27 +44,27 @@ an envelope they decode, and the batch page dispatcher of references and list tr
 cancelled after its wave was sent. A page whose fetch ended before its wave left, cancelled or past its
 admission deadline, is never sent, so it stays proven not run. A caller whose wait for a running chunk
 ends early (a cancelled page, or a fast keyset wave the traversal's end interrupts), and every page of a
-chunk that fails as a whole (it reports the chunk's error), reads what each of its commands did from the chunk's `BatchProgress`, which the batch engine keeps by the same rule: a
-command answered, by its entry or with its envelope, was answered, and one answered with a success
-succeeded; one whose latest send, or one before it, may have run without an answer may have run; one
-never sent was not sent. Until the chunk ends, a command without a final outcome may still be sent (a replay
-it waits for), so a page cancelled meanwhile may have run; a REST v3 group keeps its state to itself, so its
-commands in progress may have run. A fast keyset wave engine, flat or shared by reference bindings, settles
-each page it was handed by its command id from what that command did, also when its call raises; the page
-ledger (`FastPageLedger`) settles a page never handed to an engine as not executed, which retires it, the one
-rule on every path. A page answered with a success settles as a success on every path, a page the traversal
-stops before included: the facts recorded on a cancelled reference page keep that its command succeeded
-(`facts.settlement`), and a counted tail, reference or flat, settles each page it read but will not consume
-from what its command did, the flat one from the state of the batch it joined
-(`_BatchOutcomeStream.settlement`): its outcome once answered, its `BatchProgress` while sent, not executed
-while only read, and not executed when its pull was cut short before it joined one: answered with a success, a
-success, rejected as `transaction_aborted`; never sent, not executed; unknown only when it may have run. One
-rule, `facts.settled_as`, gives a command's settlement from what it is known to have done and whether it
-succeeded; its callers only read those two facts from what they hold: a failure's recorded facts
-(`facts.settlement`), a final batch outcome (`batch.outcome.settlement_of`), a command of a running chunk
-(`BatchProgress.settlement`) and a shared wave's dispatch task. `b24api.execution.facts` holds the one
+chunk that fails as a whole (it reports the chunk's error), reads what each of its commands did from the
+chunk's `BatchProgress`, which the batch engine keeps by the same rule: a command answered, by its entry or
+with its envelope, was answered, and one answered with a success succeeded; one whose latest send, or one
+before it, may have run without an answer may have run; one never sent was not sent. Until the chunk ends, a
+command without a final outcome may still be sent (a replay it waits for), so a page cancelled meanwhile may
+have run; a REST v3 group keeps its state to itself, so its commands in progress may have run. A fast keyset
+wave engine, flat or shared by reference bindings, settles each page it was handed by its command id from what
+that command did, also when its call raises; the page ledger (`FastPageLedger`) settles a page never handed to
+an engine as not executed, which retires it, the one rule on every path. A page answered with a success
+settles as a success on every path, a page the traversal stops before included: the facts recorded on a
+cancelled reference page keep that its command succeeded (`facts.settlement`), and a counted tail, reference
+or flat, settles each page it read but will not consume from what its command did, the flat one from the state
+of the batch it joined (`_BatchOutcomeStream.settlement`): its outcome once answered, its `BatchProgress`
+while sent, not executed while only read, and not executed when its pull was cut short before it joined one:
+answered with a success, a success, rejected as `transaction_aborted`; never sent, not executed; unknown only
+when it may have run. One rule, `facts.settled_as`, gives a command's settlement from what it is known to have
+done and whether it succeeded; its callers only read those two facts from what they hold: a failure's recorded
+facts (`facts.settlement`), a final batch outcome (`batch.outcome.settlement_of`), a command of a running
+chunk (`BatchProgress.settlement`) and a shared wave's dispatch task. `b24api.execution.facts` holds the one
 mapping from that fact to the public outcome variant (`ambiguity_of`) and to the completion settlement
-(`Execution.settlement`), and `b24api.traversal.page_failure` holds the one rule of a failed page's
+(`Execution.settlement`), and `b24api.completion.page_failure` holds the one rule of a failed page's
 trace, from its settlement alone: a page that never executed because it was never sent (traversals never
 halt a batch, so no sent command is withheld) leaves no request to record and is not traced, whatever kept
 it from its send (the budget, a closed client, a cancellation); the settlement decides the code of every
@@ -73,47 +73,49 @@ rejected; a page whose own command succeeded is rejected as `transaction_aborted
 dropped with the unit around it, not as a `command_failure`, and its completion record retires it with the same
 code (`PageRejected`), as it retires a page the traversal read but never consumed. One function couples the
 two (`page_failure.rejection_reason`): the driver and the keyset runtime both retire a page they trace as
-rejected with the trace's code. Whatever ended the page
-decides nothing: a page cancelled on the wire may have run and is traced unknown, as one whose answer was lost.
-A traversal records the failed page it stops
-at, not every page its failure leaves behind: a counted tail stops at a binding's first failed page in
-offset order, and the binding's later pages, sent or not, are settled and released without a trace record.
-A page's trace and its settlement read the same fact, the page's own: for a page of a chunk that failed as
-a whole, its command's in the chunk's `BatchProgress`. Every failure the batch page dispatcher gives a page
-it handed to a batch carries those facts (`_FailedPage`: what it reports, how it settles, and the command's
-own failure when the batch answered or ended it), and every caller reads a failed page through one function
-(`_failed_page`), which falls back to the facts recorded on any other failure: the binding's failure, a page's
-settlement and trace, and a wave or a counted tail that takes a command's own failure as its outcome.
-`page_failure.failed_page` alone decides whether a failed page is traced and how, for `record_failed_page` and
-for keyset's `classify_rejection`. Both counted tails, reference and flat, hand the tail's one trace site a
-receipt for every failed page they reach, sent or never sent, with its command's own failure or its whole
-chunk's, and that site traces it by `failed_page` alone. A page sent with a chunk that failed as a whole (its
-batch failed, or its answer could not be decoded) is traced as its settlement says, with its position in that
-chunk as its `batch_index`, on every path that sends one: the reference dispatcher's `_FailedPage`, the flat
-tail's stream (`failed_chunk`: the traversal stops at that chunk's first page, the one it traces) and a keyset
-engine whose wave or finish call failed (`failed_pages`: each page's settlement and index, which the keyset
-transaction traces by `failed_page`, a direct finish page with no index). Each of them remembers every call
-that raised, a cancelled one included, and none filters by the exception's type. A reference binding's trace
-reaches the operation's report only through the events its consumer reads: when the consumer is cancelled, it
-reads no more, so a reference binding's pages, settled as their commands did, are not traced, whatever path
-they took (sequential, counted or keyset). A page's `batch_index` is
-its command's index in the physical batch it was submitted with (sent with, or handed to), as its command's
-outcome carries it, on every path: a keyset wave or finish page of a reference binding shares that batch with
-other bindings' commands, so its index in its own binding's wave is not one. The index is also the command's
-key in that batch's envelope, which every replay send of the command keeps: a page replayed alone, or with
-fewer commands, keeps the index of the batch it was first submitted with, whichever send's answer settled it.
-A page with no batch command to point to, such as a direct page, has none. Classic and REST v3 batch,
-`call()`, direct and batch fan-out, references and list traversal all use them, and none of them chooses from
-the exception type, which names the cause of a failure and never proves that a command did not run. A sent
-command is unknown unless a listed refusal proves it did not run or a conclusive answer settles it. A
-conclusive answer is a structured Bitrix error, top-level or found in the result by the command's own
-contract, or any status outside 2xx that the ambiguity policy does not hold ambiguous, whatever its body, so a
-malformed error body on such a status is conclusive too. A REST v3 batch envelope is the one exception: a
-top-level structured error on it is an abort, which may come after some of its commands ran, so it settles
-none of them; a command is answered only by its own element or its own isolated send, or proven not run by a
-transport failure that proves the envelope was not accepted or a listed refusal status of the envelope. A 2xx
-answer the client cannot decode settles nothing, whichever part is malformed: the envelope, a command's paging
-metadata or its embedded error.
+rejected with the trace's code, and the completion recorders retire a page reserved but never consumed by
+`page_failure.unconsumed_rejection`, from the same rule. A keyset page is traced when its transaction
+commits it, before its rows reach the caller, so one read but never consumed (the caller stopped, or the
+traversal failed past it) is traced committed and retired as `transaction_aborted` too, on a fast keyset
+ledger as on the others (`FastPageLedger.close`). Whatever ended the page decides nothing: a page
+cancelled on the wire may have run and is traced unknown, as one whose answer was lost. A traversal records
+the failed page it stops at, not every page its failure leaves behind: a counted tail stops at a binding's
+first failed page in offset order, and the binding's later pages, sent or not, are settled and released
+without a trace record. A page's trace and its settlement read the same fact, the page's own: for a page of a
+chunk that failed as a whole, its command's in the chunk's `BatchProgress`. Every failure the batch page
+dispatcher gives a page it handed to a batch carries those facts (`_FailedPage`: what it reports, how it
+settles, and the command's own failure when the batch answered or ended it), and every caller reads a failed
+page through one function (`_failed_page`), which falls back to the facts recorded on any other failure: the
+binding's failure, a page's settlement and trace, and a wave or a counted tail that takes a command's own
+failure as its outcome. `page_failure.failed_page` alone decides whether a failed page is traced and how, for
+`record_failed_page` and for keyset's `classify_rejection`. Both counted tails, reference and flat, hand the
+tail's one trace site a receipt for every failed page they reach, sent or never sent, with its command's own
+failure or its whole chunk's, and that site traces it by `failed_page` alone. A page sent with a chunk that
+failed as a whole (its batch failed, or its answer could not be decoded) is traced as its settlement says,
+with its position in that chunk as its `batch_index`, on every path that sends one: the reference dispatcher's
+`_FailedPage`, the flat tail's stream (`failed_chunk`: the traversal stops at that chunk's first page, the one
+it traces) and a keyset engine whose wave or finish call failed (`failed_pages`: each page's settlement and
+index, which the keyset transaction traces by `failed_page`, a direct finish page with no index). Each of them
+remembers every call that raised, a cancelled one included, and none filters by the exception's type. A
+reference binding's trace reaches the operation's report only through the events its consumer reads: when the
+consumer is cancelled, it reads no more, so a reference binding's pages, settled as their commands did, are
+not traced, whatever path they took (sequential, counted or keyset). A page's `batch_index` is its command's
+index in the physical batch it was submitted with (sent with, or handed to), as its command's outcome carries
+it, on every path: a keyset wave or finish page of a reference binding shares that batch with other bindings'
+commands, so its index in its own binding's wave is not one. The index is also the command's key in that
+batch's envelope, which every replay send of the command keeps: a page replayed alone, or with fewer commands,
+keeps the index of the batch it was first submitted with, whichever send's answer settled it. A page with no
+batch command to point to, such as a direct page, has none. Classic and REST v3 batch, `call()`, direct and
+batch fan-out, references and list traversal all use them, and none of them chooses from the exception type,
+which names the cause of a failure and never proves that a command did not run. A sent command is unknown
+unless a listed refusal proves it did not run or a conclusive answer settles it. A conclusive answer is a
+structured Bitrix error, top-level or found in the result by the command's own contract, or any status outside
+2xx that the ambiguity policy does not hold ambiguous, whatever its body, so a malformed error body on such a
+status is conclusive too. A REST v3 batch envelope is the one exception: a top-level structured error on it is
+an abort, which may come after some of its commands ran, so it settles none of them; a command is answered
+only by its own element or its own isolated send, or proven not run by a transport failure that proves the
+envelope was not accepted or a listed refusal status of the envelope. A 2xx answer the client cannot decode
+settles nothing, whichever part is malformed: the envelope, a command's paging metadata or its embedded error.
 
 A command keeps one send lineage across executor retries, classic batch replay rounds and REST v3
 isolation: what the sends it was in left open. The commands a REST v3 envelope group still resolves are
@@ -160,12 +162,12 @@ outcome.
 - The row budget bounds what an operation holds, not what it sends: a result's rows are known only
   after its command ran. A logical batch and a counted traversal's tail fit a window's results into
   `max_buffered_rows` in input order (`_within_row_budget`), and the reference scheduler fits each
-  page into the rows reserved for it before the page is accepted. A result that does not fit is dropped, and its command fails with
-  `ResultTooLargeError`, recorded answered by `b24api.execution.facts.dropped_result`: a failure that
-  ran, never one proven not run. A page's wait for row capacity (`_RowBuffer.reserve`) is bounded by
-  the operation's elapsed budget, as every other dispatch wait is. A binding's wait for the consumer is
-  not: under `READY` delivery, or with a page stop, `_deliver_page` puts the page on the output queue and
-  awaits its acknowledgement without a deadline, since the consumer holds control there. The budget
+  page into the rows reserved for it before the page is accepted. A result that does not fit is dropped, and
+  its command fails with `ResultTooLargeError`, recorded answered by `b24api.execution.facts.dropped_result`:
+  a failure that ran, never one proven not run. A page's wait for row capacity (`_RowBuffer.reserve`) is
+  bounded by the operation's elapsed budget, as every other dispatch wait is. A binding's wait for the
+  consumer is not: under `READY` delivery, or with a page stop, `_deliver_page` puts the page on the output
+  queue and awaits its acknowledgement without a deadline, since the consumer holds control there. The budget
   ends the operation at its next scheduling point after the consumer takes the page.
 - Budgets are charged to one operation-local ledger of plain counters updated in place, so a
   reservation, its settlement and a row-buffer change cost the same however many bindings the
@@ -199,18 +201,18 @@ outcome.
   for a lone request's retry, a REST 3.0 envelope retry or isolated send and a classic round alike.
   Each send's failure is classified into the request's lineage where the send ended, so the failure that
   ends a request after its sends, a stop or a cancellation included, is recorded with what the lineage left
-  open (`record_open`), by the executor for a lone request as by the batch dialects for their own (a REST 3.0
-  group's envelopes, and the isolated sends of the command sent alone when it ended; a classic envelope's
-  rounds), never told by its exception type: a command a stop ended is explained by the latest send that may
-  have run (its reason and evidence), whatever stopped it: the budget, a closed coordinator or a closed
+  open (`record_open`), by the executor for a lone request as by the batch dialects for the stops of their
+  own commands, never told by its exception type: a command a stop ended is explained by the latest send that
+  may have run (its reason and evidence), whatever stopped it: the budget, a closed coordinator or a closed
   transport. With nothing sent, `record_open` records nothing, so a failure before the first send, a stop or a
-  cancellation, stays proven not run. A transport refuses a
-  send before it leaves the process with `ClientClosedError` only because it is closed (a closed
-  `HttpxTransport` or injected HTTPX client, or any transport): the executor releases the attempt it
-  reserved and records nothing sent (`Executor._dispatch`), so that send is no physical request and no
-  isolated send, and stops it as the permit does. Until its transport returns, a send holds its
-  reservation, so a concurrent send the spent request budget refused meanwhile stays refused even when
-  that reservation is then released. Any other failure before dispatch (a credential unavailable, a
+  cancellation, stays proven not run. A cancellation that ends a whole batch is no command's outcome and
+  records nothing of the batch: each command settles from what its chunk's `BatchProgress` holds of it, its
+  answer or its lineage. A transport refuses a send before it leaves the process with `ClientClosedError` only
+  because it is closed (a closed `HttpxTransport` or injected HTTPX client, or any transport): the executor
+  releases the attempt it reserved and records nothing sent (`Executor._dispatch`), so that send is no
+  physical request and no isolated send, and stops it as the permit does. Until its transport returns, a send
+  holds its reservation, so a concurrent send the spent request budget refused meanwhile stays refused even
+  when that reservation is then released. Any other failure before dispatch (a credential unavailable, a
   connection pool timeout, a refused connection) is a `TransportError` and its send counts. A batch command
   that followed its envelope's failure ends with that stop; a classic round may carry a command past a
   round, so its engine gives each command a copy of the stop caused by the failure that command
@@ -247,18 +249,18 @@ outcome.
   refusal recorded and the operation ended with it; those tests are what hold the rule.
   `tests/internal/deadline_refusal_test.py` adds a cheap static tripwire for the usual idioms (the
   `ExecutionContext` members that read its clock, the readers that refuse nothing, the timeouts armed
-  through `asyncio`, every `BudgetExceededError` constructed), which a site written otherwise passes. The refusals of one request while time is left, for a
-  coordinator hold or a retry delay its window cannot carry, or a send that may not be repeated left
-  less window than its wait, record nothing. `ExecutionContext.refusal` keeps the first recorded refusal's message.
-  Whether an error is the operation's refusal, which ends it, is told by its mark, not by its text or its type:
-  the mark is a value unique to the context, so it survives a copy or a pickle round trip of the error, and
-  the context marks every error it raises as such (`operation_refusal`, from `_refuse`, `admit_request`,
-  `raise_if_refused` and the source pull; a replay round's stopped commands end with that refusal or a copy
-  of it, which keeps its mark), and `ExecutionContext.ended_by` is the one check, used by the
-  reference scheduler's source pull, the batch window's pull, the counted tail and the fast keyset
-  commands. Every later work the budget refuses names its own work but is that same end; a request's own
-  refusal or a dropped result is not marked and fails its work alone.
-  `AsyncIteratorController.get`, the one source pull of the batch streams, refuses further input once
+  through `asyncio`, every `BudgetExceededError` constructed), which a site written otherwise passes. The
+  refusals of one request while time is left, for a coordinator hold or a retry delay its window cannot carry,
+  or a send that may not be repeated left less window than its wait, record nothing.
+  `ExecutionContext.refusal` keeps the first recorded refusal's message. Whether an error is the operation's
+  refusal, which ends it, is told by its mark, not by its text or its type: the mark is a value unique to the
+  context, so it survives a copy or a pickle round trip of the error, and the context marks every error it
+  raises as such (`operation_refusal`, from `_refuse`, `admit_request`, `raise_if_refused` and the source
+  pull; a replay round's stopped commands end with that refusal or a copy of it, which keeps its mark), and
+  `ExecutionContext.ended_by` is the one check, used by the reference scheduler's source pull, the batch
+  window's pull, the counted tail and the fast keyset commands. Every later work the budget refuses names its
+  own work but is that same end; a request's own refusal or a dropped result is not marked and fails its work
+  alone. `AsyncIteratorController.get`, the one source pull of the batch streams, refuses further input once
   a send was refused or the deadline has passed, so the operation ends with `BudgetExceededError`; the
   commands a batch window read before such a pull are sent as any window is, the budget refusing each,
   and the stream then raises the pull's refusal. A pull the budget refuses ends the reference
@@ -312,28 +314,29 @@ outcome.
   worker thread a cancelled synchronous pull still waits for, a binding, a tail page, a cleanup); the
   reference scheduler's binding end and cleanup collectors; the batch dispatcher's senders, whose pages a
   close may have cancelled; every handler that awaits before it raises again (a fast keyset binding's, a
-  counted head's, a counted traversal's), which hands it on first, so that await can never replace it (none
-  of them suspends today; the rule keeps it so if one ever does); and `OperationRunner.__anext__` where a read ends, which is where an inline kernel
-  (`batch()`, `iter_list*`, the fast keyset) first catches what its own send raised. That kernel's end
-  raises it as its FAILED primary, which a failed cleanup never replaces. An interrupt is different: the
-  kernel's end may raise something else in its place (its failed cleanup, say), so the latch is what keeps
-  it. Whatever later handles it as an end (a scheduler's close, a future a close cancelled) may drop it
-  freely: the latch has it. The first interrupt ends the operation; any other escape stays undelivered
-  until an end raises it. The end raises the interrupt, or else the first undelivered escape, once, as
-  from a `finally`, ahead of whatever else would leave (`OperationRunner._raise_latched`,
-  `OperationLatch.close`): the read whose end it is, or the close when no read got it. A read a concurrent
-  close ended never raises it (that close took it): the read ends as the close's cancellation of it would.
-  Only the owner's end raises it: an inline kernel's ends as it would otherwise. A reference binding that
-  ends in one ends its task in it and puts `_EndedEvent` in its queue (`ReferenceScheduler._end_binding`),
-  only so that a read reaches the binding's place instead of waiting for an end that never comes; it
-  raises the task's end there (`_finish_task`). That put, as any terminal event's, never waits: under
-  INPUT each binding's queue is its own and unbounded; under READY the shared queue holds as many events
-  as bindings may be admitted at once (`active_limit`), a binding keeps its admission slot until the
-  consumer took its terminal event, and it has at most one event queued at a time, since it waits for the
-  consumer to acknowledge each page before its next step and its terminal event is its last. A coroutine
-  closed by hand or at collection (`GeneratorExit`) ends no binding. What an end does not raise (a second
-  escape, or one behind the interrupt) and whatever is latched once the end is out (work that outlived the
-  cleanup window) goes to the event loop (`OperationLatch.hand_on`), once each. An operation raises one
+  counted head's, a counted traversal's, and a reference binding's page loop, `ReferenceScheduler._drive`,
+  which closes its page stream first), which hands it on first, so that await can never replace it (the
+  first three never suspend today; the rule keeps it so if one ever does); and `OperationRunner.__anext__`
+  where a read ends, which is where an inline kernel (`batch()`, `iter_list*`, the fast keyset) first catches
+  what its own send raised. That kernel's end raises it as its FAILED primary, which a failed cleanup never
+  replaces. An interrupt is different: the kernel's end may raise something else in its place (its failed
+  cleanup, say), so the latch is what keeps it. Whatever later handles it as an end (a scheduler's close, a
+  future a close cancelled) may drop it freely: the latch has it. The first interrupt ends the operation; any
+  other escape stays undelivered until an end raises it. The end raises the interrupt, or else the first
+  undelivered escape, once, as from a `finally`, ahead of whatever else would leave
+  (`OperationRunner._raise_latched`, `OperationLatch.close`): the read whose end it is, or the close when no
+  read got it. A read a concurrent close ended never raises it (that close took it): the read ends as the
+  close's cancellation of it would. Only the owner's end raises it: an inline kernel's ends as it would
+  otherwise. A reference binding that ends in one ends its task in it and puts `_EndedEvent` in its queue
+  (`ReferenceScheduler._end_binding`), only so that a read reaches the binding's place instead of waiting for
+  an end that never comes; it raises the task's end there (`_finish_task`). That put, as any terminal event's,
+  never waits: under INPUT each binding's queue is its own and unbounded; under READY the shared queue holds
+  as many events as bindings may be admitted at once (`active_limit`), a binding keeps its admission slot
+  until the consumer took its terminal event, and it has at most one event queued at a time, since it waits
+  for the consumer to acknowledge each page before its next step and its terminal event is its last. A
+  coroutine closed by hand or at collection (`GeneratorExit`) ends no binding. What an end does not raise (a
+  second escape, or one behind the interrupt) and whatever is latched once the end is out (work that outlived
+  the cleanup window) goes to the event loop (`OperationLatch.hand_on`), once each. An operation raises one
   interrupt at most, its first: one caught after an end that raised none is raised out of `asyncio.run`
   from a callback. Every other escape, a second interrupt included, goes to the loop's exception handler
   with the operation's report: raising another interrupt would stop the loop again while the caller
@@ -341,27 +344,26 @@ outcome.
   operation nothing ends (a stream left open when `asyncio.run` shuts down, or dropped while the loop runs
   on) reports every escape still undelivered to its loop's exception handler, once each, as its latch is
   collected (`OperationLatch.__del__`), the way asyncio reports a task's exception nobody retrieved,
-  interrupts included, never raising; a closed loop reports it still, through its handler. An escape delivered to a read or a close never
-  reaches the loop. The latch's state is explicit
-  (`LatchState`): `ARMED` while the operation runs, when the first interrupt wakes the owner; `ENDING`
-  once cleanup starts, when an interrupt is latched for the end and wakes nothing (an inline kernel's
-  cleanup runs in the very read a wake would cancel); `CLOSED` once the end is out. The wake
-  (`OperationRunner._interrupted`) decides delivery at once. A read in flight is cancelled and raises
-  the interrupt (a read whose own task latched it and still returned an item raises it instead of the
-  item). With no read in flight, between reads, the wake closes the latch and hands the interrupt, and any
-  escape undelivered yet, to the event loop then and there (`OperationLatch.close_to_loop`): nothing later has to run for it to leave. The loop raises it once the callbacks already due
-  in that loop turn have run: a reader those wake (one waiting on what the interrupted work did, say)
-  resumes first, and a read or close it makes then finds the operation ended and runs its end; every other
-  reader resumes after the raise. The operation's
-  end (cleanup and publication) is decoupled from that delivery: the phase turns `INTERRUPTED` (ended,
-  its end not begun) and whoever comes first runs the end (`OperationRunner._end_between_reads`): a
-  read or close, or the task the wake starts once the interrupt is handed on, which a read or close
-  never waits for. The end raises no interrupt, whoever runs it; it attaches the report to the
-  interrupt (`.report`). A read or close that finds an end some other caller runs (`CLOSING`, claimed;
-  `CLEANING`, its cleanup begun) waits for the phase to turn `CLOSED` (`_published`): such an end has begun
-  in a caller that runs it to its publication, and a read in flight that a concurrent close ended waits
-  the same way. Only a cleanup that began settles the end: one cancelled before its first step (as a
-  loop's shutdown cancels every task it finds) closed nothing, so the claimant starts it again
+  interrupts included, never raising; a closed loop reports it still, through its handler. An escape delivered
+  to a read or a close never reaches the loop. The latch's state is explicit (`LatchState`): `ARMED` while the
+  operation runs, when the first interrupt wakes the owner; `ENDING` once cleanup starts, when an interrupt is
+  latched for the end and wakes nothing (an inline kernel's cleanup runs in the very read a wake would
+  cancel); `CLOSED` once the end is out. The wake (`OperationRunner._interrupted`) decides delivery at once. A
+  read in flight is cancelled and raises the interrupt (a read whose own task latched it and still returned an
+  item raises it instead of the item). With no read in flight, between reads, the wake closes the latch and
+  hands the interrupt, and any escape undelivered yet, to the event loop then and there
+  (`OperationLatch.close_to_loop`): nothing later has to run for it to leave. The loop raises it once the
+  callbacks already due in that loop turn have run: a reader those wake (one waiting on what the interrupted
+  work did, say) resumes first, and a read or close it makes then finds the operation ended and runs its end;
+  every other reader resumes after the raise. The operation's end (cleanup and publication) is decoupled from
+  that delivery: the phase turns `INTERRUPTED` (ended, its end not begun) and whoever comes first runs the end
+  (`OperationRunner._end_between_reads`): a read or close, or the task the wake starts once the interrupt is
+  handed on, which a read or close never waits for. The end raises no interrupt, whoever runs it; it attaches
+  the report to the interrupt (`.report`). A read or close that finds an end some other caller runs
+  (`CLOSING`, claimed; `CLEANING`, its cleanup begun) waits for the phase to turn `CLOSED` (`_published`):
+  such an end has begun in a caller that runs it to its publication, and a read in flight that a concurrent
+  close ended waits the same way. Only a cleanup that began settles the end: one cancelled before its first
+  step (as a loop's shutdown cancels every task it finds) closed nothing, so the claimant starts it again
   (`OperationRunner._end`), and the cancellation is the claimant's, raised, never recorded. The operation's
   own work cannot close it from the wake on (`inside_own_work`): that close would run or wait for an
   end that waits for the work. Once ended, a read raises `StopAsyncIteration` and a close returns.
@@ -372,13 +374,13 @@ outcome.
   cancellation has already landed, so the close closes the source and the report is the interrupt's
   alone. A read that resumed ahead of the raise and claimed the end has its cleanup cancelled by the
   shutdown before it begins, and starts it again, past the shutdown's cancellations: the source is closed
-  once, and the report is the interrupt's alone as well. An end that a cancellation meets while its cleanup runs (a read or close running it is
-  cancelled, or the shutdown cancels a task running it) still publishes, the cancellation recorded as
-  cleanup's ("stream cleanup also failed (CancelledError)"). There is no report, and the source is not
-  closed, when no end ever begins: the stream is never read or closed again and the loop stops before
-  the end's task runs (a stream nobody closes, or an interrupt the loop raises out of `asyncio.run`'s
-  own shutdown, which then stops), or an end that has begun never runs again (its loop stopped while
-  it waited and is never run again). The interrupt leaves `asyncio.run` in every case.
+  once, and the report is the interrupt's alone as well. An end that a cancellation meets while its cleanup
+  runs (a read or close running it is cancelled, or the shutdown cancels a task running it) still publishes,
+  the cancellation recorded as cleanup's ("stream cleanup also failed (CancelledError)"). There is no report,
+  and the source is not closed, when no end ever begins: the stream is never read or closed again and the loop
+  stops before the end's task runs (a stream nobody closes, or an interrupt the loop raises out of
+  `asyncio.run`'s own shutdown, which then stops), or an end that has begun never runs again (its loop stopped
+  while it waited and is never run again). The interrupt leaves `asyncio.run` in every case.
   `OperationRunner._raise_latched` is the one raise point of an interrupt a read or close sees: after
   the report is published it closes the latch and raises its interrupt, with the report attached,
   whatever ended the stream, from every caller that sees the end (the read or close that ended it, a
@@ -386,11 +388,11 @@ outcome.
   again, since no read or close ends that operation.
   The reader's own cancellation that its read absorbed before cleanup began (handed to
   the read, which ended in its own failure, an interrupt say) is raised as the end, but never recorded
-  as a failed close: only a cancellation that arrived while cleanup ran is. The report has one shape for it, applied by
-  the runner to whichever report it publishes, the family's or the fallback after a failed finalization
-  (`LifecycleHooks.interrupted`, `with_interrupt`: failed, `INTERRUPTED_REASON`, the earlier violations
-  kept, one `interrupted` violation last). `close_owned_resources` raises the client's close's first
-  interrupt the same way with a latch of its own. A closed latch keeps nothing: an interrupt caught
+  as a failed close: only a cancellation that arrived while cleanup ran is. The report has one shape for it,
+  applied by the runner to whichever report it publishes, the family's or the fallback after a failed
+  finalization (`LifecycleHooks.interrupted`, `with_interrupt`: failed, `INTERRUPTED_REASON`, the earlier
+  violations kept, one `interrupted` violation last). `close_owned_resources` raises the client's close's
+  first interrupt the same way with a latch of its own. A closed latch keeps nothing: an interrupt caught
   after the operation ended (a task outlasting the cleanup window raises it, say) is handed to the event
   loop, once, which raises it out of `asyncio.run` as it does any task's if the operation's end raised no
   interrupt, and otherwise reports it to its exception handler: an operation raises one interrupt at most. The
@@ -400,12 +402,12 @@ outcome.
   exception raised inside `async with stream`, which the failed close does not replace, carries one
   note: the report's `cleanup_failure` violation, word for word (`__aexit__` reads it from the published
   report). A close while a read is in flight is an early close: the read it ends raises the close's
-  failure (an interrupt included), after the close has run (only an inline kernel consults the closed read's marker; an isolated runner's own close is its CLOSING phase). A
-  stream its reader's cancellation ended gives `CANCELLED_REASON`, whatever its source reached. The
-  report counts an item as emitted only once `LifecycleHooks.delivered` says the
-  reader has it. Every task the library starts around caller code (a source's pull and close, the
-  worker-thread hop, the reference scheduler's producer and binding tasks, a wave's or a counted tail's
-  page fetch, a stream's read and cleanup, the client's close) runs through
+  failure (an interrupt included), after the close has run (only an inline kernel consults the closed read's
+  marker; an isolated runner's own close is its CLOSING phase). A stream its reader's cancellation ended gives
+  `CANCELLED_REASON`, whatever its source reached. The report counts an item as emitted only once
+  `LifecycleHooks.delivered` says the reader has it. Every task the library starts around caller code (a
+  source's pull and close, the worker-thread hop, the reference scheduler's producer and binding tasks, a
+  wave's or a counted tail's page fetch, a stream's read and cleanup, the client's close) runs through
   `spawn_settled`: it returns how it ended (`Settled`) and its owner raises the failure. The batch
   dispatcher's senders, which send many pages' commands at once, hand any failure, an interrupt's too,
   to those pages' futures instead, so the fetch that awaits one raises it. So no task ends in a
@@ -468,16 +470,15 @@ wakes the waiting pages that fit in the order they came. Under both, a page is w
 beyond those promised to the pages already woken and not yet resumed, so a release wakes the pages its
 rows serve, not every waiting page. Promised rows are the woken page's own: no page or lease asking
 later takes them, and a woken page that no longer fits when it resumes (the frontier's reserve grew)
-waits again and wakes the waiting pages its promise serves. A counted binding reads its head and its known tail offsets as ordinary pages of
-that pool and commits them in offset order. A fast or automatic keyset binding instead holds one row
-lease from activation to its
-terminal event. Its runtime plans and fits every wave against a view of the operation policy that
-differs only in `max_buffered_rows`, equal to the lease; requests, pages, attempts, elapsed time and
-response bytes are charged to the single operation context, and each buffered-row change is applied
-once to the shared counter. Its waves and its sequential finish pages are commands of the shared
-dispatcher, and under `READY` delivery a binding awaiting the consumer's acknowledgement that has
-not reached its terminal, and so will hand over another row group or send its next command, is a
-pending continuation the dispatcher waits for, as an ordinary binding's page is. A command whose
+waits again and wakes the waiting pages its promise serves. A counted binding reads its head and its known
+tail offsets as ordinary pages of that pool and commits them in offset order. A fast or automatic keyset
+binding instead holds one row lease from activation to its terminal event. Its runtime plans and fits every
+wave against a view of the operation policy that differs only in `max_buffered_rows`, equal to the lease;
+requests, pages, attempts, elapsed time and response bytes are charged to the single operation context, and
+each buffered-row change is applied once to the shared counter. Its waves and its sequential finish pages are
+commands of the shared dispatcher, and under `READY` delivery a binding awaiting the consumer's
+acknowledgement that has not reached its terminal, and so will hand over another row group or send its next
+command, is a pending continuation the dispatcher waits for, as an ordinary binding's page is. A command whose
 batch was lost in transit leaves its binding unknown, as a direct page does. The lease never grows:
 a binding is granted at least its planning floor and at most the larger of that floor and an equal
 share of the pool among active fast bindings, rows kept for ordinary pages excepted. Once the plan
@@ -502,17 +503,18 @@ payload conventions, public low-level execution plans or mutable global registri
 
 ## Wire, traversal, and evidence boundaries
 
-`Request` owns an explicit route, immutable body encoding, scoped headers, replay safety, and an optional declarative
-embedded-result error contract. Legacy transports continue to support ordinary JSON requests;
+`Request` owns an explicit route, immutable body encoding, scoped headers, replay safety, and an optional
+declarative embedded-result error contract. Legacy transports continue to support ordinary JSON requests;
 advanced request representations require an advertised `WireTransport` capability and fail before
 I/O otherwise. No ordinary wire value can name an absolute destination. Native REST 3.0 batch commands travel as
 an internal JSON-array envelope that the transport must advertise; one physical-attempt classifier
 decides, before any retry, whether an envelope failure proves non-execution, attributes per-command
 results, or leaves the envelope unresolved for bounded `SAFE` isolation. Isolation, a planned replay of
-the envelope's group, sends each `SAFE` command alone, one at a time, and returns its success; a failure stays unknown, because the envelope may have run the
-command, and is explained by that envelope like any other earlier send that may have run. When the
-budget leaves no isolated send, the command ends unknown with that refusal, caused by the envelope's
-failure.
+the envelope's group, sends each `SAFE` command alone, one at a time, and returns its success; a failure stays
+unknown, because the envelope may have run the command, and is explained by the latest send that may have run
+it: its own isolated send when that one may have run too (a 2xx answer the client cannot decode, or a status
+the ambiguity policy holds ambiguous, such as 502), otherwise the envelope. When the budget leaves no isolated
+send, the command ends unknown with that refusal, caused by the envelope's failure.
 
 Traversal contracts separately declare progression (`server next`, observed width, or fixed step),
 completion (empty confirmation or caller-qualified exact total), collection shape, and identity.

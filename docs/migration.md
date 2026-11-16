@@ -340,6 +340,19 @@
   with `RuntimeError: cannot enter context ... is already entered`. The close now waits for the pull,
   then runs in the source's one `contextvars.Context`, as documented.
 
+## Keyset boundary pages are checked at both ends
+
+- **Breaking: a descending boundary page below the ascending one fails the traversal at the boundary.** A
+  fast or automatic keyset reads the first page of its selection in each direction first: the ascending
+  page starts at the least identity, the descending page at the greatest. The two pages were checked
+  against each other only at the top: a descending page whose greatest identity was below the ascending
+  page's greatest failed. A descending page holding an identity below the ascending page's least passed,
+  so a portal whose two views of the selection disagreed (one view missing rows the other has) could
+  complete an ascending traversal without those rows, or fail a descending one only at its last page,
+  after delivering them. Such boundary pages now fail the traversal before any row is delivered or any
+  further page is sent: `IncompleteTraversalError` with the blocking `direction_contradiction` violation
+  ("descending boundary passes head"), or, in a reference traversal, that binding's failure.
+
 ## Auto keyset partitioning under a small row buffer
 
 - **Auto sizes partition lanes to the row buffer.** `AutoKeysetExecution` probed `target_lanes`
@@ -364,7 +377,7 @@
   boundary pages, so `max_pages` of 681 or more; with less, Auto probes `target_lanes` anchors and
   plans as before. The assumed extra cost is often generous: dense lanes close on their last row
   without a confirmation page, so above the 96 anchors cost 156 more pages, not 228, and a
-  `max_pages` from 580 to 680 gets the 20-lane plan's 227 requests although the finer lanes would
+  `max_pages` from 580 to 680 gets the 20-probe plan's 227 requests although the finer lanes would
   have finished in 62.
 - **The gain is bounded.** At most two waves of probes are sent, so the larger the selection, the
   less of the buffer problem finer lanes solve: 50,000 and 100,000 dense rows (page 50, 2,500
@@ -404,7 +417,7 @@
 - **Small sparse-edged selections may traverse sequentially.** Counting every lane's end pages makes
   the partition estimate higher, so where sparse boundary pages also make the sequential estimate
   too low, Auto now traverses sequentially: 2,000 rows with sparse edges, page 50 and
-  `EMPTY_CONFIRMATION` take 41 requests where they took 14 to 23 with 20 lanes.
+  `EMPTY_CONFIRMATION` take 41 requests where they took 14 to 23 with 20 probes.
 - **Under a tight budget, Auto can fail where the previous release fitted.** Auto chooses its plan,
   the number of lanes and the switch after the probes from estimates extrapolated from the density
   of the boundary pages. None of these choices is guaranteed to fit what is left of a `max_pages` or
@@ -418,13 +431,14 @@
 
   Such a run ends on the exhausted budget as any traversal does (`iter_list_keyset()` raises
   `IncompleteTraversalError`); rows already yielded are a correct prefix and the buffer and budget
-  bounds hold. Over 44,682 tight-budget points this happened at 631, while 4,065 points that failed
-  before now finish, and no point of the measured grid fails at the default budgets. The default
-  `max_pages` and `max_requests` are budgets like any other, though: a selection whose need comes close
-  to them can fail the same way (495,000 rows at page 50 with a sparse first and last 200 identities
-  take 9,927 pages in the previous release's 20 lanes and run out of the 10,000 in finer lanes). To get
-  a predictable page and request need under a tight budget, pass an explicit strategy:
-  `SequentialKeysetExecution()` or `RangeKeysetExecution`.
+  bounds hold. Over 44,682 tight-budget points of the measured grid (2,000, 8,000 and 20,000 rows
+  over eight identity distributions, pages of 10 and 50 rows, row buffers of 600 to 10,000 rows) this
+  happened at 631, while 4,065 points that failed before now finish, and no point of the grid fails at
+  the default budgets. The default `max_pages` and `max_requests` are budgets like any other, though:
+  a selection whose need comes close to them can fail the same way (495,000 rows at page 50 with a
+  sparse first and last 200 identities take 9,927 pages with the previous release's 20 probes and run
+  out of the 10,000 in finer lanes). To get a predictable page and request need under a tight budget,
+  pass an explicit strategy: `SequentialKeysetExecution()` or `RangeKeysetExecution`.
 
 ## `INPUT` delivery reads reference pages ahead
 
@@ -522,9 +536,10 @@ a binding waits for rows, have changed.
   since more results share the budget, and a result longer than that now ends with
   `ResultTooLargeError`. In exchange the batches are really in flight together. A batch dispatch wider
   than the budget's page count keeps a full page per command, so ordinary 50-row pages still fit, and
-  has at most as many commands in flight as the budget has pages. A client limit below the dispatch's `concurrency` now counts too and
-  gives each command more: under `max_concurrent_requests=2` the default `DirectDispatch` share is 1,250
-  rows (was 250). To keep a longer result, raise `max_buffered_rows` or lower `concurrency`.
+  has at most as many commands in flight as the budget has pages. A client limit below the dispatch's
+  `concurrency` now counts too and gives each command more: under `max_concurrent_requests=2` the
+  default `DirectDispatch` share is 1,250 rows (was 250). To keep a longer result, raise
+  `max_buffered_rows` or lower `concurrency`.
 - **Waiting for row capacity ends with `max_elapsed`.** A page of a reference binding or a `fan_out()`
   command waiting for row capacity still held by results the consumer had not taken waited until the
   consumer read on, however long after `max_elapsed`, and its send was then refused at its admission.
@@ -630,7 +645,11 @@ send meets a method pause, have changed.
   dispatch: a `DirectDispatch` sends at most the smallest of its `concurrency`,
   `max_direct_concurrency`, `max_active_references` and the client limit at once; a `BatchDispatch`
   keeps at most the smallest of its `concurrency`, `max_active_references` and the client limit of
-  physical batches in flight, and `max_direct_concurrency` does not limit it. The isolation of a REST
+  physical batches in flight, and `max_direct_concurrency` does not limit it. A reference traversal
+  over a `BatchDispatch` (`iter_references()`, `iter_cursors()`, `iter_reference_sources()` and their
+  outcome forms) now plans its waves for that smallest limit too, so under a client limit below the
+  dispatch's `concurrency` it reads the same rows, but its waves can group commands into different
+  physical batches and take a different number of requests than before. The isolation of a REST
   3.0 envelope of `SAFE` commands that may have run sends its unresolved commands one at a time, within
   the batch it isolates (see "The retry path"). In `fan_out()` and `fan_out_outcomes()`, a `BatchDispatch`
   keeps as many batches in flight as these limits allow, whatever its `batch_size`: see "A fan-out's
@@ -749,12 +768,12 @@ with `BudgetExceededError` as its terminal reason and a `budget_exhausted` viola
 a plain `BudgetExceededError`, except that a fail-fast stream whose stop failed a command or a binding
 raises its wrapper (`BatchFailed` or `ReferenceFailed`, whose report carries that reason); a stop at a
 source pull or the end-of-source check fails none, except that commands a batch window already read are
-sent and refused, so `batch()` raises `BatchFailed`. So it depends on where the budget stopped the
-stream, not on the operation: handle both, or read the report. The cleanup no longer stops a stream
-with the budget: it gets a grace past `max_elapsed`, and a close that overruns it raises
-`CleanupOverrunError` (see "The end of `max_elapsed` is not a cleanup failure"). A send cut in flight
-is another case: its command may have run, so it is unknown (`AmbiguousExecutionError`), and a fail-fast stream may end on that ambiguity
-instead.
+sent and refused, so `batch()` raises `BatchFailed`. So for a fail-fast stream it depends on where the
+budget stopped the stream, not on the operation (a tolerant stream raises the plain error): handle both,
+or read the report. The cleanup no longer stops a stream with the budget: it gets a grace past
+`max_elapsed`, and a close that overruns it raises `CleanupOverrunError` (see "The end of `max_elapsed`
+is not a cleanup failure"). A send cut in flight is another case: its command may have run, so it is
+unknown (`AmbiguousExecutionError`), and a fail-fast stream may end on that ambiguity instead.
 
 ## Compressed bodies are decoded whole
 
@@ -833,7 +852,7 @@ instead.
   - `Settings.webhook_url` stores the canonical base the transport sends: the scheme and host lower
     case, the host IDNA-encoded and an IPv6 address in pydantic's hexadecimal form (`::ffff:1.2.3.4`
     is `::ffff:102:304`), the default port (under any scheme case: `HTTPS://portal:443/...`) and an
-    empty user name or password dropped, `.` and `..` segments resolved, and the trailing slash added.
+    an empty userinfo dropped, `.` and `..` segments resolved, and the trailing slash added.
     The canonical base parses back to itself.
   - `HttpxTransport.host` and `Bitrix24.host` are the host the rule yields: `xn--fa-hia.de`, where the
     transport reported the decoded `faß.de` and so failed `Bitrix24`'s injected-host check, and an
@@ -1028,6 +1047,11 @@ now unknown with reason `CONNECTION_LOST_AFTER_DISPATCH` and a cause chain that 
   settled as unknown, so the binding closed `UNKNOWN`. Each now settles from what its command did: one answered with a success as a success,
   rejected as aborted; one never sent as not executed; only one that may have run as unknown. The
   binding closes `FAILURE` unless one of its pages may have run.
+- **A keyset page read but never consumed is rejected as aborted.** In the completion evidence of
+  `iter_list_keyset()` or of a keyset reference binding, a page the traversal read and committed but whose
+  rows never reached the caller (the caller stopped, or the traversal failed past it) is `PageRejected` with
+  `transaction_aborted`, as a counted page is. Before, its reason was the traversal's end state
+  (`cancelled`, `failed`, ...). Its trace still records it committed: the trace says what the traversal read.
 - **An abandoned batch page is not sent.** A reference page fetched with `BatchDispatch` whose fetch was
   cancelled, or whose admission deadline passed, while its wave was being assembled was still sent with
   that wave and its answer discarded. Its wave now leaves without it, and a wave left with no page is
