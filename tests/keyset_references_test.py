@@ -421,7 +421,7 @@ async def test_a_binding_cancelled_while_its_wave_is_on_the_wire_settles_each_pa
         return serve(method, query)
 
     portal = BatchPortal(answer)
-    async with client_for(portal) as client:
+    async with client_for(portal, policy=ExecutionPolicy(page_trace_limit=1024)) as client:
         stream = client.iter_reference_outcomes(_base(), [_parent("p0")], traversal=_traversal(_range()))
         pull = asyncio.create_task(_drain(stream))
         await asyncio.wait_for(started.wait(), 5)
@@ -434,6 +434,10 @@ async def test_a_binding_cancelled_while_its_wave_is_on_the_wire_settles_each_pa
     settled = [event.outcome for event in events if isinstance(event, PageCommandOutcome)][settled_before:]
     assert unsettled == portal.waves[-1]
     assert settled == [CommandSettlement.UNKNOWN] * unsettled
+    # A cancellation is no failure of the wave's pages: none is traced as one.
+    report = stream.report
+    assert report is not None
+    assert _failed_pages(report) == []
 
 
 @pytest.mark.asyncio
@@ -536,8 +540,10 @@ async def test_a_wave_whose_replay_fails_settles_each_page_from_its_own_command(
             return WireResponse(200, answer.headers, json.dumps(body).encode())
         return answer
 
-    async with client_for(ResponderTransport(respond, host=portal.host)) as client:
-        outcomes, _report = await _drain(
+    async with client_for(
+        ResponderTransport(respond, host=portal.host), policy=ExecutionPolicy(page_trace_limit=1024)
+    ) as client:
+        outcomes, report = await _drain(
             client.iter_reference_outcomes(_base(), [_parent("p0")], traversal=_traversal(_range()))
         )
 
@@ -548,6 +554,15 @@ async def test_a_wave_whose_replay_fails_settles_each_page_from_its_own_command(
         *[CommandSettlement.SUCCESS] * (len(wave) - 1),
     ]
     assert isinstance(outcomes[-1], outcome)
+    # Each page is traced the way it settled, at its command's index in the batch: the answered ones are rejected
+    # with the wave that failed around them.
+    assert _failed_pages(report) == [
+        (0, "body", PageDispatch.BATCH, 0, *_UNKNOWN_PAGE),
+        *[
+            (0, "body", PageDispatch.BATCH, index, PageOutcome.REJECTED, PageRejectionCode.TRANSACTION_ABORTED)
+            for index in range(1, len(wave))
+        ],
+    ]
 
 
 @pytest.mark.asyncio
@@ -1791,3 +1806,36 @@ async def test_a_flat_keyset_request_that_fails_as_a_whole_traces_its_pages_the_
     report = stream.report
     assert report is not None
     assert _failed_pages(report) == failed
+
+
+@pytest.mark.asyncio
+async def test_a_flat_keyset_wave_its_cancellation_interrupts_traces_no_failed_page() -> None:
+    # A cancellation is no failure of the wave's pages: they settle from what their commands did, and the
+    # operation ends with no failed page to trace.
+    started = asyncio.Event()
+    serve = _flat_answer((1,))
+
+    async def answer(method: str, query: Query) -> Envelope:
+        started.set()
+        await asyncio.Future[None]()
+        return serve(method, query)
+
+    portal = BatchPortal(answer)
+    async with client_for(portal, policy=ExecutionPolicy(page_trace_limit=1024)) as client:
+        stream = client.iter_list_keyset(
+            _base(),
+            selector=ResultSelector.root(),
+            identity=_identity(),
+            page_size=PAGE,
+            keyset=_keyset(),
+            execution=AutoKeysetExecution(_CONTRACT),
+        )
+        pull = asyncio.create_task(_drain(stream))
+        await asyncio.wait_for(started.wait(), HANG_BOUND)
+        pull.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pull
+
+    report = stream.report
+    assert report is not None
+    assert _failed_pages(report) == []

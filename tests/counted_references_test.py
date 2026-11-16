@@ -1328,13 +1328,20 @@ async def test_flat_counted_tail_pages_cancelled_while_their_batch_fills_settle_
     assert _flat_settlement(events) == (settled, [], BindingClosure.FAILURE)
 
 
+# The physical request that carries the second tail batch of a flat counted traversal: after the head and the first.
+_SECOND_FLAT_TAIL = 3
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["undecodable", "refuse_second"])
 async def test_a_flat_counted_tail_batch_that_fails_as_a_whole_traces_the_page_it_stops_at(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
-    # The second tail batch's answer cannot be decoded: the batch fails as a whole, with no outcome per page. The
-    # traversal stops at its first page, which is traced the way it settles (it may have run), with its index in
-    # its batch, as a reference tail page failing with its chunk is; each page of the batch may have run.
+    # The second tail batch fails as a whole, with no outcome per page: its answer cannot be decoded, or its second
+    # command is refused (QUERY_LIMIT_EXCEEDED) and the answer of that command's replay cannot be decoded. The
+    # traversal stops at the batch's first page, which is traced the way it settles, with its index in its batch,
+    # as a reference tail page failing with its chunk is: it may have run, or its own command succeeded and it is
+    # rejected with the batch (``transaction_aborted``).
     events = _observed(monkeypatch)
     portal = BatchPortal(_dense(301))
     undecodable = WireResponse(200, (("content-type", "application/json"),), b"[" * _NESTED + b"]" * _NESTED)
@@ -1342,9 +1349,22 @@ async def test_a_flat_counted_tail_batch_that_fails_as_a_whole_traces_the_page_i
 
     async def respond(request: Request) -> WireResponse:
         sends[0] += 1
-        if sends[0] == 3:  # noqa: PLR2004 - the second tail batch
+        if sends[0] == (_SECOND_FLAT_TAIL if mode == "undecodable" else _SECOND_FLAT_TAIL + 1):
             return undecodable
-        return await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 22)
+        answer = await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 22)
+        if sends[0] != _SECOND_FLAT_TAIL:
+            return answer
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        second = list(commands)[1]
+        body = json.loads(answer.body)
+        result = body["result"]
+        del result["result"][second]
+        for key in ("result_total", "result_next"):
+            if isinstance(result.get(key), dict):
+                result[key].pop(second, None)
+        result["result_error"] = {second: {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "slow"}}
+        return WireResponse(200, answer.headers, json.dumps(body).encode())
 
     async with client_for(ResponderTransport(respond, host=portal.host)) as client:
         stream = client.iter_list_counted(
@@ -1360,12 +1380,19 @@ async def test_a_flat_counted_tail_batch_that_fails_as_a_whole_traces_the_page_i
             await drain()
 
     assert isinstance(raised.value.__cause__, RecursionError)
-    assert _failed_trace(_report(stream)) == [
-        (None, 4 * WIDTH, PageDispatch.BATCH, 0, PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION)
-    ]
-    settled, aborted, closure = _flat_settlement(events)
-    assert settled == dict.fromkeys(range(4), CommandSettlement.SUCCESS) | dict.fromkeys(
-        range(4, 7), CommandSettlement.UNKNOWN
+    first = (
+        (PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION)
+        if mode == "undecodable"
+        else (PageOutcome.REJECTED, PageRejectionCode.TRANSACTION_ABORTED)
     )
-    assert aborted == []
+    assert _failed_trace(_report(stream)) == [(None, 4 * WIDTH, PageDispatch.BATCH, 0, *first)]
+    settled, aborted, closure = _flat_settlement(events)
+    batch = (
+        [CommandSettlement.UNKNOWN] * 3
+        if mode == "undecodable"
+        else [CommandSettlement.SUCCESS, CommandSettlement.UNKNOWN, CommandSettlement.SUCCESS]
+    )
+    assert settled == dict.fromkeys(range(4), CommandSettlement.SUCCESS) | dict(zip(range(4, 7), batch, strict=True))
+    # A page past the stop whose command succeeded is rejected as aborted, as the stop leaves it.
+    assert aborted == ([] if mode == "undecodable" else [6])
     assert closure is BindingClosure.UNKNOWN
