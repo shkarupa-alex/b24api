@@ -1,8 +1,15 @@
 name: Publish to PyPI
 
 # Every pushed tag runs this workflow, but only a canonical stable release tag MAJOR.MINOR.PATCH
-# (for example 2.2.1, with no prefix or suffix) may build and publish. setuptools-git-versioning
-# derives the package version from that tag; the build job verifies the distributions against it.
+# (for example 2.2.1, with no prefix or suffix) on a commit of master may build and publish. The tag
+# is checked first, then the full blocking CI runs on the tagged commit, then the distributions are
+# built by the locked build backend and checked against the tag. setuptools-git-versioning derives
+# the package version from that tag.
+#
+# A tag runs the workflow file of the commit it names, so a tag on a commit older than these checks
+# runs a workflow without them. The repository settings close that gap: the `pypi` environment
+# allows deployments only from tags matching MAJOR.MINOR.PATCH and requires a reviewer, and a tag
+# ruleset limits who may create such tags.
 
 on:
   push:
@@ -13,8 +20,28 @@ permissions:
   contents: read
 
 jobs:
+  release-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The whole history, so the gate can tell whether the tagged commit is on master.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Validate release tag
+        # GITHUB_REF_NAME is read from the environment, never interpolated into the script.
+        run: |
+          git fetch --no-tags origin +refs/heads/master:refs/remotes/origin/master
+          python .github/scripts/verify_release.py tag
+
   ci:
-    # The full blocking CI (ci.yml, aggregate check `ci`) must pass on the tagged SHA first.
+    # The full blocking CI (ci.yml, aggregate check `ci`) must pass on the tagged SHA.
+    needs:
+      - release-tag
     uses: ./.github/workflows/ci.yml
 
   release-build:
@@ -25,23 +52,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v7
+      - uses: astral-sh/setup-uv@v7
         with:
+          version: "0.9.11"
           python-version: "3.12"
 
-      - name: Validate release tag
-        # GITHUB_REF_NAME is read from the environment, never interpolated into the script.
-        run: python .github/scripts/verify_release.py tag
-
       - name: Build release distributions
+        # Without build isolation the backend comes from the locked `build` group, not the newest release.
         run: |
-          python -m pip install build twine
-          python -m build
+          uv sync --locked --only-group build --no-install-project
+          uv build --no-build-isolation --no-create-gitignore --out-dir dist
 
       - name: Verify release distributions
-        run: |
-          python .github/scripts/verify_release.py dists dist
-          python -m twine check --strict dist/*
+        run: uv run --no-project python .github/scripts/verify_release.py dists dist
 
       - name: Upload distributions
         uses: actions/upload-artifact@v7

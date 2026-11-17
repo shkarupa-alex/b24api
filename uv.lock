@@ -49,6 +49,11 @@ dependencies = [
 ]
 
 [package.dev-dependencies]
+build = [
+    { name = "setuptools" },
+    { name = "setuptools-git-versioning" },
+    { name = "wheel" },
+]
 dev = [
     { name = "cryptography" },
     { name = "hypothesis" },
@@ -77,6 +82,11 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
+build = [
+    { name = "setuptools", specifier = ">=80.9.0" },
+    { name = "setuptools-git-versioning", specifier = ">=2.1.0" },
+    { name = "wheel", specifier = ">=0.45.1" },
+]
 dev = [
     { name = "cryptography", specifier = ">=50.0.1" },
     { name = "hypothesis", specifier = ">=6.168.1" },

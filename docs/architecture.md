@@ -497,8 +497,8 @@ release rows fails finitely, and every lease wait is bounded by the operation's 
 
 ## Package boundaries
 
-Architecture tests enforce one-way imports, absence of removed compatibility modules and module-size
-ceilings. The wheel contains only the runtime library and its console entry point; evidence tooling,
+Architecture tests enforce one-way imports and the absence of removed compatibility modules. Module
+size is recorded for review, not capped; a ratchet lets a function over 100 lines only shrink. The wheel contains only the runtime library and its console entry point; evidence tooling,
 tests and credentials are excluded.
 
 The client deliberately has no automatic endpoint profiles, shape-changing Python flags, tuple

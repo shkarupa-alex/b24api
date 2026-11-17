@@ -134,9 +134,7 @@ def test_attribute_access_to_a_moved_name_names_its_new_path_for_every_package_k
         with pytest.raises(AttributeError) as raised:
             getattr(b24api, name)
 
-    assert str(raised.value) == (
-        f"module 'b24api' has no attribute '{name}'; it moved to {ROOT_MOVES[name]}.{name} in 3.0"
-    )
+    assert str(raised.value) == (f"module 'b24api' has no attribute '{name}'; it moved to {ROOT_MOVES[name]}.{name}")
     assert not hasattr(b24api, name)
 
 
@@ -208,7 +206,7 @@ def test_scanner_reports_root_imports_and_attributes_of_moved_names(tmp_path: Pa
 
 def test_scanner_reports_a_wildcard_root_import(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     # A wildcard import follows __all__, which no longer lists the moved names, so CommandSuccess below raises
-    # NameError in 3.0; the scanner cannot tell which names the module uses and asks for explicit imports.
+    # NameError since 2.4; the scanner cannot tell which names the module uses and asks for explicit imports.
     path = tmp_path / "consumer.py"
     path.write_text("from b24api import *\nCommandSuccess\n", encoding="utf-8")
 

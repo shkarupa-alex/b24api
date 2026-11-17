@@ -53,6 +53,37 @@ def test_every_local_documentation_link_resolves() -> None:
             assert target.exists(), f"{path.relative_to(ROOT)} links to missing {target}"
 
 
+_FENCE = re.compile(r"^```.*?^```", re.DOTALL | re.MULTILINE)
+_HEADING = re.compile(r"^#{1,6} +(?P<title>.+?) *$", re.MULTILINE)
+
+
+def _anchors(path: Path) -> set[str]:
+    """Return the anchors GitHub derives from a document's headings, numbering repeats as it does."""
+    anchors: set[str] = set()
+    repeats: dict[str, int] = {}
+    for match in _HEADING.finditer(_FENCE.sub("", path.read_text(encoding="utf-8"))):
+        slug = re.sub(r"[^\w\- ]", "", match["title"].lower()).replace(" ", "-")
+        repeat = repeats.get(slug, 0)
+        repeats[slug] = repeat + 1
+        anchors.add(f"{slug}-{repeat}" if repeat else slug)
+    return anchors
+
+
+def test_every_documentation_anchor_names_a_heading() -> None:
+    # A renamed heading, such as one naming the release that made a change, must take its links along.
+    for path in (README, *sorted(DOCS.glob("*.md"))):
+        for match in _MARKDOWN_LINK.finditer(path.read_text(encoding="utf-8")):
+            target, _, anchor = match["target"].partition("#")
+            if target.startswith(_REPOSITORY_URLS[0]):
+                document = ROOT / target.removeprefix(_REPOSITORY_URLS[0])
+            elif "://" in target:
+                continue
+            else:
+                document = path.parent / target if target else path
+            if anchor:
+                assert anchor in _anchors(document), f"{path.relative_to(ROOT)} links to missing {match['target']}"
+
+
 def test_readme_links_are_absolute_so_they_work_on_pypi() -> None:
     relative = [
         match["target"]
@@ -121,13 +152,13 @@ def test_v3_envelope_grouping_reads_the_same_in_the_readme_and_the_migration_gui
 
 @pytest.mark.parametrize("name", ["h2", "hpack"])
 def test_migration_guide_states_the_hpack_stack_bounds(name: str) -> None:
-    # 3.0.0 made both direct requirements (C2); a consumer pinned outside them learns it before resolving.
+    # 2.4.0 made both direct requirements (C2); a consumer pinned outside them learns it before resolving.
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     line = next(dependency for dependency in project["project"]["dependencies"] if Requirement(dependency).name == name)
     assert f"`{line}`" in MIGRATION.read_text(encoding="utf-8")
 
 
-# Report fields and enum members 3.0.0 removed (B11, B12); only the migration guide, which describes their
+# Report fields and enum members 2.4.0 removed (B11, B12); only the migration guide, which describes their
 # removal, may still name them.
 _REMOVED_REPORT_VOCABULARY = (
     "canary_requests",

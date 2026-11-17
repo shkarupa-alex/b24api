@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -65,8 +66,40 @@ def _run(*arguments: str, tag: str, ref_type: str = "tag", cwd: Path = ROOT) -> 
     )
 
 
-def _metadata(name: str = "b24api", version: str = VERSION) -> bytes:
-    return f"Metadata-Version: 2.4\nName: {name}\nVersion: {version}\nSummary: Bitrix24 API\n".encode()
+def _metadata(
+    name: str = "b24api",
+    version: str = VERSION,
+    content_type: str = "text/markdown",
+    description: str = "# b24api\n",
+) -> bytes:
+    headers = f"Metadata-Version: 2.4\nName: {name}\nVersion: {version}\nSummary: Bitrix24 API\n"
+    if content_type:
+        headers += f"Description-Content-Type: {content_type}\n"
+    return f"{headers}\n{description}".encode()
+
+
+def _git(repository: Path, *arguments: str) -> str:
+    git = shutil.which("git")
+    assert git is not None
+    configuration = ("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false")
+    return subprocess.run(  # noqa: S603 - disposable local repository
+        [git, *configuration, *arguments],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+@pytest.fixture
+def repository(tmp_path: Path) -> Path:
+    """Return a repository whose HEAD is the tip of ``origin/master``, as the release-tag job fetches it."""
+    path = tmp_path / "repository"
+    path.mkdir()
+    _git(path, "init", "--quiet")
+    _git(path, "commit", "--quiet", "--allow-empty", "-m", "reviewed")
+    _git(path, "update-ref", "refs/remotes/origin/master", "HEAD")
+    return path
 
 
 def _write_wheel(
@@ -99,11 +132,43 @@ def _write_sdist(dist: Path, *, filename: str | None = None, metadata: bytes | N
 
 
 @pytest.mark.parametrize("tag", ["2.2.1", "0.0.0", "2.3.0", "10.20.30"])
-def test_canonical_stable_tags_pass_the_prebuild_gate(tag: str) -> None:
-    result = _run("tag", tag=tag)
+def test_canonical_stable_tags_on_master_pass_the_prebuild_gate(tag: str, repository: Path) -> None:
+    result = _run("tag", tag=tag, cwd=repository)
 
     assert result.returncode == 0, result.stdout
-    assert f"release tag {tag} is canonical" in result.stdout
+    assert result.stdout == f"release tag {tag} is canonical and on origin/master\n"
+
+
+def test_an_older_master_commit_passes_the_prebuild_gate(repository: Path) -> None:
+    released = _git(repository, "rev-parse", "HEAD")
+    _git(repository, "commit", "--quiet", "--allow-empty", "-m", "later")
+    _git(repository, "update-ref", "refs/remotes/origin/master", "HEAD")
+    _git(repository, "checkout", "--quiet", "--detach", released)
+
+    assert _run("tag", tag=VERSION, cwd=repository).returncode == 0
+
+
+def test_a_tag_on_a_commit_outside_master_is_refused_before_ci(repository: Path) -> None:
+    # A tag on a branch commit would publish code, and run checks, that master never reviewed.
+    _git(repository, "checkout", "--quiet", "-b", "feature")
+    _git(repository, "commit", "--quiet", "--allow-empty", "-m", "unreviewed")
+
+    result = _run("tag", tag=VERSION, cwd=repository)
+
+    assert result.returncode == 1
+    assert result.stdout == (
+        "::error title=Tag not on master::the tagged commit is not on origin/master; "
+        "tag a commit of master after it passes CI\n"
+    )
+
+
+def test_the_prebuild_gate_fails_closed_without_the_release_branch(repository: Path) -> None:
+    _git(repository, "update-ref", "-d", "refs/remotes/origin/master")
+
+    result = _run("tag", tag=VERSION, cwd=repository)
+
+    assert result.returncode == 1
+    assert result.stdout.startswith("::error title=Release branch unavailable::")
 
 
 @pytest.mark.parametrize(
@@ -200,6 +265,21 @@ def _wheel_metadata_name(dist: Path) -> None:
     _write_wheel(dist, metadata=_metadata(name="other"))
 
 
+def _wheel_description_not_markdown(dist: Path) -> None:
+    _write_sdist(dist)
+    _write_wheel(dist, metadata=_metadata(content_type="text/x-rst"))
+
+
+def _wheel_description_type_missing(dist: Path) -> None:
+    _write_sdist(dist)
+    _write_wheel(dist, metadata=_metadata(content_type=""))
+
+
+def _sdist_description_empty(dist: Path) -> None:
+    _write_sdist(dist, metadata=_metadata(description="\n"))
+    _write_wheel(dist)
+
+
 def _wheel_without_metadata(dist: Path) -> None:
     _write_sdist(dist)
     path = dist / f"b24api-{VERSION}-py3-none-any.whl"
@@ -234,6 +314,9 @@ def _wheel_with_document(dist: Path) -> None:
         (_wheel_metadata_version, "Version mismatch"),
         (_sdist_metadata_version, "Version mismatch"),
         (_wheel_metadata_name, "Invalid metadata"),
+        (_wheel_description_not_markdown, "Invalid metadata"),
+        (_wheel_description_type_missing, "Invalid metadata"),
+        (_sdist_description_empty, "Invalid metadata"),
         (_wheel_without_metadata, "Invalid metadata"),
         (_corrupt_sdist, "Invalid metadata"),
         (_untyped_wheel, "Missing typing marker"),
@@ -276,53 +359,98 @@ def test_gate_regex_matches_the_specified_release_rule() -> None:
     assert gate.release_version({"GITHUB_REF_NAME": VERSION}) == VERSION
 
 
-def _steps(job: str) -> list[str]:
-    text = WORKFLOW.read_text(encoding="utf-8")
-    body = text.split(f"  {job}:\n", 1)[1]
-    body = re.split(r"\n  [a-z][a-z-]*:\n", body, maxsplit=1)[0]
-    return re.split(r"\n      - ", body.split("    steps:\n", 1)[1])
+def _publish_jobs() -> dict[str, dict[str, Any]]:
+    jobs = _yaml(WORKFLOW)["jobs"]
+    assert isinstance(jobs, dict)
+    return jobs
 
 
-def test_workflow_validates_before_building_and_verifies_before_upload() -> None:
-    steps = _steps("release-build")
-    names = [next(line for line in step.splitlines() if line.strip()) for step in steps]
-    header = WORKFLOW.read_text(encoding="utf-8").split("  release-build:\n", 1)[1].split("    steps:\n", 1)[0]
+def _step_names(job: str) -> list[str]:
+    return [step.get("name", step.get("uses", "")) for step in _publish_jobs()[job]["steps"]]
 
-    assert "    needs:\n      - ci\n" in header
-    assert names == [
-        "      - uses: actions/checkout@v7",
-        "uses: actions/setup-python@v7",
-        "name: Validate release tag",
-        "name: Build release distributions",
-        "name: Verify release distributions",
-        "name: Upload distributions",
+
+def _step(job: str, name: str) -> dict[str, Any]:
+    return next(step for step in _publish_jobs()[job]["steps"] if step.get("name", step.get("uses")) == name)
+
+
+def test_publish_runs_tag_gate_then_full_ci_then_build_then_upload() -> None:
+    jobs = _publish_jobs()
+
+    assert list(jobs) == ["release-tag", "ci", "release-build", "pypi-publish"]
+    assert "needs" not in jobs["release-tag"]
+    assert jobs["ci"] == {"needs": ["release-tag"], "uses": "./.github/workflows/ci.yml"}
+    assert jobs["release-build"]["needs"] == ["ci"]
+    assert jobs["pypi-publish"]["needs"] == ["release-build"]
+
+
+def test_tag_gate_sees_the_whole_history_and_master_before_ci() -> None:
+    checkout = _step("release-tag", "actions/checkout@v7")
+    gate = _step("release-tag", "Validate release tag")["run"].splitlines()
+
+    assert _step_names("release-tag") == ["actions/checkout@v7", "actions/setup-python@v7", "Validate release tag"]
+    assert checkout["with"] == {"fetch-depth": 0}
+    assert _step("release-tag", "actions/setup-python@v7")["with"] == {"python-version": "3.12"}
+    assert gate == [
+        "git fetch --no-tags origin +refs/heads/master:refs/remotes/origin/master",
+        "python .github/scripts/verify_release.py tag",
     ]
-    assert 'python-version: "3.12"' in steps[1]
-    assert "python .github/scripts/verify_release.py tag" in steps[2]
-    assert "python -m build" in steps[3]
-    assert "python .github/scripts/verify_release.py dists dist" in steps[4]
-    assert "twine check --strict dist/*" in steps[4]
-    assert "actions/upload-artifact@v7" in steps[5]
-    assert "name: release-dists" in steps[5]
-    assert "path: dist/" in steps[5]
-    assert "if-no-files-found: error" in steps[5]
+
+
+def test_release_builds_with_the_locked_backend_and_pinned_uv_then_verifies_before_upload() -> None:
+    setup = _step("release-build", "astral-sh/setup-uv@v7")
+    upload = _step("release-build", "Upload distributions")
+
+    assert _step_names("release-build") == [
+        "actions/checkout@v7",
+        "astral-sh/setup-uv@v7",
+        "Build release distributions",
+        "Verify release distributions",
+        "Upload distributions",
+    ]
+    assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", setup["with"]["version"])
+    assert setup["with"]["python-version"] == "3.12"
+    assert _step("release-build", "Build release distributions")["run"].splitlines() == [
+        "uv sync --locked --only-group build --no-install-project",
+        "uv build --no-build-isolation --no-create-gitignore --out-dir dist",
+    ]
+    assert _step("release-build", "Verify release distributions")["run"] == (
+        "uv run --no-project python .github/scripts/verify_release.py dists dist"
+    )
+    assert upload["uses"] == "actions/upload-artifact@v7"
+    assert upload["with"] == {"name": "release-dists", "path": "dist/", "if-no-files-found": "error"}
+
+
+def test_release_installs_no_unlocked_tool() -> None:
+    text = WORKFLOW.read_text(encoding="utf-8") + CI_WORKFLOW.read_text(encoding="utf-8")
+
+    assert "pip install build" not in text
+    assert "twine" not in text
+    assert "python -m build" not in text
+
+
+def test_the_locked_build_group_is_the_declared_build_backend() -> None:
+    config = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    groups = config["dependency-groups"]
+
+    assert groups["build"] == config["build-system"]["requires"]
+    assert {"include-group": "build"} in groups["dev"]
 
 
 def test_workflow_publishes_only_after_the_build_job_with_trusted_publishing() -> None:
     text = WORKFLOW.read_text(encoding="utf-8")
-    publish = text.split("  pypi-publish:\n", 1)[1]
-    steps = _steps("pypi-publish")
+    publish = _publish_jobs()["pypi-publish"]
+    download, upload = publish["steps"]
 
-    assert "    needs:\n      - release-build\n" in publish
-    assert "      id-token: write\n" in publish
-    assert "      name: pypi\n      url: https://pypi.org/p/b24api\n" in publish
-    assert "actions/download-artifact@v7" in steps[0]
-    assert "name: release-dists" in steps[0]
-    assert "path: dist/" in steps[0]
-    assert "pypa/gh-action-pypi-publish@release/v1" in steps[1]
-    assert "packages-dir: dist/" in steps[1]
+    assert publish["needs"] == ["release-build"]
+    assert publish["permissions"] == {"id-token": "write"}
+    assert publish["environment"] == {"name": "pypi", "url": "https://pypi.org/p/b24api"}
+    assert download["uses"] == "actions/download-artifact@v7"
+    assert download["with"] == {"name": "release-dists", "path": "dist/"}
+    # The action checks the metadata with twine before it uploads (verify-metadata defaults to true).
+    assert upload["uses"] == "pypa/gh-action-pypi-publish@release/v1"
+    assert upload["with"] == {"packages-dir": "dist/"}
     assert text.count("id-token: write") == 1
-    assert "permissions:\n  contents: read\n" in text
+    assert _yaml(WORKFLOW)["permissions"] == {"contents": "read"}
 
 
 def test_workflow_uses_node24_action_majors_and_never_interpolates_the_ref() -> None:
@@ -330,6 +458,7 @@ def test_workflow_uses_node24_action_majors_and_never_interpolates_the_ref() -> 
     actions = re.findall(r"uses: (actions/[a-z-]+)@(\S+)", text)
 
     assert sorted(actions) == [
+        ("actions/checkout", "v7"),
         ("actions/checkout", "v7"),
         ("actions/download-artifact", "v7"),
         ("actions/setup-python", "v7"),
@@ -509,7 +638,8 @@ def test_blocking_jobs_run_the_specified_checks() -> None:
     assert "-m pytest" in _runs("min-deps")
     assert "not slow" not in _runs("min-deps")
     assert "make bench" in _runs("slow")
-    assert "uv build --wheel" in _runs("wheel-typing")
+    assert "uv sync --locked --only-group build --no-install-project" in _runs("wheel-typing")
+    assert "uv build --no-build-isolation --wheel" in _runs("wheel-typing")
     assert "python .github/scripts/verify_release.py wheel" in _runs("wheel-typing")
     assert "cp tests/typing_smoke/app.py" in _runs("wheel-typing")
     assert "import-untyped" in _runs("wheel-typing")
@@ -561,7 +691,7 @@ def test_coverage_floor_has_one_source_in_pyproject() -> None:
 
     assert isinstance(floor, int)
     assert floor > 0
-    assert any(dependency.startswith("pytest-cov") for dependency in config["dependency-groups"]["dev"])
+    assert any(str(dependency).startswith("pytest-cov") for dependency in config["dependency-groups"]["dev"])
     assert "--cov-fail-under" not in CI_WORKFLOW.read_text(encoding="utf-8")
 
 
@@ -606,15 +736,6 @@ def test_gate_script_fails_closed_without_well_formed_results(payload: str | Non
 
     assert result.returncode == 1
     assert result.stdout.startswith("::error title=CI gate::")
-
-
-def test_publish_workflow_runs_the_full_ci_before_building() -> None:
-    jobs = _yaml(WORKFLOW)["jobs"]
-    needs = jobs["release-build"]["needs"]
-
-    assert jobs["ci"] == {"uses": "./.github/workflows/ci.yml"}
-    assert "ci" in ([needs] if isinstance(needs, str) else needs)
-    assert jobs["pypi-publish"]["needs"] == ["release-build"]
 
 
 def _ratchet() -> ModuleType:
@@ -692,3 +813,17 @@ def test_ratchet_refuses_a_malformed_or_missing_baseline(tmp_path: Path) -> None
 
 def test_committed_mypy_baseline_never_exceeds_the_specified_starting_count() -> None:
     assert 0 <= _ratchet().read_baseline(MYPY_BASELINE) <= MYPY_TESTS_ERRORS_AT_SPECIFICATION
+
+
+def test_ci_and_release_set_up_the_same_pinned_uv() -> None:
+    # CI checks the build the release runs, so every job installs the one uv the release pins.
+    release_uv = _step("release-build", "astral-sh/setup-uv@v7")["with"]["version"]
+    ci_uvs = [
+        step.get("with", {}).get("version")
+        for job in _ci_jobs().values()
+        for step in job["steps"]
+        if "setup-uv" in step.get("uses", "")
+    ]
+
+    assert ci_uvs
+    assert set(ci_uvs) == {release_uv}
