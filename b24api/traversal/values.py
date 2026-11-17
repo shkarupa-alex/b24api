@@ -17,7 +17,7 @@ from b24api.contracts.request import (
     _TolerantMappingValuesResultSelector,
 )
 from b24api.contracts.response import ResultCollectionShape, result_snapshot
-from b24api.errors import CapabilityError, IdentityContractError, PaginationError, ResultShapeError
+from b24api.errors import IdentityContractError, PaginationError, ResultShapeError
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -36,39 +36,46 @@ _CANONICAL_DECIMAL = re.compile(r"0|-?[1-9][0-9]*")
 
 
 def _mapping_values(response: Response, selector: ResultSelector) -> tuple[FrozenJson, ...]:
-    selected = _selected_value(response, selector)
+    tolerant = isinstance(selector, _TolerantMappingValuesResultSelector)
+    shape = ResultCollectionShape.MAPPING_VALUES_OR_EMPTY if tolerant else ResultCollectionShape.MAPPING_VALUES
+    selected = _selected_value(response, selector, shape)
 
-    if (
-        isinstance(selector, _TolerantMappingValuesResultSelector)
-        and isinstance(selected, list | tuple)
-        and not selected
-    ):
+    if tolerant and isinstance(selected, list | tuple) and not selected:
         return ()
     if not isinstance(selected, Mapping):
         raise ResultShapeError(
             selector=ResultSelector(selector.path),
-            expected_shape=(
-                ResultCollectionShape.MAPPING_VALUES_OR_EMPTY
-                if isinstance(selector, _TolerantMappingValuesResultSelector)
-                else ResultCollectionShape.MAPPING_VALUES
-            ),
+            expected_shape=shape,
             observed_type=_json_type_name(selected),
         )
     return tuple(selected.values())
 
 
-def _selected_value(response: Response, selector: ResultSelector) -> FrozenJson:
-    """Resolve a declared selector or fail without exposing response values."""
+def _selected_value(response: Response, selector: ResultSelector, shape: ResultCollectionShape) -> FrozenJson:
+    """Resolve a declared selector or fail with a value-free shape error naming what the path met instead.
+
+    A path step that meets the wrong container names that container's type; a missing key or index names
+    ``missing``. Either way the response does not have the declared shape, as when the path resolves to a
+    value of the wrong type.
+    """
     selected = result_snapshot(response)
     for part in selector.path:
+        observed: str | None = None
         if isinstance(part, str):
-            if not isinstance(selected, Mapping) or part not in selected:
-                raise CapabilityError("response result does not satisfy the declared selector")
-            selected = selected[part]
+            if not isinstance(selected, Mapping):
+                observed = _json_type_name(selected)
+            elif part not in selected:
+                observed = "missing"
+            else:
+                selected = selected[part]
+        elif not isinstance(selected, tuple):
+            observed = _json_type_name(selected)
+        elif part >= len(selected):
+            observed = "missing"
         else:
-            if not isinstance(selected, tuple) or part >= len(selected):
-                raise CapabilityError("response result does not satisfy the declared selector")
             selected = selected[part]
+        if observed is not None:
+            raise ResultShapeError(selector=ResultSelector(selector.path), expected_shape=shape, observed_type=observed)
     return selected
 
 
@@ -78,7 +85,7 @@ def _response_items(response: Response, selector: ResultSelector, *, single: boo
     frozen_result = result_snapshot(response)
     if single and selector.path == () and not isinstance(frozen_result, tuple):
         return (frozen_result,)
-    selected = _selected_value(response, selector)
+    selected = _selected_value(response, selector, ResultCollectionShape.SEQUENCE)
     if not isinstance(selected, tuple):
         raise ResultShapeError(
             selector=selector,
