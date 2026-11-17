@@ -229,8 +229,8 @@ async def run_model_case(case: ModelCase, *, plan_name: str) -> ModelRun:
         plan = OffsetSequentialPlan(
             limit_path=None,
             requested_page_size=None,
-            continuation=OffsetContinuation.SERVER_NEXT_OR_OBSERVED_COUNT,
-            terminal=frozenset({OffsetTerminalRule.EMPTY_PAGE, OffsetTerminalRule.QUALIFIED_TOTAL}),
+            continuation=OffsetContinuation.SERVER_NEXT,
+            terminal=frozenset({OffsetTerminalRule.NO_CONTINUATION, OffsetTerminalRule.QUALIFIED_TOTAL}),
             identity_requirement=IdentityRequirement.REQUIRED,
             order_semantics=OrderSemantics.ASCENDING,
             duplicate_policy=DuplicatePolicy.ERROR,

@@ -11,6 +11,7 @@ from __future__ import annotations
 from b24api.contracts.completion import BindingClosure
 
 SINGLE_RESPONSE_COMPLETE = "single response complete"
+NO_CONTINUATION_REACHED = "page without continuation ended the source"
 QUALIFIED_TOTAL_REACHED = "qualified total reached"
 SPARSE_RAW_RANGE_COVERED = "qualified sparse raw range covered"
 ADMITTED_UPPER_BOUNDARY_REACHED = "exact admitted upper boundary reached"
@@ -25,6 +26,8 @@ def qualified_closure(terminal_reason: str | None) -> BindingClosure | None:
     match terminal_reason:
         case "single response complete":
             closure = BindingClosure.SINGLE_RESPONSE
+        case "page without continuation ended the source":
+            closure = BindingClosure.NO_CONTINUATION
         case "qualified total reached":
             closure = BindingClosure.QUALIFIED_TOTAL
         case "qualified sparse raw range covered":

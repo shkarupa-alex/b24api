@@ -81,9 +81,7 @@ class ConfirmationPolicy(StrEnum):
 
     NONE = "none"
     EMPTY_AFTER_BOUNDARY = "empty_after_boundary"
-    BOUNDARY_ID_SEEN = "boundary_id_seen"
     QUALIFIED_TOTAL = "qualified_total"
-    INDEPENDENT_ORACLE = "independent_oracle"
 
 
 class KernelState(StrEnum):

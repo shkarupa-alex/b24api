@@ -153,8 +153,14 @@ def _binding_closure_violation(binding: _Binding, event: BindingTerminal) -> str
             "completion_missing_range_witness",
         ),
         (
-            # A response flag or a continuation rule closes only after at least one acknowledged page.
-            closure in {BindingClosure.DECLARED_RESPONSE_TERMINAL, BindingClosure.RULE_DECLARED_END}
+            # A response flag, a missing server continuation or a continuation rule closes only after at
+            # least one acknowledged page.
+            closure
+            in {
+                BindingClosure.DECLARED_RESPONSE_TERMINAL,
+                BindingClosure.NO_CONTINUATION,
+                BindingClosure.RULE_DECLARED_END,
+            }
             and binding.acknowledged_pages == 0,
             "completion_missing_declared_end_witness",
         ),

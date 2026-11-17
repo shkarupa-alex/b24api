@@ -115,6 +115,9 @@ def sequential_stream(  # noqa: PLR0913
 ) -> OperationStream[JsonValue]:
     """Compose conservative sequential offset/server-next traversal."""
     ledger = _checked_identity_store(identity_store, identity)
+    # The plan's duplicate policy is the most lenient one it admits: the stronger of it and the caller's
+    # ``ConsistencyPolicy.duplicate_policy`` applies, so duplicates fail the traversal unless the caller
+    # asks to report them.
     plan = sequential_offset_plan(offset, page_size=page_size, duplicate_policy=DuplicatePolicy.REPORT)
     if offset.short_page_termination is ShortPageTermination.DECLARED_TERMINAL:
         # A declared short page proves the endpoint's stop rule, not that later windows are empty.
