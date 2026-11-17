@@ -114,6 +114,30 @@ def test_a_result_reaches_a_stdout_that_cannot_encode_it_as_escaped_json(monkeyp
     assert json.loads(raw.getvalue().decode("ascii")) == {"NAME": "привет 😀"}
 
 
+def test_help_and_usage_errors_reach_the_streams_main_was_given(capsys: pytest.CaptureFixture[str]) -> None:
+    stdout = io.StringIO()
+
+    help_code, help_stderr = _main(["--help"], stdout=stdout)
+    usage_code, usage_stderr = _main(["call", "x.get"])
+
+    assert (help_code, help_stderr) == (0, "")
+    assert stdout.getvalue().startswith("usage: b24api")
+    assert usage_code == _USAGE
+    assert usage_stderr.startswith("usage: b24api call")
+    assert "the following arguments are required: --route" in usage_stderr
+    assert capsys.readouterr() == ("", "")
+
+
+def test_a_message_reaches_a_stderr_that_cannot_encode_it_escaped() -> None:
+    raw = io.BytesIO()
+    stderr = io.TextIOWrapper(raw, encoding="ascii", write_through=True)
+
+    code = cli.main(["call", "x.get", "--route", "тест"], stdin=io.StringIO(), stdout=io.StringIO(), stderr=stderr)
+
+    assert code == _USAGE
+    assert "\\u0442\\u0435\\u0441\\u0442" in raw.getvalue().decode("ascii")
+
+
 @pytest.mark.parametrize(
     ("params", "stdin"),
     [

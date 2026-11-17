@@ -31,7 +31,6 @@ type PathPart = str | int
 _COMPONENT_LABEL_MAXIMUM = 80
 _COMPOSITE_COMPONENT_MINIMUM = 2
 _COMPOSITE_COMPONENT_MAXIMUM = 8
-_UNCHECKED = object()
 
 
 def summarize_request(  # noqa: PLR0913
@@ -232,7 +231,7 @@ class Request:
     _parameters: FrozenMapping = field(repr=False)
     _positional: PositionalArguments | None = field(repr=False)
     _empty_container: bool | None = field(repr=False, compare=False)
-    _batch_obstacle: object = field(repr=False, compare=False)
+    _batch_obstacle: BracketObstacle | None = field(repr=False, compare=False)
 
     def __init__(  # noqa: C901, PLR0913 - canonical request boundary validates each declared contract
         self,
@@ -277,7 +276,10 @@ class Request:
         object.__setattr__(self, "_parameters", frozen)
         object.__setattr__(self, "_positional", positional)
         object.__setattr__(self, "_empty_container", None)
-        object.__setattr__(self, "_batch_obstacle", _UNCHECKED)
+        # Computed here, not on first read: a lazy marker object would not survive copy or pickle.
+        object.__setattr__(
+            self, "_batch_obstacle", None if positional is not None else bracket_obstacle(frozen, batch=True)
+        )
         if encoding is BodyEncoding.FORM_URLENCODED:
             obstacle = bracket_obstacle(frozen, batch=False)
             if obstacle is not None:
@@ -346,10 +348,7 @@ class Request:
         handler substitutes. ``None`` when the command means what the direct call means. Positional
         requests have no named parameters and answer ``None``; they have no classic command form at all.
         """
-        if self._batch_obstacle is _UNCHECKED:
-            obstacle = None if self._positional is not None else bracket_obstacle(self._parameters, batch=True)
-            object.__setattr__(self, "_batch_obstacle", obstacle)
-        return cast("BracketObstacle | None", self._batch_obstacle)
+        return self._batch_obstacle
 
     @property
     def parameters(self) -> Mapping[str, JsonValue]:

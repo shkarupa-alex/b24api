@@ -8,8 +8,10 @@ pages instead, and every value a request cannot encode at all is refused when th
 """
 
 from __future__ import annotations
+import copy
 import os
-from typing import cast
+import pickle
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -37,6 +39,9 @@ from b24api.contracts import (
 from b24api.contracts.wire import BodyEncoding
 from b24api.errors import CapabilityError
 from tests.scripting import ResponderTransport, client_for
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _IDENTITY = IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.EXACT_INTEGER)
 
@@ -140,6 +145,32 @@ async def test_a_top_level_key_php_would_rename_fails_in_classic_batch(key: str)
     assert isinstance(outcomes[0], CommandFailure)
     assert "key" in str(outcomes[0].error)
     assert transport.requests == []
+
+
+@pytest.mark.parametrize("key", ["A[B", "A]B", "A\x00B", ""], ids=["open-bracket", "close-bracket", "nul", "empty"])
+@pytest.mark.asyncio
+async def test_a_nested_key_php_would_cut_or_rename_fails_in_classic_batch(key: str) -> None:
+    transport = ResponderTransport(_answer)
+    request = Request.bare("crm.deal.update", {"id": 1, "fields": {key: 1}}, ReplaySafety.UNSAFE)
+
+    outcomes = await _batch_outcomes(transport, request)
+
+    assert isinstance(outcomes[0], CommandFailure)
+    assert "key" in str(outcomes[0].error)
+    assert transport.requests == []
+
+
+@pytest.mark.parametrize(
+    "clone",
+    [copy.copy, copy.deepcopy, lambda request: pickle.loads(pickle.dumps(request))],  # noqa: S301 - a value built here
+    ids=["copy", "deepcopy", "pickle"],
+)
+def test_a_copied_or_unpickled_request_keeps_its_batch_verdict(clone: Callable[[Request], Request]) -> None:
+    plain = Request.bare("crm.deal.update", {"id": 1, "fields": {"TITLE": "x"}}, ReplaySafety.UNSAFE)
+    clearing = Request.bare("crm.deal.update", {"id": 1, "fields": {"TITLE": None}}, ReplaySafety.UNSAFE)
+
+    assert clone(plain).classic_batch_obstacle is None
+    assert clone(clearing).classic_batch_obstacle == clearing.classic_batch_obstacle is not None
 
 
 @pytest.mark.asyncio

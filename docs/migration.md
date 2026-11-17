@@ -100,7 +100,7 @@
   already refused an empty container, with "use JSON encoding" in the message.
 - **Automatic keyset execution sends its pages directly** when the request cannot travel in a classic
   batch. Its report says `requested_kind=AUTO`, `selected_kind=SEQUENTIAL`,
-  `reason=BATCH_UNREPRESENTABLE` (a new `KeysetSelectionReason` member).
+  `reason=BATCH_UNREPRESENTABLE`. Breaking for an exhaustive match: `KeysetSelectionReason` gains that member.
 - `True` and `False` are still sent as `1` and `0` in a classic batch, as PHP's `http_build_query`
   writes them.
 - The new read-only `Request.classic_batch_obstacle` names what keeps a request out of a classic
@@ -113,7 +113,7 @@
   decimal digits than the interpreter allows in `str()` was accepted and failed later, inside the send,
   as a transport failure. `Request`, `ParameterUpdate`, a positional `Present` value and
   `Binding.start_cursor` now raise `ValueError` at construction, before any request.
-- **Breaking: a bare string where a sequence of parts is expected raises `TypeError`.**
+- **Breaking: a bare string where a sequence (of path parts or codes) is expected raises `TypeError`.**
   `ParameterPath("OWNER")` was read as the path `("O", "W", "N", "E", "R")`. `ParameterPath`,
   `ResultSelector`, `IdentitySpec.item_path`, `IdentityComponent.item_path`, the `ResultErrorSpec`
   paths, `CursorSpec.item_path` and `timestamp_path`, positional control paths, and
@@ -143,6 +143,9 @@
   usage errors do. Output that a stream cannot encode is written as JSON with `\u` escapes.
 - **`--contract -` reads the contract from stdin**, as the help said. `--contract -` with
   `--params -` is a usage error.
+- **`cli.main()` writes help and usage errors to the streams it is given.** `main(stdout=..., stderr=...)`
+  wrote `--help` to `sys.stdout` and a usage error to `sys.stderr` whatever streams it was passed; both
+  now reach the given streams, and a usage error never falls back to stdout.
 
 ## Test helpers and logs
 

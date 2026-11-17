@@ -226,32 +226,48 @@ def _emit(stream: SupportsWrite[str] | None, text: str) -> None:
 
 
 class _Parser(argparse.ArgumentParser):
-    """Argument parser whose help, usage and error writes reach the caller, failures included.
+    """Argument parser whose help, usage and error writes reach the caller's streams, failures included.
 
-    ``ArgumentParser`` neither flushes its writes nor lets an ``OSError`` from them escape, so a reader
-    that has gone away would only show up in whatever stayed buffered. Each message is written and
-    flushed here, and a ``BrokenPipeError`` reaches the CLI's output boundary whatever the buffering.
+    ``ArgumentParser`` writes to ``sys.stdout`` and ``sys.stderr`` whatever streams ``main`` was given,
+    neither flushes its writes nor lets an ``OSError`` from them escape, so a reader that has gone away
+    would only show up in whatever stayed buffered. Each message is written to the stream ``main`` owns
+    and flushed here, and a ``BrokenPipeError`` reaches the CLI's output boundary whatever the buffering.
     """
 
+    def __init__(self, prog: str, *, output: TextIO, errors: TextIO, description: str | None = None) -> None:
+        """Build a parser writing help to ``output`` and usage errors to ``errors``."""
+        super().__init__(prog=prog, description=description)
+        self._output = output
+        self._errors = errors
+
     def print_usage(self, file: SupportsWrite[str] | None = None) -> None:
-        """Write and flush the usage line (stdout by default)."""
-        _emit(file or sys.stdout or _closed_stream(), self.format_usage())
+        """Write and flush the usage line (the output stream by default)."""
+        _emit(file or self._output, self.format_usage())
 
     def print_help(self, file: SupportsWrite[str] | None = None) -> None:
-        """Write and flush the help text (stdout by default)."""
-        _emit(file or sys.stdout or _closed_stream(), self.format_help())
+        """Write and flush the help text (the output stream by default)."""
+        _emit(file or self._output, self.format_help())
+
+    def error(self, message: str) -> NoReturn:
+        """Write the usage line and ``message`` to the error stream, then exit with the usage code."""
+        self.print_usage(self._errors)
+        self.exit(_USAGE, f"{self.prog}: error: {message}\n")
 
     def exit(self, status: int = 0, message: str | None = None) -> NoReturn:
-        """Write and flush ``message`` to stderr, then exit with ``status``."""
+        """Write and flush ``message`` to the error stream, then exit with ``status``."""
         if message:
-            _emit(sys.stderr or _closed_stream(), message)
+            _emit(self._errors, message)
         sys.exit(status)
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = _Parser(prog="b24api", description="Call Bitrix24 methods and stream list rows as JSONL.")
+def _parser(output: TextIO, errors: TextIO) -> argparse.ArgumentParser:
+    parser = _Parser(
+        "b24api", output=output, errors=errors, description="Call Bitrix24 methods and stream list rows as JSONL."
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    call = subparsers.add_parser("call", help="execute one method and print one JSON value")
+    call = subparsers.add_parser(
+        "call", help="execute one method and print one JSON value", output=output, errors=errors
+    )
     call.add_argument("method", help="Bitrix24 REST method name")
     call.add_argument("--route", choices=tuple(route.value for route in RouteKind), required=True)
     call.add_argument("--params", help="JSON object, @file, or - for stdin")
@@ -262,7 +278,7 @@ def _parser() -> argparse.ArgumentParser:
         default=ReplaySafety.UNKNOWN.value,
         help="operator assertion controlling post-dispatch replay (default: unknown)",
     )
-    listing = subparsers.add_parser("list", help="stream one list traversal as JSONL")
+    listing = subparsers.add_parser("list", help="stream one list traversal as JSONL", output=output, errors=errors)
     listing.add_argument("method", help="Bitrix24 REST method name")
     listing.add_argument("--route", choices=tuple(route.value for route in RouteKind), required=True)
     listing.add_argument("--params", help="JSON object, @file, or - for stdin")
@@ -273,7 +289,9 @@ def _parser() -> argparse.ArgumentParser:
         help="traversal mechanics (default: sequential)",
     )
     listing.add_argument("--contract", help="closed v1 traversal contract as @file or - for stdin")
-    verify = subparsers.add_parser("verify-keyset", help="verify strict keyset bounds for one portal method")
+    verify = subparsers.add_parser(
+        "verify-keyset", help="verify strict keyset bounds for one portal method", output=output, errors=errors
+    )
     verify.add_argument("method", help="Bitrix24 REST method name")
     verify.add_argument("--route", choices=tuple(route.value for route in RouteKind), required=True)
     verify.add_argument("--params", help="JSON object, @file, or - for stdin")
@@ -423,7 +441,7 @@ def _run(  # noqa: C901, PLR0911 - stable process-code boundary
     error_stream: TextIO,
 ) -> int:
     try:
-        args = _parser().parse_args(argv)
+        args = _parser(output_stream, error_stream).parse_args(argv)
         params = read_json_source(args.params, label="parameters", stdin=input_stream)
         if args.command == "call":
             request = cli_request(args.method, params, ReplaySafety(args.replay_safety), RouteKind(args.route))

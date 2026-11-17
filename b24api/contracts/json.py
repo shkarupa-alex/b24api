@@ -197,7 +197,7 @@ def thaw_json(value: FrozenJson) -> JsonValue:
 def _string_free_tuple[T](values: Iterable[T], *, label: str) -> tuple[T, ...]:
     """Return ``values`` as a tuple, refusing a bare string, which would otherwise split into characters."""
     if isinstance(values, str | bytes | bytearray):
-        raise TypeError(f"{label} must be a sequence of parts, not a single string")
+        raise TypeError(f"{label} must be a sequence (a tuple or list), not a single string")
     return tuple(values)
 
 
