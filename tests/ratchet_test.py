@@ -103,3 +103,12 @@ def test_long_functions_only_shrink() -> None:
         assert length == recorded, f"{name} shrank to {length} lines; update tests/ratchets.json"
     stale = sorted(set(baseline) - set(measured))
     assert not stale, f"no longer over the limit, remove from tests/ratchets.json: {stale}"
+
+
+def test_architecture_doc_states_the_checks_these_ratchets_hold() -> None:
+    # The guide promises only what the suite checks: sizes are recorded (architecture_test), functions ratcheted here.
+    text = " ".join((ROOT / "docs" / "architecture.md").read_text(encoding="utf-8").split())
+
+    assert f"a ratchet lets a function over {FUNCTION_LINE_LIMIT} lines only shrink" in text
+    assert "Module size is recorded for review, not capped" in text
+    assert "module-size ceilings" not in text
