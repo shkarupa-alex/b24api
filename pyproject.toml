@@ -57,7 +57,15 @@ include = ["b24api*"]
 b24api = ["py.typed"]
 
 [dependency-groups]
+# The build backend of [build-system], locked: the release and wheel-typing jobs build without isolation
+# from this group, so a published distribution is built by the versions in uv.lock.
+build = [
+    "setuptools>=80.9.0",
+    "setuptools-git-versioning>=2.1.0",
+    "wheel>=0.45.1",
+]
 dev = [
+    { include-group = "build" },
     "cryptography>=50.0.1",
     "hypothesis>=6.168.1",
     "jsonschema>=4.25.1",
@@ -68,11 +76,8 @@ dev = [
     "pytest-mock>=3.14.1",
     "pyyaml>=6.0.3",
     "ruff>=0.15.5",
-    "setuptools>=80.9.0",
-    "setuptools-git-versioning>=2.1.0",
     "types-jsonschema>=4.26.0.20260113",
     "types-pyyaml>=6.0.12.20260906",
-    "wheel>=0.45.1",
 ]
 
 [tool.ruff]

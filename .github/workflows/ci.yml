@@ -72,8 +72,11 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
-      - name: Build the wheel into a temporary directory
-        run: uv build --wheel --out-dir "$RUNNER_TEMP/dist"
+      - name: Build the wheel into a temporary directory as the release does
+        # Without build isolation the backend comes from the locked `build` group (publish-to-pypi.yml).
+        run: |
+          uv sync --locked --only-group build --no-install-project
+          uv build --no-build-isolation --wheel --out-dir "$RUNNER_TEMP/dist"
       - name: Verify the wheel contents
         run: uv run --no-project python .github/scripts/verify_release.py wheel "$RUNNER_TEMP"/dist/*.whl
       - name: Type-check a consumer against the installed wheel
