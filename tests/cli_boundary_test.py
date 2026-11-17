@@ -118,10 +118,14 @@ def test_help_and_usage_errors_reach_the_streams_main_was_given(capsys: pytest.C
     stdout = io.StringIO()
 
     help_code, help_stderr = _main(["--help"], stdout=stdout)
+    subcommand_stdout = io.StringIO()
+    subcommand_code, subcommand_stderr = _main(["call", "--help"], stdout=subcommand_stdout)
     usage_code, usage_stderr = _main(["call", "x.get"])
 
     assert (help_code, help_stderr) == (0, "")
     assert stdout.getvalue().startswith("usage: b24api")
+    assert (subcommand_code, subcommand_stderr) == (0, "")
+    assert subcommand_stdout.getvalue().startswith("usage: b24api call")
     assert usage_code == _USAGE
     assert usage_stderr.startswith("usage: b24api call")
     assert "the following arguments are required: --route" in usage_stderr

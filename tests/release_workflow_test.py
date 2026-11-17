@@ -622,7 +622,7 @@ def test_local_qc_leaves_out_the_internal_benches_that_the_slow_job_runs() -> No
     # The header names what qc runs and what only CI runs, rather than promising every blocking check.
     header = " ".join(line.lstrip("# ") for line in (ROOT / "Makefile").read_text(encoding="utf-8").splitlines()[:4])
     assert "every blocking CI check" not in header
-    assert "The coverage floor, the 3.13 leg, min-deps and wheel-typing run in CI only." in header
+    assert "The coverage floor, the 3.13 and 3.14 legs, min-deps and wheel-typing run in CI only." in header
 
 
 def test_blocking_jobs_run_the_specified_checks() -> None:
@@ -632,7 +632,7 @@ def test_blocking_jobs_run_the_specified_checks() -> None:
     assert "ruff format --check" in _runs("lint")
     assert "uv run --locked mypy b24api" in _runs("types")
     assert "python .github/scripts/mypy_ratchet.py" in _runs("types")
-    assert jobs["tests"]["strategy"]["matrix"]["python-version"] == ["3.12", "3.13"]
+    assert jobs["tests"]["strategy"]["matrix"]["python-version"] == ["3.12", "3.13", "3.14"]
     assert 'pytest -m "not slow and not benchmark" --cov=b24api' in _runs("tests")
     assert "--resolution lowest-direct" in _runs("min-deps")
     assert "-m pytest" in _runs("min-deps")
