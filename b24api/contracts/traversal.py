@@ -7,6 +7,7 @@ from typing import Literal, cast
 
 from b24api.contracts.bounded_range import BoundedIdentityRange
 from b24api.contracts.continuation import ContinuationRule, ResponseCursorRule, ResponseFlagTerminal, WindowClassifier
+from b24api.contracts.json import _string_free_tuple
 from b24api.contracts.keyset_execution import (
     AutoKeysetExecution,
     KeysetExecution,
@@ -335,7 +336,7 @@ class CursorSpec:
 
     def __post_init__(self) -> None:
         """Validate and freeze cursor mechanics."""
-        object.__setattr__(self, "item_path", tuple(self.item_path))
+        object.__setattr__(self, "item_path", _string_free_tuple(self.item_path, label="item_path"))
         ParameterPath(self.item_path)
         if not isinstance(self.coercion, IdentityCoercion):
             raise TypeError("coercion must be an IdentityCoercion")
@@ -539,7 +540,7 @@ class InclusiveWindowTraversal:
 
     def __post_init__(self) -> None:
         """Validate the window controls, caps and classifier."""
-        object.__setattr__(self, "timestamp_path", tuple(self.timestamp_path))
+        object.__setattr__(self, "timestamp_path", _string_free_tuple(self.timestamp_path, label="timestamp_path"))
         ParameterPath(self.timestamp_path)
         if not isinstance(self.selector, ResultSelector):
             raise TypeError("selector must be a ResultSelector")

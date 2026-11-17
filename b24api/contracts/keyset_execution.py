@@ -52,6 +52,8 @@ class KeysetSelectionReason(StrEnum):
     DEGENERATE_SINGLE_LANE = "degenerate_single_lane"
     EXPLICIT_SEQUENTIAL = "explicit_sequential"
     PAGE_STOP = "page_stop"
+    # AUTO settled on sequential direct pages: classic batch would not carry the request as a direct call does.
+    BATCH_UNREPRESENTABLE = "batch_unrepresentable"
 
 
 class KeysetAssuranceSource(StrEnum):

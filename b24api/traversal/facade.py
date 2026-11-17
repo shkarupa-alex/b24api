@@ -24,7 +24,13 @@ from b24api.contracts.policy import (
     TotalSemantics,
 )
 from b24api.contracts.report import KeysetSelectionSummary, TraversalAssurance, Violation
-from b24api.contracts.request import IdentitySpec, RequestLike, ResultSelector, TraversalIdentity, canonical_request
+from b24api.contracts.request import (
+    IdentitySpec,
+    RequestLike,
+    ResultSelector,
+    TraversalIdentity,
+    canonical_request,
+)
 from b24api.contracts.request_summary import RouteKind
 from b24api.contracts.traversal import (
     ContinuationTraversal,
@@ -180,6 +186,11 @@ def keyset_stream(  # noqa: PLR0913
         # A page stop needs the ordered page stream, so AUTO settles on sequential before planning.
         requested, reason = KeysetExecutionKind.AUTO, KeysetSelectionReason.PAGE_STOP
         execution = SequentialKeysetExecution()
+    if isinstance(execution, AutoKeysetExecution) and canonical_request(request).classic_batch_obstacle is not None:
+        # AUTO sends its boundary wave, probes and lanes as classic batch commands; a request they would carry
+        # differently from a direct call settles on sequential direct pages before planning.
+        requested, reason = KeysetExecutionKind.AUTO, KeysetSelectionReason.BATCH_UNREPRESENTABLE
+        execution = SequentialKeysetExecution()
     if page_stop is not None and not isinstance(execution, SequentialKeysetExecution):
         raise CapabilityError("page stop requires sequential keyset execution")
     if not isinstance(execution, SequentialKeysetExecution):
@@ -278,11 +289,11 @@ def counted_stream(  # noqa: PLR0913
         or canonical.positional is not None
     ):
         raise CapabilityError("counted traversal supports JSON requests without scoped headers")
-    if canonical.has_empty_container:
+    obstacle = canonical.classic_batch_obstacle
+    if obstacle is not None:
         # The head goes direct and the tail in classic batch: both must send the same request.
         raise CapabilityError(
-            "counted traversal sends its tail in classic batch, which cannot carry an empty array or object; "
-            "use iter_list"
+            f"counted traversal sends its tail in classic batch, which cannot carry {obstacle}; use iter_list"
         )
     executor.preflight_request(canonical)
     plan = CountedOffsetPlan(

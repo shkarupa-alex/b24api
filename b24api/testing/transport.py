@@ -363,11 +363,11 @@ async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915
     elif case is ConformanceCase.FORM_NESTED_BRACKETS:
         request = Request(
             "conformance.test",
-            parameters={"outer": {"items": ["x", None]}},
+            parameters={"outer": {"items": ["x", "y"]}},
             encoding=BodyEncoding.FORM_URLENCODED,
             route=RouteKind.BARE,
         )
-        expected_body = b"outer%5Bitems%5D%5B0%5D=x"
+        expected_body = b"outer%5Bitems%5D%5B0%5D=x&outer%5Bitems%5D%5B1%5D=y"
     elif case is ConformanceCase.SCOPED_HEADERS_FORWARDED:
         request = Request(
             "conformance.test",
