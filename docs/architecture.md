@@ -13,7 +13,7 @@ client does not contain endpoint catalogs, persistence, business reconciliation 
 | Binary response | `call_bytes()` | Every bounded successful body byte returned without JSON sniffing. |
 | Arbitrary logical batch | `batch()` / `batch_outcomes()` | Lazy input, bounded physical batches, off-wire correlation and typed outcomes. |
 | Independent command fan-out | `fan_out()` / `fan_out_outcomes()` | Explicit dispatch mode, concurrency and delivery order. |
-| Sequential offset list | `iter_list()` | Server-continuation validation and terminal empty-page confirmation. |
+| Sequential offset list | `iter_list()` | Server-continuation validation; the page without `next` ends it, checked against a reported total. |
 | Counted list | `iter_list_counted()` | Direct head, batched tail and exact total/range/identity validation. |
 | No-count keyset | `iter_list_keyset()` | Deterministic auto default plus explicit sequential, range, or partitioned execution for caller-asserted stable integer keysets. |
 | Dependent cursor | `iter_list_cursor()` | Strict unique monotonic cursor progress. |
@@ -30,6 +30,14 @@ client does not contain endpoint catalogs, persistence, business reconciliation 
 The client fails closed when transport or pagination evidence cannot prove the requested mechanical
 result. Contradictory continuation, missing counted ranges, duplicates, total mismatch, response
 size overflow and unsafe ambiguous replay never become ordinary success.
+
+Every list traversal, `iter_list()` and `iter_list_counted()` alike, raises a broken pagination
+invariant (`PaginationError`: a contradictory continuation or range, a duplicate, a total the rows do
+not reach) as the cause of `IncompleteTraversalError`, and any other failure (an API error, a
+capability the plan needs such as a missing total, a result of the wrong shape, a spent budget) as it
+is. A rejected page carries one code per cause: `range_contradiction` only for a pagination invariant
+without a narrower code, `budget_exhausted`, `capability_contract`, `identity_store` and
+`internal_failure` for the rest.
 
 The application still owns facts that a generic REST client cannot infer:
 
@@ -421,7 +429,8 @@ outcome.
   its interrupt is latched even though the cancelled call's result is dropped.
 - The default response ceiling is enforced while streaming, before JSON decoding.
 - Exact sequential, counted, and multi-reference traversal shares one operation-wide
-  `max_identity_keys` ceiling and rejects an overflowing page atomically. Sequential and counted
+  `max_identity_keys` ceiling and rejects an overflowing page atomically; a flat counted traversal whose
+  exact total already exceeds it is refused at its head, before any row. Sequential and counted
   offset traversal may instead record identities in a caller-owned `IdentityStore`, keeping
   in-process identity memory bounded by one page (per-page fingerprints remain bounded by
   `max_pages`); a reported duplicate withdraws identity assurance.
@@ -520,7 +529,10 @@ the ambiguity policy holds ambiguous, such as 502), otherwise the envelope. When
 send, the command ends unknown with that refusal, caused by the envelope's failure.
 
 Traversal contracts separately declare progression (`server next`, observed width, or fixed step),
-completion (empty confirmation or caller-qualified exact total), collection shape, and identity.
+completion (the page without `next` for server next, an empty page for the others, or a
+caller-qualified exact total), collection shape, and identity. A server-next traversal never requests
+a page past the one without `next`: endpoints that round `start` to their page width answer it with
+their last page again. A total that page reports must match the rows read from the first page.
 A fixed step without a qualified total fails closed after a short page; a sparse raw bound reads its
 qualified extent from a result path or the envelope `total`.
 Page evidence contains only bounded counters and enum classifications—never rows, identities,

@@ -1,5 +1,80 @@
 # Migration guide
 
+## Offset traversal ends at the page without `next`
+
+- **Breaking: `iter_list()` ends at the page without `next`.** It followed `next` and then asked for
+  one more page at `start=<rows read>`, expecting it empty. `crm.lead.list`, `crm.deal.list`,
+  `crm.activity.list` and `tasks.task.list` round `start` down to a multiple of 50 and answer that
+  request with their last page again, and `department.get` ignores `start`: the traversal yielded
+  every row and then raised `IncompleteTraversalError` (repeated page), on any row count that is not
+  a multiple of 50. Every Bitrix list page with more rows carries `next` and the last one carries
+  none, so that page now ends the traversal and nothing is requested past it: one request fewer, the
+  terminal reason "page without continuation ended the source", and a reference binding's
+  `ReferenceComplete.closure` is the new `BindingClosure.NO_CONTINUATION` where it was `SOURCE_EMPTY`.
+  Sequential reference bindings end by the same rule.
+- **Breaking: `OffsetContinuation.SERVER_NEXT_OR_OBSERVED_COUNT` is removed; `SERVER_NEXT` is the
+  default.** Its fallback, "no `next`, so advance by the rows read", is what sent the request past the
+  end. An endpoint that honors `start` exactly and sends no `next` declares
+  `OffsetContinuation.OBSERVED_COUNT`, which still ends at an empty page. `SERVER_NEXT` no longer
+  requires `TotalTermination.EXACT_QUALIFIED`. For hand-built plans, `OffsetTerminalRule` gains
+  `NO_CONTINUATION`, the default end of an `OffsetSequentialPlan`, and a server-next plan must close
+  with it and not with `EMPTY_PAGE`.
+- **Breaking: rows that do not reach the reported total never complete.** A traversal under
+  `SERVER_NEXT` that started at the first page compares the `total` of its last page (or of the latest
+  page that had one) with the rows it read; when they differ it raises `IncompleteTraversalError`
+  caused by a `PaginationError` whose `rejection_code` is `total_drift`, and the report is
+  `incomplete`. It completed before, with 50 rows of 120 when the source ended early. An endpoint
+  whose `total` is not an exact count declares `ConsistencyPolicy(total_semantics=TotalSemantics.ADVISORY)`
+  and gets the `advisory_total_mismatch` warning instead. Under `OBSERVED_COUNT` and `FIXED_STEP`
+  the `total` is still read only when the caller qualifies it.
+- **Breaking: `iter_list_counted()` fails as `iter_list()` does.** It wrapped every failure after the
+  first request in `IncompleteTraversalError` and reported `incomplete`. Now only a broken pagination
+  invariant (`PaginationError`) is wrapped; an API error, a missing `total` (`CapabilityError`), a
+  result of the wrong shape (`ResultShapeError`), a spent budget (`BudgetExceededError`), a closed
+  client (`ClientClosedError`) or a lost batch (`AmbiguousExecutionError`) is raised as it is, and the report says `failed`
+  (`incomplete` for a budget), as `iter_list()` and the fast keyset already did. Code that caught
+  `IncompleteTraversalError` for every counted failure catches the specific error or `B24ApiError`.
+  A counted page that contradicts its planned range (its length, its `total`, its `next`), a page that
+  reaches the total while `next` remains, and a tail that ends short of the total now raise
+  `PaginationError` (`range_contradiction` or `total_drift`) where they raised `CapabilityError`.
+- **Breaking: a counted head without `next` short of its total fails with `total_drift`.** It failed
+  with `CapabilityError` ("requires a positive in-band stride"), and a sequential counted reference
+  path advanced by the rows read. A head that holds the whole range (`total` equal to its rows, no
+  `next`) now completes under `SERVER_NEXT`, now the default, where an explicit `SERVER_NEXT` refused it.
+- **A counted range the budget cannot hold is refused at its traced head.** The page, request and
+  row-buffer checks made from the head's exact total raise `BudgetExceededError` (they raised
+  `CapabilityError`), the in-memory `max_identity_keys` ceiling is checked there too (it failed only
+  at the page that crossed it, after yielding the rows before), and the head is traced as a rejected
+  page with `budget_exhausted` (it was not traced).
+- **Breaking: page rejection codes say what refused the page.** `PageRejectionCode` gains
+  `BUDGET_EXHAUSTED`, `CAPABILITY_CONTRACT`, `IDENTITY_STORE` (the caller's `IdentityStore` failed or
+  answered with a non-boolean) and `INTERNAL_FAILURE`. Each was `RANGE_CONTRADICTION`, which now
+  means only a pagination invariant without a narrower code. `NOT_EXECUTED`, never produced, is
+  removed.
+- **Breaking: refused-only members are removed.** `ConfirmationPolicy.BOUNDARY_ID_SEEN`,
+  `ConfirmationPolicy.INDEPENDENT_ORACLE` and `KeysetTerminalRule.BOUNDARY_ID_SEEN` were refused on
+  every traversal; they no longer exist.
+- **`EMPTY_AFTER_BOUNDARY` under `SERVER_NEXT` is refused before any request.** It asks for an empty
+  page past the end, which a server-next traversal never requests; the combination was accepted and
+  failed at the end. It raises `CapabilityError` without a request now.
+- **An exact-total `iter_list()` over an empty source completes.** A first page with no rows, no
+  `next` and no usable `total` (as `user.get` answers a filter that matches nothing) completes as an
+  observed empty source under `TotalTermination.EXACT_QUALIFIED`, as it already did in
+  `iter_list_counted()`; it raised a bare `CapabilityError`.
+- **Breaking: `CursorSpec(take="first")` requires a reversed page order.** On a page in cursor order
+  the first row is the one nearest the previous boundary, so the next request read the rest of the
+  page again and the traversal failed with "identity order did not advance". `take="first"` with
+  `page_order=None` or equal to `direction` now raises `ValueError`.
+- **An empty page carrying `next` is refused only where `next` is followed.** A cursor, continuation
+  or window traversal, an observed count and a fixed step ignore the envelope `next`, so such a page
+  now ends them normally; under `SERVER_NEXT` it is still refused (`range_contradiction`).
+- **A selector that finds nothing raises `ResultShapeError`.** `ResultSelector(("items",))` over
+  `{"result": []}` raised `CapabilityError`; it now raises `ResultShapeError` naming the selector, the
+  expected shape and the observed JSON type, and the page is traced as `shape_contract`.
+- **A continuation control repeated in another spelling is a cycle.** `1`, `"1"` and `True` reach the
+  server as the same value, so a rule that alternates between them now fails with
+  `ContinuationError(CONTINUATION_CYCLE)` at the repetition instead of running until a budget ends it.
+
 ## The retry path
 
 - **A REST 3.0 isolation waits and is admitted as a retry is, and sends one command at a time.** When
