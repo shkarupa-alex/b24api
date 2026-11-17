@@ -283,7 +283,7 @@ def test_expected_counted_next_is_the_qualified_fixed_stride_expectation() -> No
     ids=["next_out_of_range", "total_below_head"],
 )
 async def test_a_head_page_contradicting_its_range_leaves_the_counted_traversal_incomplete(
-    pages: dict[int, tuple[int, int, int | None]], code: PageRejectionCode
+    pages: dict[int, tuple[int, int | None, int | None]], code: PageRejectionCode
 ) -> None:
     # The first page is judged as every later one: its contradiction is a pagination failure, as in iter_list.
     async with _client(_Portal(pages)) as client:
@@ -295,4 +295,6 @@ async def test_a_head_page_contradicting_its_range_leaves_the_counted_traversal_
     cause = raised.value.__cause__
     assert isinstance(cause, PaginationError)
     assert cause.rejection_code is code
-    assert stream.report.state is TerminalState.INCOMPLETE
+    report = stream.report
+    assert report is not None
+    assert report.state is TerminalState.INCOMPLETE
