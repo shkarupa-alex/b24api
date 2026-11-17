@@ -147,7 +147,8 @@ async def pause_and_resume(
     with tempfile.TemporaryDirectory(prefix="b24api-example-") as temporary:
         sink = SqliteMirror(Path(temporary) / "mirror.sqlite3")
         try:
-            first = _transport((("A", None, (105, 104)),))
+            # The single dispatch slot sends B's first page once A stops; the reader closes before it is delivered.
+            first = _transport((("A", None, (105, 104)), ("B", None, (115, 114))))
             first_report = await _run_once(sink, first, pause_a=True)
             if (
                 first_report.state is not TerminalState.EARLY_CLOSED

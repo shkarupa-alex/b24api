@@ -32,17 +32,19 @@ async def test_form_bodies_and_scoped_headers_are_served_as_an_http_transport_se
 
 
 @pytest.mark.asyncio
-async def test_a_fixture_matches_only_the_key_order_it_names_and_a_mismatch_is_named() -> None:
-    # Equal as Request values, but PHP reads ``order`` in the order it is sent, so they sort differently.
+async def test_an_unmatched_call_is_named_first_and_calls_keep_the_key_order_they_were_sent_in() -> None:
+    # Equal as Request values, so either matches the fixture; PHP reads ``order`` in the order it is sent.
     assert _ORDERED == _REVERSED
+    other = Request.bare("crm.deal.get", {"id": 1}, ReplaySafety.SAFE)
     transport = ScriptedTransport((ScriptedExchange.json(_ORDERED, {"result": ["ordered"]}),))
     async with client_for(transport) as client:
         with pytest.raises(B24ApiError):
-            await client.call(_REVERSED)
-        assert await client.call(_ORDERED) == ["ordered"]
+            await client.call(other)
+        assert await client.call(_REVERSED) == ["ordered"]
 
-    assert [call.request for call in transport.unexpected] == [_REVERSED]
-    with pytest.raises(AssertionError, match=r"1 unexpected scripted request\(s\): crm.deal.list"):
+    assert [call.request for call in transport.unexpected] == [other]
+    assert list(transport.calls[-1].copy_parameters()["order"]) == ["ID", "DATE_CREATE"]
+    with pytest.raises(AssertionError, match=r"1 unexpected scripted request\(s\): crm.deal.get"):
         transport.assert_exhausted()
 
 

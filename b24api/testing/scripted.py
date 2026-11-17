@@ -195,26 +195,17 @@ class ScriptedCall:
     replay_safety: ReplaySafety
 
 
-def _wire_order(request: Request) -> str | None:
-    """Return a request's named parameters in the key order they are sent, or ``None`` for positional ones.
-
-    ``Request`` equality compares JSON objects as unordered, but the wire keeps their order, and PHP reads it
-    (``order[DATE]=ASC&order[ID]=DESC`` sorts differently from the reverse), so a fixture matches only the
-    order it names.
-    """
-    if request.positional is not None:
-        return None
-    return json.dumps(request.copy_parameters(), ensure_ascii=False, separators=(",", ":"))
-
-
 class ScriptedTransport:
     """Match a finite frozen exchange table by the exact request each call sends.
 
     A call matches an exchange whose request is equal to it (method, route, replay safety, body encoding,
-    scoped headers, embedded-error contract and parameters) and names its parameters in the same key order.
-    Form-encoded bodies and scoped headers are supported as an HTTP transport supports them. A call no
-    exchange matches is recorded in ``unexpected`` and fails its send; the client reports that as a
-    transport failure of the call, and ``assert_exhausted()`` names it first.
+    scoped headers, embedded-error contract and parameters). ``Request`` equality reads JSON objects as
+    unordered, as the client builds them (a cursor it sets is added where the update puts it), so a test
+    that depends on key order, such as the sort priority of ``order``, asserts it on ``calls``, which keep
+    each request's parameters in the order they were sent. Form-encoded bodies and scoped headers are
+    supported as an HTTP transport supports them. A call no exchange matches is recorded in ``unexpected``
+    and fails its send; the client reports that as a transport failure of the call, and
+    ``assert_exhausted()`` names it ahead of unused exchanges.
     """
 
     capabilities = TransportCapabilities(
@@ -269,10 +260,9 @@ class ScriptedTransport:
         self._calls.append(request)
         call = ScriptedCall(request, None, request.replay_safety)
         self._wire_calls.append(call)
-        order = _wire_order(request)
         for index, exchange in enumerate(self._remaining):
             # A v3 batch exchange never matches a classic call, even one equal to its envelope descriptor.
-            if exchange.v3_wire is None and exchange.request == request and _wire_order(exchange.request) == order:
+            if exchange.v3_wire is None and exchange.request == request:
                 return self._take(index, max_response_bytes)
         return self._refuse(call, request.method)
 
@@ -327,11 +317,14 @@ class ScriptedTransport:
 
     def assert_exhausted(self) -> None:
         """Fail when a call matched no exchange, or when a recipe did not issue every expected fixture request."""
+        problems = []
         if self._unexpected:
             methods = ", ".join(_call_method(call) for call in self._unexpected)
-            raise AssertionError(f"{len(self._unexpected)} unexpected scripted request(s): {methods}")
+            problems.append(f"{len(self._unexpected)} unexpected scripted request(s): {methods}")
         if self._remaining:
-            raise AssertionError(f"{len(self._remaining)} scripted exchange(s) were not requested")
+            problems.append(f"{len(self._remaining)} scripted exchange(s) were not requested")
+        if problems:
+            raise AssertionError("; ".join(problems))
 
 
 def _call_method(call: ScriptedCall) -> str:
