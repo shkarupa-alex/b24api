@@ -3,11 +3,17 @@
 from __future__ import annotations
 import argparse
 import asyncio
+import codecs
 import dataclasses
+import errno
+import io
 import json
 import os
+import signal
 import sys
-from typing import TYPE_CHECKING, NoReturn, TextIO
+from typing import TYPE_CHECKING, Any, NoReturn, TextIO, cast
+
+from pydantic_settings import SettingsConfigDict
 
 from b24api import (
     B24ApiError,
@@ -31,9 +37,10 @@ from b24api.cli_contract import (
     read_json_source,
 )
 from b24api.contracts import Response
+from b24api.settings import Settings
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Coroutine, Sequence
 
     from _typeshed import SupportsWrite
 
@@ -47,10 +54,108 @@ _OUTPUT_CLOSED = 5
 _KEYSET_UNSUPPORTED = 6
 _KEYSET_INCONCLUSIVE = 7
 _INTERRUPTED = 130
+# A termination signal ends the operation as an interrupt does, with the shell's code for that signal.
+_SIGNAL_EXIT_BASE = 128
+_TERMINATION_SIGNALS = tuple(
+    signum for signum in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None)) if signum is not None
+)
 
 
-def _compact(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+class _CliSettings(Settings):
+    """The CLI's settings: the process environment, then a ``.env`` file in the working directory.
+
+    Only the command line reads ``.env``; the library's ``Settings`` reads the process environment alone.
+    """
+
+    model_config = SettingsConfigDict(env_file=".env")
+
+
+def _open_client() -> Bitrix24:
+    # Every field comes from the environment or ``.env``; none is passed, which the type checker cannot see.
+    from_environment: dict[str, Any] = {}
+    return Bitrix24(_CliSettings(**from_environment))
+
+
+class _Terminated(KeyboardInterrupt):
+    """An interrupt by a termination signal: the operation was cancelled as Ctrl-C cancels it."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+async def _until_terminated(operation: Coroutine[object, object, None]) -> None:
+    """Run one operation; SIGTERM or SIGHUP cancels it as Ctrl-C does, so a list still reports."""
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    received: list[int] = []
+
+    def terminate(signum: int) -> None:
+        if not received and task is not None:
+            received.append(signum)
+            task.cancel()
+
+    installed: list[int] = []
+    for signum in _TERMINATION_SIGNALS:
+        try:
+            loop.add_signal_handler(signum, terminate, signum)
+        except (NotImplementedError, RuntimeError, ValueError):  # no signal handlers here: the default action stays
+            continue
+        installed.append(signum)
+    try:
+        await operation
+    except asyncio.CancelledError:
+        if received:
+            raise _Terminated(received[0]) from None
+        raise
+    finally:
+        for signum in installed:
+            loop.remove_signal_handler(signum)
+
+
+def _run_operation(operation: Coroutine[object, object, None]) -> None:
+    asyncio.run(_until_terminated(operation))
+
+
+class _ClosedStream(io.TextIOBase):
+    """A standard stream whose descriptor was closed when the process started: it has no reader.
+
+    Python leaves such a stream unset; writing to this stand-in fails as a write to a gone reader does.
+    Reading it yields nothing.
+    """
+
+    def writable(self) -> bool:
+        return True
+
+    def readable(self) -> bool:
+        return True
+
+    def write(self, text: str) -> int:
+        del text
+        raise BrokenPipeError(errno.EPIPE, "standard stream is closed")
+
+    def read(self, size: int | None = -1) -> str:
+        del size
+        return ""
+
+
+def _closed_stream() -> TextIO:
+    return cast("TextIO", _ClosedStream())
+
+
+def _writes_all_unicode(stream: object) -> bool:
+    """Whether a text stream encodes every character; a sink without an encoding keeps text as it is."""
+    encoding = getattr(stream, "encoding", None)
+    if not isinstance(encoding, str):
+        return True
+    try:
+        return codecs.lookup(encoding).name.startswith(("utf-", "gb18030"))
+    except LookupError:
+        return False
+
+
+def _compact(value: object, *, ascii_only: bool = False) -> str:
+    return json.dumps(value, ensure_ascii=ascii_only, separators=(",", ":"), allow_nan=False)
 
 
 def _response_json(response: Response) -> dict[str, object]:
@@ -102,17 +207,18 @@ def _safe_error(error: BaseException) -> dict[str, object]:
 
 
 def _write_json(stream: TextIO, value: object) -> None:
-    stream.write(_compact(value))
+    # JSON escapes what the stream's encoding cannot write, so a result is never lost to the terminal's locale.
+    stream.write(_compact(value, ascii_only=not _writes_all_unicode(stream)))
     stream.write("\n")
     stream.flush()
 
 
 def _emit(stream: SupportsWrite[str] | None, text: str) -> None:
-    # Python leaves a standard stream unset when its descriptor was closed at startup; like argparse,
-    # fall back to stderr and drop the message when that is unset too.
-    target = stream or sys.stderr
-    if target is None:
-        return
+    # Python leaves a standard stream unset when its descriptor was closed at startup: no reader is there.
+    target = stream or sys.stderr or _closed_stream()
+    encoding = getattr(target, "encoding", None)
+    if not _writes_all_unicode(target) and isinstance(encoding, str):
+        text = text.encode(encoding, "backslashreplace").decode(encoding)
     target.write(text)
     flush = getattr(target, "flush", None)
     if flush is not None:
@@ -129,16 +235,16 @@ class _Parser(argparse.ArgumentParser):
 
     def print_usage(self, file: SupportsWrite[str] | None = None) -> None:
         """Write and flush the usage line (stdout by default)."""
-        _emit(file or sys.stdout, self.format_usage())
+        _emit(file or sys.stdout or _closed_stream(), self.format_usage())
 
     def print_help(self, file: SupportsWrite[str] | None = None) -> None:
         """Write and flush the help text (stdout by default)."""
-        _emit(file or sys.stdout, self.format_help())
+        _emit(file or sys.stdout or _closed_stream(), self.format_help())
 
     def exit(self, status: int = 0, message: str | None = None) -> NoReturn:
         """Write and flush ``message`` to stderr, then exit with ``status``."""
         if message:
-            _emit(sys.stderr, message)
+            _emit(sys.stderr or _closed_stream(), message)
         sys.exit(status)
 
 
@@ -166,17 +272,17 @@ def _parser() -> argparse.ArgumentParser:
         default="sequential",
         help="traversal mechanics (default: sequential)",
     )
-    listing.add_argument("--contract", help="closed v1 traversal contract as @file or -")
+    listing.add_argument("--contract", help="closed v1 traversal contract as @file or - for stdin")
     verify = subparsers.add_parser("verify-keyset", help="verify strict keyset bounds for one portal method")
     verify.add_argument("method", help="Bitrix24 REST method name")
     verify.add_argument("--route", choices=tuple(route.value for route in RouteKind), required=True)
     verify.add_argument("--params", help="JSON object, @file, or - for stdin")
-    verify.add_argument("--contract", required=True, help="closed v1 verifier contract as @file")
+    verify.add_argument("--contract", required=True, help="closed v1 verifier contract as @file or - for stdin")
     return parser
 
 
 async def _call(args: argparse.Namespace, request: Request, stdout: TextIO) -> None:
-    async with Bitrix24() as client:
+    async with _open_client() as client:
         result = await client.call_response(request) if args.raw else await client.call(request)
     _write_json(stdout, _response_json(result) if isinstance(result, Response) else result)
 
@@ -200,7 +306,7 @@ async def _list(
     stdout: TextIO,
     stderr: TextIO,
 ) -> None:
-    async with Bitrix24() as client:
+    async with _open_client() as client:
         stream = list_stream(
             client,
             request=request,
@@ -231,7 +337,7 @@ async def _list(
 
 
 async def _verify_keyset(request: Request, route: VerifyKeysetContractRoute, stdout: TextIO) -> None:
-    async with Bitrix24() as client:
+    async with _open_client() as client:
         report = await client.verify_keyset_capability(
             request,
             selector=route.selector,
@@ -289,12 +395,13 @@ def main(
 ) -> int:
     """Run one CLI operation and return its stable process code.
 
-    A reader of stdout or stderr that has gone away at any write yields the output-closed code, which
-    takes priority over every other outcome; any other failed write yields the generic failure code.
+    A reader of stdout or stderr that has gone away at any write, or a stream closed before the process
+    started, yields the output-closed code, which takes priority over every other outcome; any other
+    failed write yields the generic failure code.
     """
-    input_stream = stdin or sys.stdin
-    output_stream = stdout or sys.stdout
-    error_stream = stderr or sys.stderr
+    input_stream = stdin or sys.stdin or _closed_stream()
+    output_stream = stdout or sys.stdout or _closed_stream()
+    error_stream = stderr or sys.stderr or _closed_stream()
     try:
         code = _run(argv, input_stream, output_stream, error_stream)
     except BrokenPipeError:
@@ -320,19 +427,19 @@ def _run(  # noqa: C901, PLR0911 - stable process-code boundary
         params = read_json_source(args.params, label="parameters", stdin=input_stream)
         if args.command == "call":
             request = cli_request(args.method, params, ReplaySafety(args.replay_safety), RouteKind(args.route))
-            asyncio.run(_call(args, request, output_stream))
+            _run_operation(_call(args, request, output_stream))
         elif args.command == "list":
-            contract = default_contract(args.strategy, args.contract, input_stream)
+            contract = default_contract(args.strategy, args.contract, input_stream, params=args.params)
             route = parse_list_contract(args.strategy, contract)
             request = cli_request(args.method, params, ReplaySafety.UNKNOWN, RouteKind(args.route))
-            asyncio.run(_list(request, route, output_stream, error_stream))
+            _run_operation(_list(request, route, output_stream, error_stream))
         else:
-            contract = default_contract("verify-keyset", args.contract, input_stream)
+            contract = default_contract("verify-keyset", args.contract, input_stream, params=args.params)
             verify_route = parse_verify_keyset_contract(contract)
             request = cli_request(args.method, params, ReplaySafety.UNKNOWN, RouteKind(args.route))
-            asyncio.run(_verify_keyset(request, verify_route, output_stream))
-    except KeyboardInterrupt:
-        return _INTERRUPTED
+            _run_operation(_verify_keyset(request, verify_route, output_stream))
+    except KeyboardInterrupt as interrupt:
+        return _SIGNAL_EXIT_BASE + interrupt.signum if isinstance(interrupt, _Terminated) else _INTERRUPTED
     except SystemExit as error:
         return int(error.code) if isinstance(error.code, int) else _USAGE
     except CliUsageError as error:
