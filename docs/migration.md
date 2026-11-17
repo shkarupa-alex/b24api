@@ -75,6 +75,86 @@
   server as the same value, so a rule that alternates between them now fails with
   `ContinuationError(CONTINUATION_CYCLE)` at the repetition instead of running until a budget ends it.
 
+## What a classic batch command can carry
+
+- **Breaking: a classic batch command holding `None` is refused before any request.** A direct JSON
+  call sends `None` as `null`, which Bitrix reads as an empty value (`{"filter": {"COMPANY_ID": None}}`
+  selects the deals without a company). The query string of a classic batch command dropped every
+  `None` with no error, so the same filter selected every deal and `{"fields": {"TITLE": None}}`
+  updated nothing. Every path that sends classic batch commands now refuses such a command, as it
+  already refused an empty array or object: `batch_outcomes()`, `fan_out_outcomes()` and batched
+  references fail that command or binding alone with `CapabilityError`, `batch()` raises
+  `BatchFailed`, and `iter_list_counted()`, explicit fast keyset execution and
+  `verify_keyset_capability()` raise `CapabilityError` before their first request. The message names
+  the value and points to direct dispatch. Send such a command with `client.call()`, `DirectDispatch`
+  or REST 3.0.
+- **Breaking: text holding a batch reference pattern is refused in a classic batch.** The batch
+  handler replaces `$result[...]` (and `$result_error[`, `$result_total[`, `$result_next[`,
+  `$result_time[`, in any letter case) inside any value and drops the rest of the value, so a title
+  `"probe-$result[a][0][ID]-end"` was stored as `probe-1`. The library has no batch reference
+  feature and the pattern cannot be escaped, so such a command is refused as `None` is. A direct call
+  sends the text as written.
+- **Breaking: a key PHP would rename is refused in a classic batch.** An empty key, a key holding `[`,
+  `]` or NUL, and a top-level key holding `.` or a space (PHP turns those into `_`) are refused there.
+- **Breaking: a `FORM_URLENCODED` request refuses `None` and such keys when it is built**, as it
+  already refused an empty container, with "use JSON encoding" in the message.
+- **Automatic keyset execution sends its pages directly** when the request cannot travel in a classic
+  batch. Its report says `requested_kind=AUTO`, `selected_kind=SEQUENTIAL`,
+  `reason=BATCH_UNREPRESENTABLE` (a new `KeysetSelectionReason` member).
+- `True` and `False` are still sent as `1` and `0` in a classic batch, as PHP's `http_build_query`
+  writes them.
+- The new read-only `Request.classic_batch_obstacle` names what keeps a request out of a classic
+  batch, or is `None`.
+
+## Request values are checked when they are built
+
+- **Breaking: a value no encoding can send is refused when the `Request` is built.** A string with a
+  lone surrogate (from `os.fsdecode()` of a non-UTF-8 file name, for example) or an integer with more
+  decimal digits than the interpreter allows in `str()` was accepted and failed later, inside the send,
+  as a transport failure. `Request`, `ParameterUpdate`, a positional `Present` value and
+  `Binding.start_cursor` now raise `ValueError` at construction, before any request.
+- **Breaking: a bare string where a sequence of parts is expected raises `TypeError`.**
+  `ParameterPath("OWNER")` was read as the path `("O", "W", "N", "E", "R")`. `ParameterPath`,
+  `ResultSelector`, `IdentitySpec.item_path`, `IdentityComponent.item_path`, the `ResultErrorSpec`
+  paths, `CursorSpec.item_path` and `timestamp_path`, positional control paths, and
+  `RetryPolicy.transient_api_codes` and `AmbiguityPolicy.refusal_api_codes` now refuse `str` and
+  `bytes`. Pass a tuple or list: `ParameterPath(("OWNER",))`.
+- **`FrozenMapping` freezes what it holds** when it is built directly, as it already did inside a
+  `Request`: nested lists become tuples and nested mappings become `FrozenMapping`, so a later change
+  to the caller's value no longer reaches it and it can be hashed. `Binding.start_cursor` is frozen the
+  same way.
+
+## Settings and the CLI
+
+- **Breaking: `Settings` no longer reads a `.env` file.** It read `.env` from the current directory,
+  so a library call could pick up a credential from whatever directory the process ran in. It now
+  reads only the process environment. The `b24api` CLI still reads `.env` from its working directory
+  (the environment wins). A program that relied on `.env` should load it itself, for example with
+  `python-dotenv`, or export the variables.
+- **Breaking: `Settings` cannot be pickled.** A pickled copy held `[REDACTED]` in place of the webhook
+  and failed far from the cause, in `multiprocessing` for example. `pickle.dumps(settings)` now raises
+  `TypeError`; build `Settings` in each process.
+- **`b24api list --strategy counted` works.** It refused every run, because the contract it built had
+  no exact total.
+- **CLI exit codes at the process boundary.** A run started with stdout or stderr already closed exits
+  `5`, as a reader gone during the run does. `SIGTERM` and `SIGHUP` end a run as Ctrl-C does, closing
+  a `list` stream and writing its report, and exit `128 + signal` (`143`, `129`). Local input that is
+  not UTF-8 or not valid JSON (a number with too many digits, nesting too deep) exits `2`, as other
+  usage errors do. Output that a stream cannot encode is written as JSON with `\u` escapes.
+- **`--contract -` reads the contract from stdin**, as the help said. `--contract -` with
+  `--params -` is a usage error.
+
+## Test helpers and logs
+
+- **`ScriptedTransport` matches what a call sends.** It now serves form-encoded requests and scoped
+  headers, as `HttpxTransport` does, and matches a call only when its mapping keys are in the order
+  the exchange names. A call nothing matches is kept in `unexpected`, and `assert_exhausted()` names
+  it first. A fixture that relied on two requests with keys in different orders matching each other
+  must now name each order.
+- **httpcore's DEBUG records are scrubbed.** With the `httpcore` loggers at `DEBUG`, a redirect's
+  `Location` header carried the webhook token into the log. The URL filter now covers every
+  `httpcore` logger as it covers `httpx`.
+
 ## The retry path
 
 - **A REST 3.0 isolation waits and is admitted as a retry is, and sends one command at a time.** When
@@ -1324,18 +1404,10 @@ now unknown with reason `CONNECTION_LOST_AFTER_DISPATCH` and a cause chain that 
     is an empty `filter: {}`: omit it, or use `iter_list()` or `SequentialKeysetExecution`.
   - A `FORM_URLENCODED` request with an empty container is refused when it is built.
 
-  Native REST v3 batch and every direct JSON request still send empty containers. `None` is still
-  omitted from bracket encoding, so `{"UF_MULTI": [None]}` also sends no field there. The new
-  read-only `Request.has_empty_container` tells whether a request holds such a value.
-
-  **Warning: `None` in a classic batch is a no-op, not "clear this field".** A direct JSON call sends
-  `None` as `null` (`{"fields": {"TITLE": null}}`); what the method does with `null` is its own. The
-  bracket encoding of a classic batch command, and of a `FORM_URLENCODED` request, drops every `None`
-  instead, with nothing in its place and no error: `{"fields": {"TITLE": None}}` sends no `TITLE`, so
-  the update leaves the field as it was; a mapping left holding only `None` values is not sent at all;
-  and `{"fields": {"UF_MULTI": [None, 5]}}` sends only `fields[UF_MULTI][1]=5`, the later items keeping
-  their index. `Request.has_empty_container` does not flag a `None`. To clear a field in a batch, send
-  the value the method itself expects for clearing it, never `None`.
+  Native REST v3 batch and every direct JSON request still send empty containers. The new
+  read-only `Request.has_empty_container` tells whether a request holds such a value. Classic batch
+  now refuses `None` the same way; see
+  [What a classic batch command can carry](#what-a-classic-batch-command-can-carry).
 
 ## Page-level response fields
 
@@ -1971,8 +2043,9 @@ latency-oriented workloads. The dispatcher shutdown remains cancellation-based; 
   it differs. Match `.normalized_code`, not rendered text.
 - Boolean values in form and physical-batch bracket encoding are now `1` and `0`; the old `False`
   text was truthy to PHP.
-- `None` values are omitted from form and physical-batch bracket encoding, matching PHP query conventions;
-  JSON encoding continues to send them as `null`.
+- `None` values were omitted from form and physical-batch bracket encoding; JSON encoding sends them as
+  `null`. Since then such a request is refused instead (see
+  [What a classic batch command can carry](#what-a-classic-batch-command-can-carry)).
 - A 2xx response missing the canonical result envelope raises `EnvelopeContractError`. It is a
   subclass of both `HTTPGatewayError` and `ProtocolError`, so `except ProtocolError` now catches it
   too; its origin stays `http_gateway`, it is never retried, and reports still classify it as

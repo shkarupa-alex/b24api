@@ -163,6 +163,12 @@ outcome.
 ## Resource and lifecycle model
 
 - Logical sources are consumed incrementally; physical Bitrix batches contain at most 50 commands.
+- One rule, `b24api.encoding.bracket_obstacle`, decides whether a classic batch command's query string
+  means what its JSON means; a `Request` exposes its answer as `classic_batch_obstacle`. The batch engine
+  partitions commands by it (one it refuses fails alone with `CapabilityError` before any request), and
+  counted traversal, fast keyset execution, the keyset verifier and `ScriptedExchange.batch` refuse a base
+  request by it, while automatic keyset selection sends such a request's pages directly. A `Request` checks
+  at construction that every value can be encoded at all, so no send fails on an unencodable value.
 - Response bytes, buffered rows and commands, retained unordered identity keys, request/page
   budgets, concurrency and elapsed time are bounded by `ExecutionPolicy`. Concurrency has one more,
   client-wide ceiling: the permits of the client's shared rate coordinator,
