@@ -9,6 +9,7 @@ from b24api import IdentitySpec, ParameterPath, ResultSelector, RetryPolicy
 from b24api.contracts import (
     AmbiguityPolicy,
     Binding,
+    CompositeIdentitySpec,
     CursorSpec,
     FrozenMapping,
     IdentityCoercion,
@@ -32,6 +33,8 @@ _CURSOR = ParameterPath(("filter", ">ID"))
         lambda: ResultSelector("items"),  # type: ignore[arg-type]
         lambda: IdentitySpec("ID", "ID", "ID"),  # type: ignore[arg-type]
         lambda: IdentityComponent("ID"),  # type: ignore[arg-type]
+        lambda: CompositeIdentitySpec("A"),  # type: ignore[arg-type]
+        lambda: CompositeIdentitySpec("ABCDEFGHI"),  # type: ignore[arg-type]
         lambda: ResultErrorSpec(ResultSelector(), "error"),  # type: ignore[arg-type]
         lambda: ResultErrorSpec(ResultSelector(), ("error",), "description"),  # type: ignore[arg-type]
         lambda: CursorSpec(_CURSOR, "ID", IdentityCoercion.EXACT_INTEGER, "ascending", "last"),  # type: ignore[arg-type]
@@ -45,6 +48,8 @@ _CURSOR = ParameterPath(("filter", ">ID"))
         "result-selector",
         "identity-item-path",
         "identity-component",
+        "composite-components-short",
+        "composite-components-long",
         "result-error-code-path",
         "result-error-description-path",
         "cursor-item-path",

@@ -114,21 +114,24 @@ def test_a_result_reaches_a_stdout_that_cannot_encode_it_as_escaped_json(monkeyp
     assert json.loads(raw.getvalue().decode("ascii")) == {"NAME": "привет 😀"}
 
 
-def test_help_and_usage_errors_reach_the_streams_main_was_given(capsys: pytest.CaptureFixture[str]) -> None:
+@pytest.mark.parametrize("command", [[], ["call"], ["list"], ["verify-keyset"]], ids=["top", "call", "list", "verify"])
+def test_help_and_usage_errors_reach_the_streams_main_was_given_as_plain_text(
+    command: list[str], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Every parser writes to ``main``'s streams, never coloured: Python 3.14 would colour for a forced terminal."""
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    usage = " ".join(("usage: b24api", *command))
     stdout = io.StringIO()
 
-    help_code, help_stderr = _main(["--help"], stdout=stdout)
-    subcommand_stdout = io.StringIO()
-    subcommand_code, subcommand_stderr = _main(["call", "--help"], stdout=subcommand_stdout)
-    usage_code, usage_stderr = _main(["call", "x.get"])
+    help_code, help_stderr = _main([*command, "--help"], stdout=stdout)
+    usage_code, usage_stderr = _main(command)
 
     assert (help_code, help_stderr) == (0, "")
-    assert stdout.getvalue().startswith("usage: b24api")
-    assert (subcommand_code, subcommand_stderr) == (0, "")
-    assert subcommand_stdout.getvalue().startswith("usage: b24api call")
+    assert stdout.getvalue().startswith(usage)
     assert usage_code == _USAGE
-    assert usage_stderr.startswith("usage: b24api call")
-    assert "the following arguments are required: --route" in usage_stderr
+    assert usage_stderr.startswith(usage)
+    assert "the following arguments are required" in usage_stderr
+    assert "\x1b" not in stdout.getvalue() + usage_stderr
     assert capsys.readouterr() == ("", "")
 
 
