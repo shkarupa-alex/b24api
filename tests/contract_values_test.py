@@ -17,12 +17,14 @@ from b24api.contracts import (
     ParameterUpdate,
     ResultErrorSpec,
 )
-from b24api.contracts.positional import PositionalLayout, SlotContract, SlotShape
+from b24api.contracts.positional import PositionalArguments, PositionalLayout, Present, SlotContract, SlotShape
 
 if TYPE_CHECKING:
     from b24api.contracts.json import JsonValue
 
 _CURSOR = ParameterPath(("filter", ">ID"))
+_LAYOUT = PositionalLayout("layout", (SlotContract("a", SlotShape.ANY),), frozenset({(0, "a")}))
+_ARGUMENTS = PositionalArguments((Present({"a": 1}),), "layout", layout=_LAYOUT)
 
 
 @pytest.mark.parametrize(
@@ -41,6 +43,8 @@ _CURSOR = ParameterPath(("filter", ">ID"))
         lambda: RetryPolicy(transient_api_codes="QUERY_LIMIT_EXCEEDED"),  # type: ignore[arg-type]
         lambda: AmbiguityPolicy(refusal_api_codes="QUERY_LIMIT_EXCEEDED"),  # type: ignore[arg-type]
         lambda: PositionalLayout("layout", (SlotContract("a", SlotShape.ANY),), frozenset({"0a"})),  # type: ignore[arg-type]
+        lambda: _ARGUMENTS.write_control("0a", 1),  # type: ignore[arg-type]
+        lambda: _ARGUMENTS.write_control(b"0a", 1),  # type: ignore[arg-type]
     ],
     ids=[
         "parameter-path",
@@ -56,6 +60,8 @@ _CURSOR = ParameterPath(("filter", ">ID"))
         "retry-api-codes",
         "ambiguity-api-codes",
         "positional-control-path",
+        "positional-write-control",
+        "positional-write-control-bytes",
     ],
 )
 def test_a_bare_string_where_a_sequence_of_parts_is_expected_is_refused(build: object) -> None:

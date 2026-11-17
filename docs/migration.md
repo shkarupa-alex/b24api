@@ -116,7 +116,8 @@
 - **Breaking: a bare string where a sequence (of path parts or codes) is expected raises `TypeError`.**
   `ParameterPath("OWNER")` was read as the path `("O", "W", "N", "E", "R")`. `ParameterPath`,
   `ResultSelector`, `IdentitySpec.item_path`, `IdentityComponent.item_path`, `CompositeIdentitySpec.components`, the `ResultErrorSpec`
-  paths, `CursorSpec.item_path` and `timestamp_path`, positional control paths, and
+  paths, `CursorSpec.item_path`, `InclusiveWindowTraversal.timestamp_path`, positional control paths
+  (declared or written), and
   `RetryPolicy.transient_api_codes` and `AmbiguityPolicy.refusal_api_codes` now refuse `str` and
   `bytes`. Pass a tuple or list: `ParameterPath(("OWNER",))`.
 - **`FrozenMapping` freezes what it holds** when it is built directly, as it already did inside a

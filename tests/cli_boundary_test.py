@@ -120,6 +120,9 @@ def test_help_and_usage_errors_reach_the_streams_main_was_given_as_plain_text(
 ) -> None:
     """Every parser writes to ``main``'s streams, never coloured: Python 3.14 would colour for a forced terminal."""
     monkeypatch.setenv("FORCE_COLOR", "1")
+    # Either would silence colour before FORCE_COLOR is read, hiding the colour the parser must turn off itself.
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("PYTHON_COLORS", raising=False)
     usage = " ".join(("usage: b24api", *command))
     stdout = io.StringIO()
 
