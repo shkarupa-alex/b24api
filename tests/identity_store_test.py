@@ -65,7 +65,7 @@ def _pages(*pages: Sequence[int], total: int | None = None) -> Callable[[Request
 
     def handler(request: Request) -> WireResponse:
         start = request.copy_parameters().get("start", 0)
-        if start not in by_offset:
+        if not isinstance(start, int) or start not in by_offset:
             raise AssertionError(f"traversal requested undeclared offset {start}")
         payload: dict[str, object] = {"result": [{"ID": value} for value in by_offset[start]]}
         following = start + len(by_offset[start])
