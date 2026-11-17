@@ -14,6 +14,7 @@ from b24api.contracts import (
     FrozenMapping,
     IdentityCoercion,
     IdentityComponent,
+    InclusiveWindowTraversal,
     ParameterUpdate,
     ResultErrorSpec,
 )
@@ -45,6 +46,7 @@ _ARGUMENTS = PositionalArguments((Present({"a": 1}),), "layout", layout=_LAYOUT)
         lambda: PositionalLayout("layout", (SlotContract("a", SlotShape.ANY),), frozenset({"0a"})),  # type: ignore[arg-type]
         lambda: _ARGUMENTS.write_control("0a", 1),  # type: ignore[arg-type]
         lambda: _ARGUMENTS.write_control(b"0a", 1),  # type: ignore[arg-type]
+        lambda: InclusiveWindowTraversal(None, None, "DATE", None, None, None, 1),  # type: ignore[arg-type]
     ],
     ids=[
         "parameter-path",
@@ -62,6 +64,7 @@ _ARGUMENTS = PositionalArguments((Present({"a": 1}),), "layout", layout=_LAYOUT)
         "positional-control-path",
         "positional-write-control",
         "positional-write-control-bytes",
+        "inclusive-window-timestamp-path",
     ],
 )
 def test_a_bare_string_where_a_sequence_of_parts_is_expected_is_refused(build: object) -> None:
