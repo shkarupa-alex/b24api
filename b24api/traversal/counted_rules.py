@@ -88,10 +88,10 @@ class EmptyHeadFacts:
 def empty_source_head_eligible(facts: EmptyHeadFacts) -> bool:
     """Return whether an unvalidated head may witness an empty source.
 
-    Only the first page at offset zero of an exact-total traversal (counted or sequential) qualifies, with empty source and adapted rows, no
-    usable total, no continuation, no fixed step, no earlier exact total and no caller-declared
-    qualified-total confirmation. ``-1`` is the unknown-total sentinel and never counts as zero, and
-    ``next=0`` is a continuation, not its absence.
+    Only the first page at offset zero of an exact-total traversal (counted or sequential) qualifies,
+    with empty source and adapted rows, no usable total, no continuation, no fixed step, no earlier
+    exact total and no caller-declared qualified-total confirmation. ``-1`` is the unknown-total
+    sentinel and never counts as zero, and ``next=0`` is a continuation, not its absence.
     """
     return (
         not facts.fixed_step
