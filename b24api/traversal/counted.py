@@ -17,7 +17,7 @@ from b24api.contracts.policy import (
     SnapshotState,
 )
 from b24api.contracts.report import retain_page_trace
-from b24api.errors import B24ApiError, CapabilityError, IncompleteTraversalError
+from b24api.errors import B24ApiError, IncompleteTraversalError, PaginationError
 from b24api.execution.context import latch_escape
 from b24api.execution.failure import CANCELLED_REASON
 from b24api.execution.failure import attach_report as _attach_report
@@ -149,8 +149,9 @@ class CountedItemStream:
             raise
         except Exception as error:
             primary = error
-            snapshot = await self._context.snapshot()
-            if isinstance(error, CapabilityError) and snapshot.counters.physical_requests == 0:
+            if not isinstance(error, PaginationError | IncompleteTraversalError):
+                # As in ``iter_list``: a typed failure leaves as raised on a FAILED report; only a broken
+                # pagination invariant makes the traversal incomplete.
                 await self._finalize(KernelState.FAILED, type(error).__name__)
                 _attach_report(error, self.report)
                 raise

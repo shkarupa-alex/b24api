@@ -27,6 +27,8 @@ from b24api.contracts import (
     KeysetSpec,
     NotExecutedReason,
     OffsetSpec,
+    PageOutcome,
+    PageRejectionCode,
     ParameterPath,
     ParameterUpdate,
     ReferenceComplete,
@@ -57,6 +59,7 @@ from b24api.errors import (
     FailurePhase,
     IncompleteTraversalError,
     InputSourceError,
+    PaginationError,
     ReferenceFailed,
     TransportError,
 )
@@ -298,7 +301,7 @@ async def test_public_counted_traversal_above_100k_uses_declared_identity_budget
 
 
 @pytest.mark.asyncio
-async def test_counted_identity_budget_stops_before_admitting_an_overflow_page() -> None:
+async def test_counted_identity_budget_refuses_a_range_it_cannot_hold_at_its_head() -> None:
     def handler(request: Request) -> object:
         if request.method != "batch":
             return {
@@ -323,14 +326,16 @@ async def test_counted_identity_budget_stops_before_admitting_an_overflow_page()
         policy=ExecutionPolicy(max_identity_keys=PAGE_SIZE + 1),
     )
 
-    assert len([await anext(stream) for _index in range(PAGE_SIZE)]) == PAGE_SIZE
-    with pytest.raises(IncompleteTraversalError) as captured:
+    # The head's exact total already exceeds the identity budget: the range is refused before any row.
+    with pytest.raises(BudgetExceededError, match="identity evidence budget"):
         await anext(stream)
 
-    assert isinstance(captured.value.error, BudgetExceededError)
     assert stream.report is not None
     assert stream.report.state is TerminalState.INCOMPLETE
-    assert stream.report.emitted == PAGE_SIZE
+    assert stream.report.emitted == 0
+    assert [(record.outcome, record.rejection_code) for record in stream.report.page_trace] == [
+        (PageOutcome.REJECTED, PageRejectionCode.BUDGET_EXHAUSTED)
+    ]
 
 
 @pytest.mark.slow
@@ -1449,7 +1454,8 @@ async def test_reference_traversal_enforces_its_local_page_cap_without_a_wire_li
 
 @pytest.mark.asyncio
 async def test_reference_incomplete_maps_to_typed_failure_not_unknown() -> None:
-    transport = ResponderTransport(lambda _request: {"result": [{"ID": 1}]})
+    # Every page names a next offset and returns the same row, so the second page repeats the first.
+    transport = ResponderTransport(lambda _request: {"result": [{"ID": 1}], "next": 1})
     correlation = object()
     stream = _client(transport).iter_reference_outcomes(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
@@ -1691,13 +1697,13 @@ def test_injected_transport_host_must_match_settings_before_io() -> None:
 
 @pytest.mark.asyncio
 async def test_iter_list_is_sequential_mechanics_only_and_report_is_post_cleanup() -> None:
-    pages = {0: [{"ID": 1}, {"ID": 2}], 2: [{"ID": 3}], 3: []}
+    pages = {0: [{"ID": 1}, {"ID": 2}], 2: [{"ID": 3}]}
 
     def handler(request: Request) -> object:
         start = request.copy_parameters().get("start", 0)
         assert isinstance(start, int)
         assert not isinstance(start, bool)
-        return {"result": pages[start]}
+        return {"result": pages[start], "next": 2} if start == 0 else {"result": pages[start]}
 
     transport = ResponderTransport(handler)
     stream = _client(transport).iter_list(Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE))
@@ -1706,7 +1712,7 @@ async def test_iter_list_is_sequential_mechanics_only_and_report_is_post_cleanup
     rows = [item async for item in stream]
 
     assert rows == [{"ID": 1}, {"ID": 2}, {"ID": 3}]
-    assert [request.copy_parameters()["start"] for request in transport.requests] == [0, 2, 3]
+    assert [request.copy_parameters()["start"] for request in transport.requests] == [0, 2]
     assert stream.report is not None
     assert stream.report.state is TerminalState.COMPLETED
     assert stream.report.assurance is TraversalAssurance.MECHANICS_ONLY
@@ -1890,18 +1896,21 @@ async def test_counted_traversal_preserves_frozen_request_shape_and_exact_identi
 
 
 @pytest.mark.asyncio
-async def test_counted_missing_in_band_stride_fails_incomplete() -> None:
+async def test_counted_head_without_next_short_of_its_total_fails_incomplete() -> None:
+    # The head has no next, so it is the source's last page, yet it holds one row of the two the total counts.
     transport = ResponderTransport(lambda _request: {"result": [{"ID": 1}], "total": 2})
     stream = _client(transport).iter_list_counted(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=_identity(),
     )
 
-    assert await anext(stream) == {"ID": 1}
     with pytest.raises(IncompleteTraversalError, match="did not complete") as captured:
         await anext(stream)
 
-    assert type(captured.value).__name__ == "IncompleteTraversalError"
+    cause = captured.value.__cause__
+    assert isinstance(cause, PaginationError)
+    assert cause.rejection_code is PageRejectionCode.TOTAL_DRIFT
+    assert len(transport.requests) == 1
     assert stream.report is not None
     assert stream.report.state is TerminalState.INCOMPLETE
 

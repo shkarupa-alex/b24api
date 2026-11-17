@@ -344,7 +344,7 @@ async def library_probes(webhook: str) -> list[dict[str, object]]:
 
         # Counted reference traversals: R2 per binding, batched (BatchDispatch is required). R2 applies only
         # where the continuation is not FIXED_STEP, so each recipe also runs with the default continuation
-        # (SERVER_NEXT_OR_OBSERVED_COUNT), whose terminal pages R2 must accept.
+        # (SERVER_NEXT), whose terminal pages R2 must accept.
         comments = _read("crm.timeline.comment.list", {"filter": {"ENTITY_TYPE": "deal"}, "select": ["ID"]})
         by_deal: list[tuple[JsonValue, ParameterPath]] = [
             (deal_id, ParameterPath(("filter", "ENTITY_ID"))) for deal_id in deal_ids[:5]

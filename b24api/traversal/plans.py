@@ -40,6 +40,8 @@ _LAST_ID_PATH = ParameterPath(("LAST_ID",))
 class OffsetTerminalRule(StrEnum):
     """Explicit offset termination evidence."""
 
+    # A page without the server's ``next`` ends a server-next traversal; nothing is requested past it.
+    NO_CONTINUATION = "no_continuation"
     EMPTY_PAGE = "empty_page"
     QUALIFIED_TOTAL = "qualified_total"
     SPARSE_RAW_BOUND = "sparse_raw_bound"
@@ -56,7 +58,6 @@ class CountedOffsetMode(StrEnum):
 class KeysetTerminalRule(StrEnum):
     """Explicit keyset terminal evidence."""
 
-    BOUNDARY_ID_SEEN = "boundary_id_seen"
     EMPTY_CONFIRMATION = "empty_confirmation"
 
 
@@ -120,8 +121,8 @@ class OffsetSequentialPlan(PlanContract):
     offset_path: ParameterPath = _START_PATH
     limit_path: ParameterPath | None = None
     requested_page_size: int | None = None
-    continuation: OffsetContinuation = OffsetContinuation.SERVER_NEXT_OR_OBSERVED_COUNT
-    terminal: frozenset[OffsetTerminalRule] = frozenset({OffsetTerminalRule.EMPTY_PAGE})
+    continuation: OffsetContinuation = OffsetContinuation.SERVER_NEXT
+    terminal: frozenset[OffsetTerminalRule] = frozenset({OffsetTerminalRule.NO_CONTINUATION})
     allow_create_controls: bool = True
     fixed_step: int | None = None
     initial_control: int = 0
@@ -140,8 +141,7 @@ class OffsetSequentialPlan(PlanContract):
             raise TypeError("terminal rules must be OffsetTerminalRule values")
         _validate_page_size(self.limit_path, self.requested_page_size)
         _require_disjoint_paths(self.offset_path, self.limit_path)
-        if not self.terminal:
-            raise ValueError("offset plan requires at least one terminal rule")
+        _validate_offset_end(self)
         if OffsetTerminalRule.QUALIFIED_TOTAL in self.terminal and self.total_semantics not in {
             TotalSemantics.FILTERED_EXACT,
             TotalSemantics.ADVISORY,
@@ -173,6 +173,21 @@ class OffsetSequentialPlan(PlanContract):
         if not isinstance(self.allow_empty_after_short_window, bool):
             raise TypeError("allow_empty_after_short_window must be a boolean")
         _validate_declared_short_page(self)
+
+
+def _validate_offset_end(plan: OffsetSequentialPlan) -> None:
+    """Require a server-next traversal to end at its missing ``next`` and every other one at an empty page.
+
+    The server's ``next`` both continues and ends a server-next traversal: a page past its end would be
+    answered by a rounding endpoint with its last page again, never an empty one.
+    """
+    if not plan.terminal:
+        raise ValueError("offset plan requires at least one terminal rule")
+    server_next = plan.continuation is OffsetContinuation.SERVER_NEXT
+    if server_next != (OffsetTerminalRule.NO_CONTINUATION in plan.terminal) or (
+        server_next and OffsetTerminalRule.EMPTY_PAGE in plan.terminal
+    ):
+        raise ValueError("server-next continuation is closed by its missing next, never by an empty page")
 
 
 def _validate_declared_short_page(plan: OffsetSequentialPlan) -> None:
@@ -208,7 +223,7 @@ class CountedOffsetPlan(PlanContract):
     requested_page_size: int | None = None
     fixed_stride: int | None = None
     allow_create_controls: bool = True
-    continuation: OffsetContinuation = OffsetContinuation.SERVER_NEXT_OR_OBSERVED_COUNT
+    continuation: OffsetContinuation = OffsetContinuation.SERVER_NEXT
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
@@ -319,8 +334,9 @@ def _validate_cursor_page_contract(plan: ItemCursorPlan) -> None:
     if plan.page_order not in {None, "asc", "desc"}:
         raise ValueError("cursor page_order must be asc, desc or None")
     reversed_page = plan.page_order is not None and plan.page_order != plan.direction
-    if reversed_page and plan.cursor_take != "first":
-        raise ValueError("a reversed cursor page order requires cursor_take first")
+    if reversed_page != (plan.cursor_take == "first"):
+        # The boundary is the page extreme nearest the next page: the first row only of a reversed page.
+        raise ValueError("cursor_take first is valid exactly for a page order opposite to the direction")
     if reversed_page and plan.order_semantics is not OrderSemantics.UNORDERED:
         raise ValueError("a reversed cursor page order has no global row order")
     if plan.response_terminal is not None and not isinstance(plan.response_terminal, ResponseFlagTerminal):

@@ -16,7 +16,7 @@ from b24api.batch.outcome import BatchFailure, BatchSuccess, settlement_of
 from b24api.batch.stream import _BatchOutcomeStream
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
-from b24api.errors import B24ApiError, CapabilityError, IncompleteTraversalError
+from b24api.errors import B24ApiError, BudgetExceededError, CapabilityError, IncompleteTraversalError
 from b24api.execution.facts import settlement
 
 if TYPE_CHECKING:
@@ -311,18 +311,23 @@ class DirectCountedWaveIO:
         head_rows: int,
         batch_size: int,
     ) -> int:
-        """Refuse a tail the operation budgets cannot hold; return the physical batch size that fits."""
+        """Refuse a range the operation budgets cannot hold; return the physical batch size that fits.
+
+        The exact total is known from the head, so a range the page, row buffer, request or identity budget
+        cannot hold is refused before any of its rows is delivered.
+        """
         policy = ctx.context.policy
         tail_pages = (total - 1) // stride if total > head_rows else 0
         budget = await ctx.context.snapshot()
         if budget.counters.logical_pages + tail_pages > policy.max_pages:
-            raise CapabilityError("parallel counted traversal exceeds the logical page budget")
+            raise BudgetExceededError("parallel counted traversal exceeds the logical page budget")
         if tail_pages and stride > policy.max_buffered_rows:
-            raise CapabilityError("parallel counted page exceeds the decoded row buffer budget")
+            raise BudgetExceededError("parallel counted page exceeds the decoded row buffer budget")
         fitted = min(batch_size, max(1, policy.max_buffered_rows // stride))
         minimum_tail_requests = (tail_pages + fitted - 1) // fitted
         if budget.counters.physical_requests + minimum_tail_requests > policy.max_requests:
-            raise CapabilityError("parallel counted traversal exceeds the physical request budget")
+            raise BudgetExceededError("parallel counted traversal exceeds the physical request budget")
+        ctx.ensure_identity_capacity(total)
         return fitted
 
     def open_tail(

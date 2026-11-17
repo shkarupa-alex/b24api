@@ -1,7 +1,7 @@
 """#24: a cursor page order independent of the boundary direction, and a response-flag terminal (A24)."""
 
 from __future__ import annotations
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import pytest
 
@@ -331,5 +331,20 @@ def test_a24_reversed_page_order_requires_first_take_and_keeps_old_defaults() ->
             "first",
             None,
             True,  # noqa: FBT003 - positional field order is part of the pinned contract
+            page_order="ascending",
             continuation=ResultSelector(("hasPrevPage",)),  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("page_order", [None, "descending"])
+def test_first_take_on_a_page_in_cursor_order_is_refused(page_order: Literal["descending"] | None) -> None:
+    """take='first' on a page in cursor order reads the rest of that page again; refused before I/O."""
+    with pytest.raises(ValueError, match="requires a page_order opposite"):
+        CursorSpec(
+            ParameterPath(("lastId",)),
+            ("id",),
+            IdentityCoercion.EXACT_INTEGER,
+            "descending",
+            "first",
+            page_order=page_order,
         )

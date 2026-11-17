@@ -55,7 +55,13 @@ class PageOutcome(StrEnum):
 
 
 class PageRejectionCode(StrEnum):
-    """Bounded page-level rejection categories."""
+    """Bounded page-level rejection categories.
+
+    ``RANGE_CONTRADICTION`` is a broken pagination invariant without a narrower code (an offset or
+    cursor that does not advance, a page over its cap, an end short of its range). A refusal that is no
+    pagination invariant keeps its own category: a spent budget, an unmet capability contract, a
+    failed caller identity store, or an unexpected failure of the library or the caller's code.
+    """
 
     DUPLICATE_IDENTITY = "duplicate_identity"
     REPEATED_FINGERPRINT = "repeated_fingerprint"
@@ -66,9 +72,12 @@ class PageRejectionCode(StrEnum):
     IDENTITY_CONTRACT = "identity_contract"
     AMBIGUOUS_EXECUTION = "ambiguous_execution"
     BATCH_ENVELOPE = "batch_envelope"
-    NOT_EXECUTED = "not_executed"
     TRANSACTION_ABORTED = "transaction_aborted"
     PAGE_ADAPTATION = "page_adaptation"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    CAPABILITY_CONTRACT = "capability_contract"
+    IDENTITY_STORE = "identity_store"
+    INTERNAL_FAILURE = "internal_failure"
 
 
 @dataclass(frozen=True, slots=True)

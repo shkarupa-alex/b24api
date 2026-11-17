@@ -88,8 +88,8 @@ Four things are at work:
   `async with` closes it. `Bitrix24()` reads the same URL from the environment.
 - **The request.** `Request.bare()` names a REST method and its parameters and sends them to the
   classic `/rest/` endpoint. The route is always explicit: `Request.v3()` targets the V3 API.
-- **`iter_list()`.** It walks the list page by page and reads one more, empty, page to confirm
-  the end.
+- **`iter_list()`.** It walks the list page by page, following the server's `next`, and stops at
+  the page that has none.
 - **The report.** `deals.report` says how the traversal ended. `completed` means every page was
   read; a traversal that stops early or fails records why.
 
@@ -369,7 +369,7 @@ more specialized mechanics have explicit names and explicit preconditions.
 
 | Operation | Use it when | Network mechanics | Completion proof |
 |---|---|---|---|
-| `iter_list` | The method supports ordinary offset pagination. | Sequential requests follow server `next` (the next offset). Ordinary counted Bitrix list endpoints do server-side COUNT for `total` plus LIMIT/OFFSET page retrieval. | Continuation and empty terminal page; add identity for duplicate detection. |
+| `iter_list` | The method supports ordinary offset pagination. | Sequential requests follow server `next` (the next offset). Ordinary counted Bitrix list endpoints do server-side COUNT for `total` plus LIMIT/OFFSET page retrieval. | The last page carries no `next`; a reported `total` must match the rows read; add identity for duplicate detection. |
 | `iter_list_counted` | The first response provides an exact filtered `total` and stable offset pages. | Head page is direct; all known tail offsets are grouped into physical Bitrix batches. | Exact total, ranges and identities. |
 | `iter_list_keyset` | The method may omit `total`, but reliably supports ordering and filtering by a unique integer identity. | Auto by default: it plans first, then selects boundary-only, sequential, range, or partitioned execution; runtime sends no diagnostic canaries. | Caller-asserted keyset contract, strict monotonic identity, active bound validation, and terminal empty confirmation. |
 | `iter_list_cursor` | Each next request depends on a cursor from the previous response. | Sequential dependent cursor requests. | Strict unique monotonic cursor and empty terminal page. |
@@ -387,7 +387,7 @@ exact `limit_path`; the client never guesses method-specific parameter names.
 ![List traversal comparison](https://raw.githubusercontent.com/shkarupa-alex/b24api/master/list-traversal-comparison.svg)
 
 The animation replays traces executed against a scripted portal with 1,000 dense IDs at 50 rows
-per page. `iter_list` sends 20 pages and one empty confirmation (21 HTTP). `iter_list_counted` sends
+per page. `iter_list` sends 20 pages and stops at the one without `next` (20 HTTP). `iter_list_counted` sends
 the head and one batch of 19 pages (2 HTTP). `iter_list_keyset` in auto mode selects range
 execution: it reads both ends of the range in one batch, the 19 ranges between them in a second, and
 confirms the end with one call for `ID > 1000` (3 HTTP). A `BoundedIdentityRange` with a qualified
@@ -397,14 +397,28 @@ auto chooses from the observed geometry, so the plan and its request count can d
 
 ### Sequential offset
 
-This is the canonical default. It follows the `next` returned by the server and confirms the end
-with an empty page. For ordinary counted Bitrix list endpoints, `next` is an offset for the next
+This is the canonical default. It follows the `next` returned by the server and ends at the first
+page without one. For ordinary counted Bitrix list endpoints, `next` is an offset for the next
 LIMIT/OFFSET page, not a keyset cursor. Producing `total` involves a separate server-side count
 query in addition to retrieving the page. These database operations are performed inside the same
 REST request: the client does not issue an additional HTTP call just for the count. This distinction
 matters for performance: not making a separate HTTP count call does **not** mean avoiding server-side
-COUNT work. `iter_list` does not suppress that work; a returned `total` is observational and does not
-control this strategy's completion. Exact database implementation is endpoint-specific.
+COUNT work. `iter_list` does not suppress that work; a returned `total` never ends this strategy,
+but it is checked against the rows read at the end (below). Exact database implementation is
+endpoint-specific.
+
+Nothing is requested past the last page. Many endpoints cannot answer such a request with an empty
+page: `crm.lead.list`, `crm.deal.list`, `crm.activity.list` and `tasks.task.list` round `start` down to
+a multiple of 50 and answer a `start` at or past the end with their last page again, and
+`department.get` ignores `start` and always returns everything without `next`. The page without
+`next` is therefore the end on every Bitrix list endpoint. A Bitrix list `total` counts the filter's
+rows, so when the traversal started at the first page, a `total` reported by the last page (or, if
+it has none, by the latest page that had one) must equal the number of rows read; otherwise the traversal raises `IncompleteTraversalError` caused by a
+`PaginationError` with the `total_drift` page rejection, and the report is `incomplete`, never
+`completed`. An endpoint whose `total` is not an exact count of its rows can declare that with
+`ConsistencyPolicy(total_semantics=TotalSemantics.ADVISORY)`: a mismatch is then the
+`advisory_total_mismatch` warning. `TotalSemantics.GLOBAL` declares a `total` that counts every row of
+the endpoint rather than the filter's, so it is never compared with the rows read.
 
 <!-- tested: tests/client_v2_test.py::test_iter_list_is_sequential_mechanics_only_and_report_is_post_cleanup -->
 ```python
@@ -446,10 +460,20 @@ are read before a `page_adapter` runs, so an adapter never sees a row that break
 without a leading zero, with a minus only before a non-zero value (`"0"`, `"12"`, `"-7"`). `"012"`,
 `" 12"`, `"1_2"` and `"+12"` are refused, so two different wire values never become one identity.
 
-`OffsetContinuation.SERVER_NEXT` requires `TotalTermination.EXACT_QUALIFIED`. It never continues
-without `next`, and the last Bitrix page carries rows but no `next`, so only an exact total can close
-it; `OffsetSpec` refuses the combination without the total with `ValueError`. Without a qualified
-total use the default `SERVER_NEXT_OR_OBSERVED_COUNT`, which confirms the end with an empty page.
+`OffsetContinuation.SERVER_NEXT` is the default. An endpoint that honors `start` exactly but sends no
+`next` declares `OffsetContinuation.OBSERVED_COUNT`: the next offset is the current one plus the rows
+read, and an empty page ends the traversal. Such an endpoint has no Bitrix list envelope, so its
+`total` is not read unless the caller qualifies it (`EXACT_QUALIFIED`, or an `ADVISORY` comparison);
+the same holds for `FIXED_STEP`. An empty page that still carries `next` is refused only where `next`
+is followed, under `SERVER_NEXT`; cursor, continuation and window traversals, an observed count and a
+fixed step do not read it. `ConsistencyPolicy(confirmation_policy=EMPTY_AFTER_BOUNDARY)`
+asks for such an empty page, so it is refused with `CapabilityError` before any request under
+`SERVER_NEXT`, whose end is the page without `next`.
+`TotalTermination.EXACT_QUALIFIED` requires every page to carry the same exact `total` and the rows
+to reach it; under `OBSERVED_COUNT` or `FIXED_STEP` the page that reaches it ends the traversal
+without an empty confirmation. A first page with no rows, no `next` and no usable `total` (missing,
+`null` or `-1`, as `user.get` answers a filter that matches nothing) completes as an observed empty
+source, as it does for `iter_list_counted` below.
 
 An endpoint that honors `start` only at a fixed server window and signals its end only with a
 shorter page (no usable `total`, no `next`) can declare that stop rule with
@@ -497,17 +521,23 @@ stream = client.iter_list_counted(
 ```
 
 Use it only when `total` is exact for the supplied filter and offset pages are stable. Any missing
-range, overlap, duplicate identity or total contradiction raises `IncompleteTraversalError`.
+range, overlap, duplicate identity or total contradiction, a head without `next` short of its `total`
+included, raises `IncompleteTraversalError`. As in `iter_list`, every other failure (an API error, a
+missing `total`, a result of the wrong shape, a spent budget) is raised as it is, and the report says
+`failed` (`incomplete` for a budget). The exact `total` is known from the head, so a range the page,
+request, row-buffer or in-memory identity budget cannot hold is refused right there with
+`BudgetExceededError`, before any row is yielded; the head is traced as rejected with the
+`budget_exhausted` page rejection.
 
 A filtered call that matches nothing may omit `total` entirely, as `user.get` does with
 `result: []`. A first page with no rows, no `next` and no usable `total` (missing, `null`, or the
 `-1` unknown sentinel) therefore completes as an observed empty source after that one request: the
 report is `completed` and `exhausted`, but its assurance is `mechanics_only` (`identity_exact` with an
 identity), never a count-matched claim, and no total is invented. A first page that reports
-`total: 0` keeps the count-matched result. Rows without a usable total, a remaining `next`, a
-positive total with no rows, a fixed step, or a `ConsistencyPolicy` whose `confirmation_policy` is
-`QUALIFIED_TOTAL` (from `b24api.contracts.policy.ConfirmationPolicy`) stay strict and raise
-`IncompleteTraversalError`.
+`total: 0` keeps the count-matched result. Rows without a usable total, a remaining `next`, a fixed
+step, or a `ConsistencyPolicy` whose `confirmation_policy` is `QUALIFIED_TOTAL` (from
+`b24api.contracts.policy.ConfirmationPolicy`) stay strict and raise `CapabilityError`; a positive
+total with no rows raises `IncompleteTraversalError`.
 
 Physical batching reduces HTTP exchanges, but does not suppress server-side COUNT in ordinary
 counted list subrequests. Each command still performs its own offset page retrieval and associated

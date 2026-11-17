@@ -11,7 +11,7 @@ from b24api import BatchDispatch, Bitrix24, ReplaySafety, Request, Settings
 from b24api.contracts import Command, CommandFailure, CommandSettlement
 from b24api.contracts.policy import ExecutionPolicy, RetryPolicy
 from b24api.contracts.request import RouteKind
-from b24api.errors import BudgetExceededError, ClientClosedError, IncompleteTraversalError
+from b24api.errors import BudgetExceededError, ClientClosedError
 from b24api.execution import CoordinatorState, Executor, RateCoordinator, WireResponse, WorkClass
 from b24api.execution.cleanup import close_owned_resources
 from b24api.execution.facts import execution
@@ -149,14 +149,14 @@ async def test_a_closed_coordinator_stops_a_flat_counted_head_which_is_not_trace
                 pass
 
     try:
-        with pytest.raises(IncompleteTraversalError) as raised:
+        # As in ``iter_list``, the stop leaves as raised, not wrapped as a broken pagination invariant.
+        with pytest.raises(ClientClosedError):
             await drain()
     finally:
         await client.aclose()
         await transport.aclose()
         await http.aclose()
 
-    assert isinstance(raised.value.__cause__, ClientClosedError)
     report = stream.report
     assert report is not None
     assert report.physical_requests == 0

@@ -99,11 +99,16 @@ async def test_unique_identity_admits_rows_that_repeat_outside_it() -> None:
 # --- server-next closure --------------------------------------------------------------------------
 
 
-def test_server_next_without_exact_total_is_refused_at_construction() -> None:
-    with pytest.raises(ValueError, match="EXACT_QUALIFIED"):
-        OffsetSpec(continuation=OffsetContinuation.SERVER_NEXT)
-    with pytest.raises(ValueError, match="EXACT_QUALIFIED"):
-        OffsetSpec(continuation=OffsetContinuation.SERVER_NEXT, total_termination=TotalTermination.DISABLED)
+@pytest.mark.asyncio
+async def test_server_next_without_exact_total_closes_on_the_bitrix_last_page() -> None:
+    rows: list[dict[str, object]] = [{"ID": index} for index in range(1, 6)]
+    transport = _bitrix_offset(rows)
+    offset = OffsetSpec(continuation=OffsetContinuation.SERVER_NEXT, total_termination=TotalTermination.DISABLED)
+    stream = client_for(transport).iter_list(_LIST, page_size=2, identity=_ID, offset=offset)
+
+    assert [row async for row in stream] == rows
+    assert _report(stream).terminal_reason == "page without continuation ended the source"
+    assert len(transport.requests) == len(range(0, len(rows), 2))
 
 
 @pytest.mark.asyncio

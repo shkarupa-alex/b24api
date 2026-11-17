@@ -38,10 +38,18 @@ DECLARED_SHORT_PAGE_MINIMUM_WIDTH = 2
 
 
 class OffsetContinuation(StrEnum):
-    """Caller-declared offset progression source."""
+    """Caller-declared offset progression source and the end it implies.
+
+    ``SERVER_NEXT`` is the Bitrix list contract: every page with more rows carries ``next``, the
+    offset of the following page, and the last page carries none. A page without ``next`` therefore
+    ends the source; no request is sent past it, because endpoints that round ``start`` down to
+    their page width answer such a request with their last page again, not with an empty one.
+    ``OBSERVED_COUNT`` is for an endpoint that honors ``start`` exactly and sends no ``next``: the
+    next offset is the current one plus the rows read, and an empty page ends the source.
+    ``FIXED_STEP`` advances by a declared step.
+    """
 
     SERVER_NEXT = "server_next"
-    SERVER_NEXT_OR_OBSERVED_COUNT = "server_next_or_observed_count"
     OBSERVED_COUNT = "observed_count"
     FIXED_STEP = "fixed_step"
 
@@ -181,7 +189,8 @@ def _validate_offset_extensions(spec: OffsetSpec) -> None:  # noqa: C901 - close
     if spec.page_index is not None:
         if not isinstance(spec.page_index, PageIndex) or spec.parameter_path != spec.page_index.control_path:
             raise ValueError("page_index control_path must equal the offset parameter_path")
-        if spec.continuation is not OffsetContinuation.SERVER_NEXT_OR_OBSERVED_COUNT or spec.step is not None:
+        if spec.continuation is not OffsetContinuation.SERVER_NEXT or spec.step is not None:
+            # The page index owns progression: the continuation stays at its default and is not used.
             raise ValueError("page_index owns progression and cannot combine with offset continuation")
         if spec.total_termination is not TotalTermination.DISABLED:
             raise ValueError("page_index requires explicit empty-page closure")
@@ -227,7 +236,7 @@ class OffsetSpec:
     parameter_path: ParameterPath = _START
     limit_path: ParameterPath | None = None
     allow_create_controls: bool = True
-    continuation: OffsetContinuation = OffsetContinuation.SERVER_NEXT_OR_OBSERVED_COUNT
+    continuation: OffsetContinuation = OffsetContinuation.SERVER_NEXT
     step: int | None = None
     total_termination: TotalTermination = TotalTermination.DISABLED
     page_index: PageIndex | None = None
@@ -249,16 +258,6 @@ class OffsetSpec:
                 raise ValueError("fixed-step offset requires a positive integer step")
         elif self.step is not None:
             raise ValueError("step is valid only for fixed-step continuation")
-        if (
-            self.continuation is OffsetContinuation.SERVER_NEXT
-            and self.total_termination is not TotalTermination.EXACT_QUALIFIED
-        ):
-            # SERVER_NEXT refuses a non-empty page without ``next``, and an empty page may close it only
-            # after a ``next`` led there. Bitrix omits ``next`` on its last, non-empty page, so only an
-            # exact qualified total can close the traversal.
-            raise ValueError(
-                "server-next continuation requires TotalTermination.EXACT_QUALIFIED: the last page omits next",
-            )
 
 
 _COUNTED_OFFSET = OffsetSpec(total_termination=TotalTermination.EXACT_QUALIFIED)
@@ -346,9 +345,14 @@ class CursorSpec:
             raise ValueError("take must be first or last")
         if self.page_order is not None and self.page_order not in {"ascending", "descending"}:
             raise ValueError("page_order must be ascending, descending or None")
-        if self.page_order is not None and self.page_order != self.direction and self.take != "first":
+        reversed_page = self.page_order is not None and self.page_order != self.direction
+        if reversed_page and self.take != "first":
             # The next boundary is the page extreme nearest the next page: the first row of a reversed page.
             raise ValueError("a page order opposite to the cursor direction requires take='first'")
+        if self.take == "first" and not reversed_page:
+            # On a page in cursor order the first row is the one nearest the previous boundary: the next
+            # request would read the rest of that page again.
+            raise ValueError("take='first' requires a page_order opposite to the cursor direction")
         if self.continuation is not None and not isinstance(self.continuation, ResponseFlagTerminal):
             raise TypeError("continuation must be a ResponseFlagTerminal or None")
         if not isinstance(self.domain, CursorDomain):

@@ -46,6 +46,8 @@ MAPPING_MODES = (ResultCollectionShape.MAPPING_VALUES, ResultCollectionShape.MAP
 PAGES = {"101": (10, 1, 0), "202": (1, 0)}
 TOTAL_ROWS = 12
 WAVES = [2, 2, 1]
+# An offset traversal ends at the page without ``next``, so it never asks for the empty pages.
+OFFSET_WAVES = [2, 1]
 
 
 def _empty(shape: ResultCollectionShape) -> object:
@@ -121,7 +123,7 @@ async def test_a26_sequential_references_read_mapping_pages_in_one_shared_queue(
     assert len(items) == TOTAL_ROWS
     assert sorted(complete.correlation for complete in completes) == ["101", "202"]
     assert all(complete.exhausted for complete in completes)
-    assert portal.waves == WAVES
+    assert portal.waves == OFFSET_WAVES
 
 
 @pytest.mark.parametrize("shape", MAPPING_MODES)

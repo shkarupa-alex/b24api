@@ -21,6 +21,8 @@ class BindingClosure(StrEnum):
     """One qualified terminal witness for an admitted binding."""
 
     SOURCE_EMPTY = "source_empty"
+    # The last page carried no server ``next``: the server's own continuation ended the source.
+    NO_CONTINUATION = "no_continuation"
     QUALIFIED_TOTAL = "qualified_total"
     RAW_RANGE_COVERED = "raw_range_covered"
     SINGLE_RESPONSE = "single_response"

@@ -780,8 +780,8 @@ def _rows_answer(*, counted: bool, fail: bool) -> Answer:
         envelope: Envelope = {"result": [{"ID": row} for row in range(offset, min(offset + size, 20))]}
         if counted:
             envelope["total"] = 20
-            if offset + size < 20:  # noqa: PLR2004 - the fixture's size
-                envelope["next"] = offset + size
+        if offset + size < 20:  # noqa: PLR2004 - the fixture's size
+            envelope["next"] = offset + size
         return envelope
 
     return answer

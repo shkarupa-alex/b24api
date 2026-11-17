@@ -493,8 +493,8 @@ async def test_a_counted_list_whose_tail_the_deadline_refuses_ends_with_the_budg
     async with client_for(portal, policy=POLICY) as client:
         error = await asyncio.wait_for(_drain(client.iter_list_counted(LIST_REQUEST, page_size=2)), timeout=HANG_BOUND)
 
-    report = _assert_ended_by_the_budget(error, IncompleteTraversalError)
-    assert isinstance(error.__cause__, BudgetExceededError)
+    # As in ``iter_list``, the budget's end leaves as raised, not wrapped as a broken pagination invariant.
+    report = _assert_ended_by_the_budget(error, None)
     assert _blocking(report) == ["budget_exhausted"]
     assert portal.waves == [1]
 
@@ -575,8 +575,7 @@ async def test_a_counted_tail_replay_the_budget_refuses_at_its_send_ends_with_th
     async with client_for(ResponderTransport(respond), policy=policy) as client:
         error = await asyncio.wait_for(_drain(client.iter_list_counted(LIST_REQUEST, page_size=2)), timeout=HANG_BOUND)
 
-    report = _assert_ended_by_the_budget(error, IncompleteTraversalError)
-    assert isinstance(error.__cause__, BudgetExceededError)
+    report = _assert_ended_by_the_budget(error, None)
     assert _blocking(report) == ["budget_exhausted"]
     assert batches == 1
 

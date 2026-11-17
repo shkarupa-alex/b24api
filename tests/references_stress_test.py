@@ -394,9 +394,10 @@ async def test_a_contended_input_frontier_sends_its_own_pages_before_a_later_hea
         async with stream:
             events = [event async for event in stream]
     sent = [(query["PARENT"], query.get("start", "0")) for query in portal.queries]
+    # Each binding ends at its page without ``next``: nothing is requested past its last rows.
     assert sent == [
-        ("p0", "0"), ("p0", "10"), ("p0", "20"), ("p0", "25"), ("p1", "0"), ("p1", "3"), ("p2", "0"),
-        ("p3", "0"), ("p3", "10"), ("p3", "20"), ("p3", "30"), ("p3", "40"), ("p3", "41"),
+        ("p0", "0"), ("p0", "10"), ("p0", "20"), ("p1", "0"), ("p2", "0"),
+        ("p3", "0"), ("p3", "10"), ("p3", "20"), ("p3", "30"), ("p3", "40"),
     ]  # fmt: skip
     completes = {event.correlation: event.row_count for event in events if isinstance(event, ReferenceComplete)}
     assert completes == {"p0": 25, "p1": 3, "p2": 0, "p3": 41}

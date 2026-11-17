@@ -277,8 +277,6 @@ def _validate_confirmation_policy(
 ) -> None:
     if policy is ConfirmationPolicy.NONE:
         return
-    if policy is ConfirmationPolicy.INDEPENDENT_ORACLE:
-        raise CapabilityError("independent oracle confirmation is unavailable inside traversal")
     if policy is ConfirmationPolicy.QUALIFIED_TOTAL:
         if total_semantics is not TotalSemantics.FILTERED_EXACT:
             raise CapabilityError("qualified-total confirmation requires filtered exact total semantics")
@@ -290,11 +288,9 @@ def _validate_confirmation_policy(
             or (isinstance(plan, ItemCursorPlan) and plan.terminal is CursorTerminalRule.EMPTY_CONFIRMATION)
         )
         if not empty_confirmed:
+            # A server-next offset traversal ends at its page without next: a request past it would be
+            # answered by a rounding endpoint with its last page again, so no empty page can confirm it.
             raise CapabilityError("plan does not provide the requested empty-boundary confirmation")
-        return
-    if policy is ConfirmationPolicy.BOUNDARY_ID_SEEN:
-        if not isinstance(plan, KeysetPlan) or plan.terminal is not KeysetTerminalRule.BOUNDARY_ID_SEEN:
-            raise CapabilityError("plan does not provide the requested boundary identity confirmation")
         return
     raise AssertionError("unhandled confirmation policy")
 
