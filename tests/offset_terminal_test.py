@@ -271,6 +271,22 @@ async def test_an_advisory_total_only_warns_when_the_rows_differ() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_global_total_is_never_compared_with_the_rows_read() -> None:
+    # A GLOBAL total counts every row of the endpoint, not the filter's: rows that differ from it end the source.
+    policy = ExecutionPolicy(consistency=ConsistencyPolicy(total_semantics=TotalSemantics.GLOBAL))
+    portal = BatchPortal(_short_source("short"))
+    stream = _client(portal).iter_list(_request(), identity=ID, policy=policy)
+
+    rows, error = await _drain(stream)
+
+    assert error is None
+    assert len(rows) == PAGE + 20
+    report = _report(stream)
+    assert report.state is TerminalState.COMPLETED
+    assert not report.violations
+
+
+@pytest.mark.asyncio
 async def test_a_traversal_resumed_past_the_first_page_does_not_compare_the_whole_total() -> None:
     portal = BatchPortal(_rounding(120))
     stream = _client(portal).iter_list(_request({"start": 100}), identity=ID)
