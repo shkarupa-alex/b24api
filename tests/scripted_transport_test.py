@@ -1,6 +1,7 @@
 """``ScriptedTransport`` matches what a call sends, as an HTTP transport would send it, and names a mismatch."""
 
 from __future__ import annotations
+import json
 
 import pytest
 
@@ -43,7 +44,8 @@ async def test_an_unmatched_call_is_named_first_and_calls_keep_the_key_order_the
         assert await client.call(_REVERSED) == ["ordered"]
 
     assert [call.request for call in transport.unexpected] == [other]
-    assert list(transport.calls[-1].copy_parameters()["order"]) == ["ID", "DATE_CREATE"]
+    assert json.dumps(transport.calls[-1].copy_parameters()) == json.dumps(_REVERSED.copy_parameters())
+    assert json.dumps(transport.calls[-1].copy_parameters()) != json.dumps(_ORDERED.copy_parameters())
     with pytest.raises(AssertionError, match=r"1 unexpected scripted request\(s\): crm.deal.get"):
         transport.assert_exhausted()
 
