@@ -125,6 +125,11 @@ def _portal(request: Request) -> object:
                 "result": {key: _page(query) for key, query in queries.items()},
                 "result_error": [],
                 "result_total": {key: len(IDS) for key, query in queries.items() if query.offset},
+                "result_next": {
+                    key: query.start + PAGE
+                    for key, query in queries.items()
+                    if query.offset and query.start + PAGE < len(IDS)
+                },
             }
         }
     query = _query(_parameters(request))
@@ -179,7 +184,8 @@ async def _lanes() -> dict[str, ResponderTransport]:
 async def test_each_lane_sends_what_the_animation_draws() -> None:
     lanes = await _lanes()
 
-    assert _sends(lanes["iter_list"]) == [("call", 1)] * 21
+    # The offset lane stops at the page without next: nothing is requested past the last page.
+    assert _sends(lanes["iter_list"]) == [("call", 1)] * PAGES
     assert _sends(lanes["iter_list_counted"]) == [("call", 1), ("batch", 19)]
     assert _sends(lanes["iter_list_keyset"]) == [("batch", 2), ("batch", 19), ("call", 1)]
     bounds, _ranges, confirmation = lanes["iter_list_keyset"].requests
@@ -219,7 +225,7 @@ async def test_the_readme_caption_quotes_the_same_traces() -> None:
     keyset = _sends(lanes["iter_list_keyset"])
     last_id = _query(_parameters(lanes["iter_list_keyset"].requests[-1])).filters[">ID"]
 
-    assert f"sends {len(lanes['iter_list'].requests) - 1} pages and one empty confirmation" in readme
+    assert f"sends {len(lanes['iter_list'].requests)} pages and stops at the one without `next`" in readme
     assert f"one batch of {_sends(lanes['iter_list_counted'])[1][1]} pages" in readme
     assert f"the {keyset[1][1]} ranges between them in a second" in readme
     assert f"one call for `ID > {last_id}`" in readme

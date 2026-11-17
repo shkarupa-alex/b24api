@@ -91,8 +91,9 @@ def _answer(method: str, query: Query) -> Envelope:
         before = query.get("BEFORE")
         return {"result": [{"ID": value} for value in ALPHA_PAGES[None if before is None else int(before)]]}
     if method == "beta.list":
-        # The same identity 4 as alpha's first row: sources never share identity state.
-        return {"result": [{"ID": 4}] if int(query.get("start", "0")) == 0 else []}
+        # The same identity 4 as alpha's first row: sources never share identity state. The first page names a
+        # second one, which is empty and names none: two pages per binding.
+        return {"result": [{"ID": 4}], "next": 1} if int(query.get("start", "0")) == 0 else {"result": []}
     if method == "gamma.list":
         offset = int(query.get("start", "0"))
         rows = [{"ID": row} for row in range(offset, min(offset + 50, 1001))]

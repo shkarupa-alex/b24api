@@ -37,7 +37,7 @@ from b24api.contracts.policy import (
 )
 from b24api.contracts.request import RouteKind
 from b24api.contracts.response import Response
-from b24api.errors import CapabilityError, IncompleteTraversalError
+from b24api.errors import CapabilityError, IncompleteTraversalError, PaginationError, ResultShapeError
 from b24api.execution import Executor
 from b24api.execution.snapshot import KernelReport
 from b24api.traversal.driver import PaginationDriver
@@ -215,35 +215,43 @@ def _incomplete_cases() -> list[object]:
     )
     qualified = ExecutionPolicy(consistency=ConsistencyPolicy(confirmation_policy=ConfirmationPolicy.QUALIFIED_TOTAL))
     return [
-        pytest.param(_payload([{"ID": 1}]), _COUNTED, None, id="nonempty-missing-total"),
-        pytest.param(_payload([{"ID": 1}], total=-1), _COUNTED, None, id="nonempty-unknown-total"),
-        pytest.param(_payload([], next_value=PAGE_SIZE), _COUNTED, None, id="empty-with-continuation"),
-        pytest.param(_payload([], total=-1, next_value=PAGE_SIZE), _COUNTED, None, id="empty-unknown-with-next"),
-        pytest.param(_payload([], total=3), _COUNTED, None, id="positive-total-no-rows"),
-        pytest.param(_payload([]), fixed_step, None, id="fixed-step"),
-        pytest.param(_payload([]), _COUNTED, qualified, id="explicit-qualified-total"),
-        pytest.param({"result": {"unexpected": "shape"}}, _COUNTED, None, id="invalid-page-shape"),
+        pytest.param(_payload([{"ID": 1}]), _COUNTED, None, CapabilityError, id="nonempty-missing-total"),
+        pytest.param(_payload([{"ID": 1}], total=-1), _COUNTED, None, CapabilityError, id="nonempty-unknown-total"),
+        pytest.param(_payload([], next_value=PAGE_SIZE), _COUNTED, None, CapabilityError, id="empty-with-continuation"),
+        pytest.param(
+            _payload([], total=-1, next_value=PAGE_SIZE), _COUNTED, None, CapabilityError, id="empty-unknown-with-next"
+        ),
+        pytest.param(_payload([], total=3), _COUNTED, None, PaginationError, id="positive-total-no-rows"),
+        pytest.param(_payload([]), fixed_step, None, CapabilityError, id="fixed-step"),
+        pytest.param(_payload([]), _COUNTED, qualified, CapabilityError, id="explicit-qualified-total"),
+        pytest.param({"result": {"unexpected": "shape"}}, _COUNTED, None, ResultShapeError, id="invalid-page-shape"),
     ]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("payload", "offset", "policy"), _incomplete_cases())
-async def test_heads_outside_the_empty_source_contract_remain_incomplete(
+@pytest.mark.parametrize(("payload", "offset", "policy", "failure"), _incomplete_cases())
+async def test_heads_outside_the_empty_source_contract_do_not_complete(
     closures: list[tuple[BindingClosure, StreamClosure, int | None]],
     payload: dict[str, object],
     offset: OffsetSpec,
     policy: ExecutionPolicy | None,
+    failure: type[Exception],
 ) -> None:
+    """A broken pagination invariant is incomplete; any other refusal fails as raised, as in ``iter_list``."""
     transport = ResponderTransport(replies(payload))
     stream = _stream(transport, offset=offset, policy=policy)
 
-    with pytest.raises(IncompleteTraversalError):
+    with pytest.raises(Exception) as caught:  # noqa: PT011 - the row names the class
         _ = [row async for row in stream]
 
+    incomplete = failure is PaginationError
+    error = caught.value.__cause__ if incomplete else caught.value
+    assert isinstance(caught.value, IncompleteTraversalError) is incomplete
+    assert isinstance(error, failure), repr(caught.value)
     assert len(transport.requests) == 1
     report = stream.report
     assert report is not None
-    assert report.state is TerminalState.INCOMPLETE
+    assert report.state is (TerminalState.INCOMPLETE if incomplete else TerminalState.FAILED)
     assert not report.exhausted
     assert report.assurance is TraversalAssurance.MECHANICS_ONLY
     assert report.terminal_reason != EMPTY_SOURCE_WITNESS.terminal_reason
@@ -253,20 +261,19 @@ async def test_heads_outside_the_empty_source_contract_remain_incomplete(
 
 
 @pytest.mark.asyncio
-async def test_later_page_without_total_remains_incomplete() -> None:
+async def test_later_page_without_total_fails_on_its_capability_contract() -> None:
     rows = [{"ID": identity} for identity in range(1, PAGE_SIZE + 1)]
     tail = _batch_tail([{"ID": PAGE_SIZE + 1}])
     transport = ResponderTransport(replies(_payload(rows, total=PAGE_SIZE + 1, next_value=PAGE_SIZE), tail))
     stream = _stream(transport, identity=_IDENTITY)
 
-    with pytest.raises(IncompleteTraversalError) as caught:
+    with pytest.raises(CapabilityError, match="non-negative total"):
         _ = [row async for row in stream]
 
-    assert isinstance(caught.value.__cause__, CapabilityError)
-    assert "non-negative total" in str(caught.value.__cause__)
     report = stream.report
     assert report is not None
-    assert report.state is TerminalState.INCOMPLETE
+    assert report.state is TerminalState.FAILED
+    assert report.page_trace[-1].rejection_code is PageRejectionCode.CAPABILITY_CONTRACT
     assert report.terminal_reason != EMPTY_SOURCE_WITNESS.terminal_reason
     assert [record.outcome for record in report.page_trace] == [PageOutcome.COMMITTED, PageOutcome.REJECTED]
     assert _source_report(stream).empty_source_witness is None
@@ -297,23 +304,23 @@ async def test_rejected_eligible_head_leaves_no_empty_source_evidence(
     monkeypatch: pytest.MonkeyPatch,
     closures: list[tuple[BindingClosure, StreamClosure, int | None]],
 ) -> None:
-    def refuse(self: CountedCompletionRecorder, identities: object, row_count: int) -> None:
-        del self, identities, row_count
+    def refuse(self: CountedCompletionRecorder, row_count: int) -> None:
+        del self, row_count
         raise CapabilityError("scripted commit refusal")
 
     monkeypatch.setattr(CountedCompletionRecorder, "validated", refuse)
     transport = ResponderTransport(replies(_payload([])))
     stream = _stream(transport)
 
-    with pytest.raises(IncompleteTraversalError):
+    with pytest.raises(CapabilityError, match="scripted commit refusal"):
         _ = [row async for row in stream]
 
     report = stream.report
     assert report is not None
-    assert report.state is TerminalState.INCOMPLETE
+    assert report.state is TerminalState.FAILED
     assert report.terminal_reason != EMPTY_SOURCE_WITNESS.terminal_reason
     last = report.page_trace[-1]
-    assert (last.outcome, last.rejection_code) == (PageOutcome.REJECTED, PageRejectionCode.RANGE_CONTRADICTION)
+    assert (last.outcome, last.rejection_code) == (PageOutcome.REJECTED, PageRejectionCode.CAPABILITY_CONTRACT)
     assert [closure for closure, _stream_closure, _total in closures] == [BindingClosure.FAILURE]
     assert _source_report(stream).empty_source_witness is None
     driver = stream._source._driver  # type: ignore[attr-defined] # noqa: SLF001

@@ -172,6 +172,22 @@ CONSTRUCTIONS = Counter(
             "OffsetStrategy._request",
             "BudgetExceededError('sparse raw page budget exhausted')",
         ): 1,
+        # A counted range whose exact total the page, row buffer or request budget cannot hold is refused at its head.
+        (
+            "traversal/counted_io.py",
+            "DirectCountedWaveIO.tail_batch_size",
+            "BudgetExceededError('parallel counted traversal exceeds the logical page budget')",
+        ): 1,
+        (
+            "traversal/counted_io.py",
+            "DirectCountedWaveIO.tail_batch_size",
+            "BudgetExceededError('parallel counted page exceeds the decoded row buffer budget')",
+        ): 1,
+        (
+            "traversal/counted_io.py",
+            "DirectCountedWaveIO.tail_batch_size",
+            "BudgetExceededError('parallel counted traversal exceeds the physical request budget')",
+        ): 1,
         # One request refused while time is left: a hold or a retry delay its window cannot carry, a send that may
         # not be repeated left less window than it waited, or no attempt left; the operation goes on.
         ("execution/executor.py", "_permit_window", "BudgetExceededError(_HOLD_REFUSAL)"): 1,

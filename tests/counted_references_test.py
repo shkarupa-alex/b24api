@@ -1153,10 +1153,10 @@ async def test_flat_counted_tail_pages_the_budget_keeps_from_their_send_are_not_
                 async for _ in stream:
                     pass
 
-        with pytest.raises(IncompleteTraversalError) as raised:
+        # As in ``iter_list``, the budget's end leaves as raised, not wrapped as a broken pagination invariant.
+        with pytest.raises(BudgetExceededError):
             await drain()
 
-    assert isinstance(raised.value.__cause__, BudgetExceededError)
     assert portal.waves == [1, 3, 1]
     report = _report(stream)
     assert _failed_trace(report) == []
@@ -1422,10 +1422,9 @@ async def test_a_flat_counted_tail_batch_that_fails_as_a_whole_traces_the_page_i
                 async for _ in stream:
                     pass
 
-        with pytest.raises(IncompleteTraversalError) as raised:
+        with pytest.raises(RecursionError):
             await drain()
 
-    assert isinstance(raised.value.__cause__, RecursionError)
     first = (
         (PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION)
         if mode == "undecodable"

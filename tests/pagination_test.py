@@ -47,7 +47,6 @@ from b24api.traversal.plans import (
     CursorTerminalRule,
     ItemCursorPlan,
     KeysetPlan,
-    KeysetTerminalRule,
     ListPlan,
     OffsetContinuation,
     OffsetSequentialPlan,
@@ -568,7 +567,7 @@ async def test_conflicting_policy_and_plan_semantics_refuse_before_io() -> None:
 @pytest.mark.parametrize(
     ("responses", "message"),
     [
-        (({"result": [], "total": -1},), "before its exact total"),
+        (({"result": [], "total": 3},), "before its exact total"),
         (
             (
                 {"result": [{"ID": 1}], "total": 2, "next": 1},
@@ -596,8 +595,8 @@ async def test_counted_offset_rejects_unproven_totals(
     await _assert_incomplete_pagination(stream, message)
 
     assert stream.report.state is KernelState.INCOMPLETE
-    expected_code = PageRejectionCode.TOTAL_DRIFT if message == "drifted" else PageRejectionCode.RANGE_CONTRADICTION
-    assert stream.report.page_trace[-1].rejection_code is expected_code
+    # An end short of the exact total is the same contradiction as a drifted total.
+    assert stream.report.page_trace[-1].rejection_code is PageRejectionCode.TOTAL_DRIFT
 
 
 @pytest.mark.asyncio
@@ -605,16 +604,12 @@ async def test_page_trace_limit_bounds_live_driver_evidence() -> None:
     responses = [
         {"result": [{"ID": 1}], "next": 1},
         {"result": [{"ID": 2}], "next": 2},
-        {"result": [{"ID": 3}], "next": 3},
-        {"result": []},
+        {"result": [{"ID": 3}]},
     ]
     stream = iter_list(
         Executor(ResponderTransport(lambda _request: responses.pop(0))),
         Request("crm.item.list", route=RouteKind.BARE),
-        plan=OffsetSequentialPlan(
-            continuation=OffsetContinuation.SERVER_NEXT,
-            terminal=frozenset({OffsetTerminalRule.EMPTY_PAGE}),
-        ),
+        plan=OffsetSequentialPlan(),
         identity=_identity(),
         policy=ExecutionPolicy(page_trace_limit=1),
     )
@@ -673,48 +668,9 @@ async def test_cancellation_while_waiting_for_dispatch_records_no_unknown_page()
 
 
 @pytest.mark.asyncio
-async def test_boundary_keyset_strategy_refuses_before_io() -> None:
-    transport = ResponderTransport(lambda _request: {"result": []})
-    boundary = KeysetPlan(
-        identity_requirement=IdentityRequirement.REQUIRED,
-        order_semantics=OrderSemantics.ASCENDING,
-        terminal=KeysetTerminalRule.BOUNDARY_ID_SEEN,
-    )
-
-    stream = iter_list(
-        Executor(transport),
-        Request("crm.item.list", route=RouteKind.BARE),
-        plan=boundary,
-        identity=_identity(),
-    )
-    with pytest.raises(CapabilityError):
-        await _collect(stream)
-
-    assert transport.requests == []
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("plan", "policy", "message"),
     [
-        (
-            SingleResponsePlan(),
-            ExecutionPolicy(
-                consistency=ConsistencyPolicy(
-                    confirmation_policy=ConfirmationPolicy.INDEPENDENT_ORACLE,
-                ),
-            ),
-            "independent oracle",
-        ),
-        (
-            SingleResponsePlan(),
-            ExecutionPolicy(
-                consistency=ConsistencyPolicy(
-                    confirmation_policy=ConfirmationPolicy.BOUNDARY_ID_SEEN,
-                ),
-            ),
-            "boundary identity",
-        ),
         (
             SingleResponsePlan(order_semantics=OrderSemantics.INPUT),
             ExecutionPolicy(),

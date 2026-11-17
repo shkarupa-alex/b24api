@@ -68,6 +68,10 @@ def _pages(*pages: Sequence[int], total: int | None = None) -> Callable[[Request
         if start not in by_offset:
             raise AssertionError(f"traversal requested undeclared offset {start}")
         payload: dict[str, object] = {"result": [{"ID": value} for value in by_offset[start]]}
+        following = start + len(by_offset[start])
+        if by_offset.get(following):
+            # Bitrix sends ``next`` on every page that has more rows, and none on the last one.
+            payload["next"] = following
         if total is not None:
             payload["total"] = total
         return WireResponse(200, (("Content-Type", "application/json"),), json.dumps(payload).encode())
@@ -97,7 +101,7 @@ def test_identity_store_key_is_canonical_and_type_distinct() -> None:
 @pytest.mark.asyncio
 async def test_external_ledger_proves_uniqueness_beyond_the_in_memory_key_budget() -> None:
     ledger = _SqliteLedger()
-    transport = ResponderTransport(_pages([1, 2], [3], []))
+    transport = ResponderTransport(_pages([1, 2], [3]))
     stream = _client(transport).iter_list(
         _request(),
         identity=IDENTITY,
@@ -114,12 +118,12 @@ async def test_external_ledger_proves_uniqueness_beyond_the_in_memory_key_budget
     assert report.assurance is TraversalAssurance.IDENTITY_EXACT
     assert report.unique_rows == LEDGER_UNIQUE_ROWS
     assert ledger.keys() == ["1", "2", "3"]
-    assert [request.copy_parameters().get("start", 0) for request in transport.requests] == [0, 2, 3]
+    assert [request.copy_parameters().get("start", 0) for request in transport.requests] == [0, 2]
 
 
 @pytest.mark.asyncio
 async def test_in_memory_budget_still_fails_closed_without_a_ledger() -> None:
-    stream = _client(ResponderTransport(_pages([1, 2], [3], []))).iter_list(
+    stream = _client(ResponderTransport(_pages([1, 2], [3]))).iter_list(
         _request(),
         identity=IDENTITY,
         page_size=2,
@@ -134,7 +138,7 @@ async def test_in_memory_budget_still_fails_closed_without_a_ledger() -> None:
 
 @pytest.mark.asyncio
 async def test_external_ledger_duplicate_under_error_policy_rejects_the_page() -> None:
-    stream = _client(ResponderTransport(_pages([1, 2], [2, 3], []))).iter_list(
+    stream = _client(ResponderTransport(_pages([1, 2], [2, 3]))).iter_list(
         _request(),
         identity=IDENTITY,
         page_size=2,
@@ -151,7 +155,7 @@ async def test_external_ledger_duplicate_under_error_policy_rejects_the_page() -
 
 @pytest.mark.asyncio
 async def test_failing_ledger_never_acknowledges_or_completes() -> None:
-    stream = _client(ResponderTransport(_pages([1, 2], []))).iter_list(
+    stream = _client(ResponderTransport(_pages([1, 2]))).iter_list(
         _request(),
         identity=IDENTITY,
         page_size=2,
@@ -194,7 +198,7 @@ async def test_counted_traversal_accepts_a_ledger_for_its_identity_evidence() ->
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ledger", [None, _SqliteLedger], ids=["memory", "external"])
 async def test_reported_cross_page_duplicate_withdraws_identity_strength(ledger: type[_SqliteLedger] | None) -> None:
-    stream = _client(ResponderTransport(_pages([10, 20], [20, 30], [40], []))).iter_list(
+    stream = _client(ResponderTransport(_pages([10, 20], [20, 30], [40]))).iter_list(
         _request(),
         identity=IDENTITY,
         page_size=2,
@@ -213,7 +217,7 @@ async def test_reported_cross_page_duplicate_withdraws_identity_strength(ledger:
 
 @pytest.mark.asyncio
 async def test_reported_policy_without_duplicates_keeps_identity_exact() -> None:
-    stream = _client(ResponderTransport(_pages([10, 20], [30], []))).iter_list(
+    stream = _client(ResponderTransport(_pages([10, 20], [30]))).iter_list(
         _request(),
         identity=IDENTITY,
         page_size=2,
@@ -244,7 +248,7 @@ async def test_exact_total_duplicate_under_report_withdraws_identity_and_count_s
 async def test_external_ledger_completes_a_long_traversal_within_the_page_budget() -> None:
     ids = list(range(1, LONG_TRAVERSAL_ROWS + 1))
     ledger = _SqliteLedger()
-    stream = _client(ResponderTransport(_pages(*([value] for value in ids), []))).iter_list(
+    stream = _client(ResponderTransport(_pages(*([value] for value in ids)))).iter_list(
         _request(),
         identity=IDENTITY,
         page_size=1,

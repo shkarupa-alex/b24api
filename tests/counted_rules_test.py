@@ -84,11 +84,17 @@ TABLE_R = (
     Row(
         "short_incomplete",
         {0: (1, 3, None), 1: (0, 3, None), 2: (0, 3, None)},
-        "CapabilityError: page length contradicts the planned exact range",
-        "PaginationError: ended before its exact total",
+        "PaginationError: terminated before its exact total",
+        "PaginationError: terminated before its exact total",
     ),
     Row("two_full_pages", {0: (2, 4, 2), 2: (2, 4, None)}, "completed:4", "completed:4"),
-    Row("missing_next", {0: (2, 4, None), 2: (2, 4, None)}, "completed:4", "completed:4"),
+    # A page without next ends the source: here two rows short of the exact total, on both paths.
+    Row(
+        "missing_next",
+        {0: (2, 4, None), 2: (2, 4, None)},
+        "PaginationError: terminated before its exact total",
+        "PaginationError: terminated before its exact total",
+    ),
     # H7 stays a parallel-plan check: without a qualified stride or identity the sequential path cannot
     # prove the skipped offset is a gap, so it follows the server continuation as it does today.
     Row(
@@ -101,22 +107,22 @@ TABLE_R = (
     Row(
         "total_changed",
         {0: (2, 4, 2), 2: (2, 5, None)},
-        "CapabilityError: page total contradicts the head total",
-        "CapabilityError: page total contradicts the head total",
+        "PaginationError: page total contradicts the head total",
+        "PaginationError: page total contradicts the head total",
     ),
     # R2, the only rule the sequential path takes over from the batched head (A8).
     Row(
         "continuation_after_total",
         {0: (2, 2, 2)},
-        "CapabilityError: completed while continuation remained",
-        "CapabilityError: completed while continuation remained",
+        "PaginationError: completed while continuation remained",
+        "PaginationError: completed while continuation remained",
     ),
     # A dense head plans a fixed-width tail; a short tail page then contradicts that range (A20-VARIABLE).
     Row(
         "variable_width",
         {0: (2, 5, 2), 2: (1, 5, 3), 3: (2, 5, None), 4: (1, 5, None)},
-        "CapabilityError: page length contradicts the planned exact range",
-        "CapabilityError: page length contradicts the planned exact range",
+        "PaginationError: page length contradicts the planned exact range",
+        "PaginationError: page length contradicts the planned exact range",
     ),
     # A short head (no full declared page) proves no width: the flat tail strides by the observed next,
     # while the reference continues on the sequential counted rules from offset head_rows.
@@ -241,8 +247,9 @@ async def test_table_r_sequential_counted_path(row: Row) -> None:
 @pytest.mark.parametrize(
     ("facts", "verdict"),
     [
-        (CountedPageFacts(0, 2, 0, 2, 2, OffsetContinuation.SERVER_NEXT_OR_OBSERVED_COUNT), (True, True)),
-        (CountedPageFacts(0, 2, 0, 2, None, OffsetContinuation.SERVER_NEXT_OR_OBSERVED_COUNT), (True, False)),
+        (CountedPageFacts(0, 2, 0, 2, 2, OffsetContinuation.SERVER_NEXT), (True, True)),
+        (CountedPageFacts(0, 2, 0, 2, None, OffsetContinuation.SERVER_NEXT), (True, False)),
+        (CountedPageFacts(0, 2, 0, 2, 2, OffsetContinuation.OBSERVED_COUNT), (True, True)),
         (CountedPageFacts(0, 0, 0, 0, 0, OffsetContinuation.SERVER_NEXT), (True, False)),
         (CountedPageFacts(2, 1, 2, 3, 1, OffsetContinuation.FIXED_STEP), (True, False)),
         (CountedPageFacts(0, 2, 0, 4, 2, OffsetContinuation.SERVER_NEXT), (False, False)),

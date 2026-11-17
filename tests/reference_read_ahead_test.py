@@ -141,10 +141,12 @@ def _expected(parents: int, pages: int | None) -> list[tuple[int, object]]:
 # INPUT sends at most this many times READY's physical requests; before read-ahead it sent 25 to 47
 # times as many, and 3.6 times on the skewed counted traversal. A counted tail sends its window of pages
 # at once: without room kept for all of them, the counted traversal of two pages sends a third more.
+# A sequential binding ends at its page without ``next``: on the skewed sources that leaves READY 14
+# requests where it sent 22 with an empty confirmation per binding, and INPUT 54 where it sent 71.
 _READY_RATIO = {
     (2, "sequential"): 3.5,
     (2, "counted"): 1.5,
-    (None, "sequential"): 3.5,
+    (None, "sequential"): 4.0,
     (None, "counted"): 2.0,
 }
 
