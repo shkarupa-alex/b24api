@@ -115,7 +115,7 @@
   `Binding.start_cursor` now raise `ValueError` at construction, before any request.
 - **Breaking: a bare string where a sequence (of path parts or codes) is expected raises `TypeError`.**
   `ParameterPath("OWNER")` was read as the path `("O", "W", "N", "E", "R")`. `ParameterPath`,
-  `ResultSelector`, `IdentitySpec.item_path`, `IdentityComponent.item_path`, the `ResultErrorSpec`
+  `ResultSelector`, `IdentitySpec.item_path`, `IdentityComponent.item_path`, `CompositeIdentitySpec.components`, the `ResultErrorSpec`
   paths, `CursorSpec.item_path` and `timestamp_path`, positional control paths, and
   `RetryPolicy.transient_api_codes` and `AmbiguityPolicy.refusal_api_codes` now refuse `str` and
   `bytes`. Pass a tuple or list: `ParameterPath(("OWNER",))`.
