@@ -146,11 +146,13 @@
 
 ## Test helpers and logs
 
-- **`ScriptedTransport` matches what a call sends.** It now serves form-encoded requests and scoped
-  headers, as `HttpxTransport` does, and matches a call only when its mapping keys are in the order
-  the exchange names. A call nothing matches is kept in `unexpected`, and `assert_exhausted()` names
-  it first. A fixture that relied on two requests with keys in different orders matching each other
-  must now name each order.
+- **`ScriptedTransport` serves what an HTTP transport serves and names a call nothing matches.** It
+  now accepts form-encoded requests and scoped headers, as `HttpxTransport` does. A call no exchange
+  matches still fails its send (the client reports a transport failure, which a stream may absorb),
+  and is now also kept in `unexpected`; `assert_exhausted()` fails on it even when every exchange was
+  used. A fixture that passed only because such a failure was absorbed now fails: script that call.
+  Matching still compares parameters as JSON values, whatever their key order; `calls` keeps each
+  request's keys in the order sent, for a test that checks the sort priority of `order`.
 - **httpcore's DEBUG records are scrubbed.** With the `httpcore` loggers at `DEBUG`, a redirect's
   `Location` header carried the webhook token into the log. The URL filter now covers every
   `httpcore` logger as it covers `httpx`.

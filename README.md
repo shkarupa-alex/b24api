@@ -1119,9 +1119,10 @@ disk, exits `4`.
 (`ScriptedExchange.json()`, `.batch()` for a classic batch, `.v3_batch()` for a REST 3.0 envelope) to a
 client built on it, with no socket and no credential. A call matches an exchange only when it sends what
 the exchange names: the same method, route, replay safety, body encoding (JSON or form), scoped headers
-and parameters, with mapping keys in the same order, since Bitrix reads `order` in the order it is sent.
-A call nothing matches fails its send, as a transport failure, and is kept in `unexpected`;
-`assert_exhausted()` raises first on such calls, then on exchanges never used. `.batch()` refuses a
+and parameters. Parameters compare as JSON values, so the order of mapping keys does not matter for a
+match; `calls` keeps each request with its keys in the order they were sent, for a test that checks the
+sort priority of `order`. A call nothing matches fails its send, as a transport failure, and is kept in
+`unexpected`; `assert_exhausted()` reports such calls and exchanges never used. `.batch()` refuses a
 command a classic batch would refuse (see [Logical batch and correlation](#logical-batch-and-correlation)).
 `run_transport_conformance()` checks your own transport against the cases the client relies on.
 
