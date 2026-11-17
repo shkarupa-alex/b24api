@@ -30,7 +30,8 @@ if TYPE_CHECKING:
     from b24api.execution.executor import Executor
 
 # A bounded keyset reads both boundaries (ascending and descending) before it plans.
-_BOUNDARY_READS = 2
+BOUNDARY_WAVE_COMMANDS = 2
+"""Commands of the boundary wave every fast keyset traversal opens with, in one physical batch."""
 
 
 def _path_lookup(
@@ -186,8 +187,8 @@ def validate_fast_keyset(  # noqa: C901, PLR0912, PLR0913
     )
     if (
         capacity < 1
-        or policy.max_buffered_commands < _BOUNDARY_READS
-        or policy.max_pages < _BOUNDARY_READS
+        or policy.max_buffered_commands < BOUNDARY_WAVE_COMMANDS
+        or policy.max_pages < BOUNDARY_WAVE_COMMANDS
         or policy.max_requests < 1
         or policy.max_buffered_rows < 2 * effective_cap
     ):
@@ -210,4 +211,4 @@ def validate_fast_keyset(  # noqa: C901, PLR0912, PLR0913
     return effective_cap
 
 
-__all__ = ["reject_unencodable_fast_request", "validate_fast_keyset"]
+__all__ = ["BOUNDARY_WAVE_COMMANDS", "reject_unencodable_fast_request", "validate_fast_keyset"]

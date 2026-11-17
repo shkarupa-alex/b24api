@@ -716,13 +716,21 @@ class AsyncIteratorController[T]:
         # Both run caller code; neither ends in its failure (``spawn_settled``).
         self._active_pull: asyncio.Task[Settled[T]] | None = None
         self._cleanup_task: asyncio.Task[Settled[None]] | None = None
+        # Set once a pull ends the source: its end is read once, and no budget can end what has nothing left.
+        self._exhausted = False
 
     async def get(self, context: ExecutionContext) -> T:
-        """Pull one item within the operation's budget: its time left, and a request budget that refused nothing."""
+        """Pull one item within the operation's budget: its time left, and a request budget that refused nothing.
+
+        Once a pull has ended the source, every later one raises ``StopAsyncIteration`` again without reading the
+        source or the budget.
+        """
         if self._active_pull is not None:
             raise RuntimeError("source pull is already active")
         if self._cleanup_task is not None:
             raise RuntimeError("source cleanup has already started")
+        if self._exhausted:
+            raise StopAsyncIteration
         if context.requests_refused:
             # No item pulled now could be sent: the operation ends with its request budget, as with its time budget.
             raise context.operation_refusal(REQUEST_BUDGET_EXHAUSTED)
@@ -739,9 +747,12 @@ class AsyncIteratorController[T]:
                 self._retain_close_after(pull)
             raise
         try:
-            return (await pull).unwrap()
+            settled = await pull
         finally:
             self._active_pull = None
+        if isinstance(settled.error, StopAsyncIteration):
+            self._exhausted = True
+        return settled.unwrap()
 
     async def aclose(self, context: ExecutionContext) -> None:
         """Close the source, waiting for it within the operation's cleanup window.

@@ -50,6 +50,7 @@ from b24api.contracts import (
     KeysetExecutionKind,
     KeysetSelectionReason,
     KeysetSelectionSummary,
+    NotExecutedReason,
     PageDispatch,
     PageOutcome,
     PageRejectionCode,
@@ -964,6 +965,40 @@ async def test_explicit_fast_with_a_page_stop_or_direct_dispatch_is_rejected_bef
         )
     assert isinstance(outcomes[0], ReferenceNotExecuted) or isinstance(outcomes[-1], ReferenceNotExecuted)
     assert any(isinstance(outcome, ReferenceComplete) and outcome.correlation == "ok" for outcome in outcomes)
+
+
+@pytest.mark.parametrize("execution", [_range(), _partitioned(), _auto()], ids=["range", "partitioned", "auto"])
+@pytest.mark.asyncio
+async def test_fast_keyset_references_refuse_a_batch_too_small_for_the_boundary_wave_before_any_request(
+    execution: Execution,
+) -> None:
+    # The boundary wave is two commands and every wave travels in one physical batch: batch_size=1 cannot run it.
+    portal = BatchPortal(_answer({"p0": DISTRIBUTIONS["dense"]}))
+    async with client_for(portal) as client:
+        for family in (client.iter_references, client.iter_reference_outcomes):
+            with pytest.raises(CapabilityError, match="batch_size of at least 2"):
+                family(_base(), [_parent("p0")], traversal=_traversal(execution), dispatch=BatchDispatch(batch_size=1))
+        outcomes, _report = await _drain(
+            client.iter_reference_source_outcomes(
+                [
+                    ReferenceSource(_base(), _traversal(execution), _parent("p0")),
+                    ReferenceSource(_base(), _traversal(SequentialKeysetExecution()), _parent("p0", "ok")),
+                ],
+                dispatch=BatchDispatch(batch_size=1),
+            )
+        )
+        refused = [outcome for outcome in outcomes if isinstance(outcome, ReferenceNotExecuted)]
+        assert [(outcome.correlation, outcome.reason) for outcome in refused] == [
+            ("p0", NotExecutedReason.LOCAL_VALIDATION_FAILED)
+        ]
+        assert any(isinstance(outcome, ReferenceComplete) and outcome.correlation == "ok" for outcome in outcomes)
+        outcomes, report = await _drain(
+            client.iter_reference_outcomes(
+                _base(), [_parent("p0")], traversal=_traversal(execution), dispatch=BatchDispatch(batch_size=2)
+            )
+        )
+    assert _rows_by_parent(outcomes)["p0"] == sorted(DISTRIBUTIONS["dense"])
+    assert report.state is TerminalState.COMPLETED
 
 
 # A27-VIEW: the projection differs only in rows=G; engine and executor get the shared context; one
