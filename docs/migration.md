@@ -917,7 +917,7 @@ unknown (`AmbiguousExecutionError`), and a fail-fast stream may end on that ambi
   own), the records of the `httpx` logger, and the `hpack.hpack` and `hpack.table` records, which are
   dropped while a library HTTPX client is open (an HTTP/2 send is refused with `CapabilityError` before
   I/O when that filter was removed; see item 14 under
-  [Upgrading from 2.3 to 3.0](#upgrading-from-23-to-30)). Records of other loggers are not filtered:
+  [Upgrading from 2.3 to 2.4](#upgrading-from-23-to-24)). Records of other loggers are not filtered:
   `httpcore` DEBUG records carry the response headers, so a `Location` header that holds the token
   puts it in a record; see the HTTPX logging note in
   [Migrating to the issues architecture (2.3)](#migrating-to-the-issues-architecture-23). What is not
@@ -1373,16 +1373,16 @@ unchanged. The new public names live in `b24api.contracts`.
   [Keyset references with per-owner filters](recipes.md#keyset-references-with-per-owner-filters).
   `traversal_control_paths()` is unchanged and still names the whole filter container.
 
-## Upgrading from 2.3 to 3.0
+## Upgrading from 2.3 to 2.4
 
-3.0.0 changes only what the list below names. Work through it in order; each item links to the
+2.4.0 changes only what the list below names. Work through it in order; each item links to the
 details.
 
 1. **Root imports.** The `b24api` root exports 51 names; 115 others moved to `b24api.contracts`,
    `b24api.errors`, `b24api.transport` or `b24api.completion`. Old imports fail with `ImportError`
    or `AttributeError`, and type checkers flag them. `from b24api import *` follows `__all__` and
    no longer brings the moved names; replace it with explicit imports. Run
-   `python -m b24api.migration src/ tests/` to list both; see [Root imports in 3.0](#root-imports-in-30).
+   `python -m b24api.migration src/ tests/` to list both; see [Root imports in 2.4](#root-imports-in-24).
 2. **Removed report vocabulary.** Values no code path produced are gone from `KeysetExecutionReport`,
    `KeysetAssuranceSource`, `ReplayDisposition`, `CompletionAssurance`, `SnapshotState` and
    `NotExecutedReason`, and `PageValidated` has no `identity_digest`. Drop those arms from exhaustive
@@ -1632,7 +1632,7 @@ traversal keeps its separate raw-range closure contract.
 
 The earlier 2.x keyset migration notes below remain as historical guidance for that API.
 
-## Root imports in 3.0
+## Root imports in 2.4
 
 The `b24api` root now exports only the names a typical application needs: the client and its
 settings, requests and routes, policies, traversal and dispatch specifications, the report and the
@@ -1640,10 +1640,10 @@ main errors, and the transports, including `HttpxTransport`. The other 115 names
 public packages `b24api.contracts`, `b24api.errors`, `b24api.transport` and `b24api.completion`,
 which export the same objects. No object was removed or renamed; only the root path is gone.
 
-The old root paths do not resolve in 3.0 and there is no deprecation period:
+The old root paths do not resolve since 2.4 and there is no deprecation period:
 `from b24api import CommandSuccess` raises `ImportError: cannot import name 'CommandSuccess' from
 'b24api'`, and `b24api.CommandSuccess` raises `AttributeError: module 'b24api' has no attribute
-'CommandSuccess'; it moved to b24api.contracts.CommandSuccess in 3.0`. Mypy and pyright report each
+'CommandSuccess'; it moved to b24api.contracts.CommandSuccess`. Mypy and pyright report each
 old root import as `attr-defined`, which points at every line to change. A wildcard import follows
 `__all__`, which lists only the 51 root names, so a moved name used after `from b24api import *`
 raises `NameError`. The scanner reports every such import; replace it with
@@ -1782,7 +1782,7 @@ src/app.py:3 b24api.CommandSuccess -> b24api.contracts.CommandSuccess
 ## Keyset verification, cursor fan-out, and page adaptation
 
 Normal `iter_list_keyset()` no longer sends the five diagnostic canary commands. Range and
-partitioned reports use `KeysetAssuranceSource.CALLER_ASSERTED_BOUNDS`. 3.0.0 removes the legacy
+partitioned reports use `KeysetAssuranceSource.CALLER_ASSERTED_BOUNDS`. 2.4.0 removed the legacy
 `KeysetAssuranceSource.CANARY_VERIFIED_BOUNDS` and the always-zero `canary_requests`,
 `canary_commands` and `canary_rows` fields of `KeysetExecutionReport`; `KeysetPhase.CANARY` remains
 because `verify_keyset_capability()` still records its canary wave under that phase.
@@ -1937,7 +1937,7 @@ mapping-shape, and composite-identity configurations are shown in [endpoint reci
 This release retains the compatibility removals already made in 2.x. Migrate by capability rather than by
 preserving names or return-shaping flags.
 
-| Earlier capability | Current 2.x operation | Important difference |
+| Earlier capability | Current operation | Important difference |
 |---|---|---|
 | Decoded `call()` | `call()` | Returns detached decoded JSON. |
 | Raw/envelope call | `call_response()` | Always returns the immutable `Response` type. |
@@ -1960,13 +1960,13 @@ preserving names or return-shaping flags.
 - permissive cursor de-duplication that could hide missing rows;
 - automatic unsafe direct fallback;
 - public low-level execution plans and compatibility data models.
-- report values no code path produced (3.0.0): `ReplayDisposition.REPLAYED_DIRECT` and
+- report values no code path produced (2.4.0): `ReplayDisposition.REPLAYED_DIRECT` and
   `DIRECT_REPLAY_FAILED` (a physical batch is never replayed as direct calls),
   `CompletionAssurance.ORACLE_VERIFIED`, `SnapshotState.VERIFIED` and `SnapshotState.CHANGED`
   (no snapshot oracle exists; a required snapshot reports `UNVERIFIED`), and
   `NotExecutedReason.SCHEDULER_STOPPED`. Drop those arms from exhaustive matches; the enum inputs
   `SnapshotRequirement` and `ConfirmationPolicy` keep every member.
-- `PageValidated.identity_digest` (3.0.0). The gate only ever checked that the digest was non-empty,
+- `PageValidated.identity_digest` (2.4.0). The gate only ever checked that the digest was non-empty,
   so every recorder paid a SHA-256 per page for no guarantee. The gate still checks event order and
   `row_count`; a custom recorder or test that builds `PageValidated` drops the argument.
 
