@@ -14,6 +14,7 @@ from b24api.transport import HttpxTransport
 from b24api.transport.logging_shield import HTTPCORE_LOGGER_NAMES
 
 _TOKEN = "s3cr3tT0kenValue9"  # noqa: S105 - a fixture webhook token the shield must hide
+_QUERY_SECRET = "z" * 10
 _REDIRECT = 302
 
 
@@ -44,7 +45,7 @@ class _Records(logging.Handler):
 async def test_a_redirect_location_naming_the_webhook_token_is_scrubbed_from_httpcore_debug_records() -> None:
     async def redirect(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         await reader.readuntil(b"\r\n\r\n")
-        location = f"/rest/1/{_TOKEN}/other.method?auth=zzzzzzzzzz".encode()
+        location = f"/rest/1/{_TOKEN}/other.method?auth={_QUERY_SECRET}".encode()
         writer.write(b"HTTP/1.1 302 Found\r\nlocation: " + location + b"\r\ncontent-length: 0\r\n\r\n")
         await writer.drain()
         writer.close()
@@ -75,4 +76,4 @@ async def test_a_redirect_location_naming_the_webhook_token_is_scrubbed_from_htt
     assert headers
     assert all(b"location" in message.encode() for message in headers)
     assert not any(_TOKEN in message for message in handler.messages)
-    assert not any("zzzzzzzzzz" in message for message in handler.messages)
+    assert not any(_QUERY_SECRET in message for message in handler.messages)

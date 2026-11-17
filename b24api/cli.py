@@ -22,6 +22,7 @@ from b24api import (
     ReplaySafety,
     Request,
     RouteKind,
+    Settings,
     TerminalState,
     TraversalAssurance,
 )
@@ -37,7 +38,6 @@ from b24api.cli_contract import (
     read_json_source,
 )
 from b24api.contracts import Response
-from b24api.settings import Settings
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine, Sequence
