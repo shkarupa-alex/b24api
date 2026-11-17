@@ -207,6 +207,9 @@ def _short_source(mode: str) -> Callable[[str, Query], Envelope]:
 
     def answer(_method: str, query: Query) -> Envelope:
         start = int(query.get("start", "0"))
+        if start == PAGE and mode == "untotalled":
+            # The end reports no total: the latest page that reported one still counts the source.
+            return {"result": rows[start : start + PAGE]}
         if start == PAGE:
             return {"result": [] if mode == "empty" else rows[start : start + 20], "total": 120}
         return {"result": rows[start : start + PAGE], "total": 120, "next": start + PAGE}
@@ -214,7 +217,7 @@ def _short_source(mode: str) -> Callable[[str, Query], Envelope]:
     return answer
 
 
-@pytest.mark.parametrize("mode", ["empty", "short"])
+@pytest.mark.parametrize("mode", ["empty", "short", "untotalled"])
 @pytest.mark.asyncio
 async def test_rows_short_of_the_reported_total_never_complete(mode: str) -> None:
     portal = BatchPortal(_short_source(mode))
@@ -234,6 +237,22 @@ async def test_rows_short_of_the_reported_total_never_complete(mode: str) -> Non
         PageOutcome.REJECTED,
         PageRejectionCode.TOTAL_DRIFT,
     )
+
+
+@pytest.mark.asyncio
+async def test_rows_beyond_a_reported_total_of_zero_never_complete() -> None:
+    rows = _rows(3)
+    portal = BatchPortal(lambda _method, _query: {"result": rows, "total": 0})
+    stream = _client(portal).iter_list(_request(), identity=ID)
+
+    delivered, error = await _drain(stream)
+
+    assert isinstance(error, IncompleteTraversalError)
+    cause = error.__cause__
+    assert isinstance(cause, PaginationError)
+    assert cause.rejection_code is PageRejectionCode.TOTAL_DRIFT
+    assert delivered == []
+    assert _report(stream).state is TerminalState.INCOMPLETE
 
 
 @pytest.mark.asyncio

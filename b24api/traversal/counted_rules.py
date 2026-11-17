@@ -88,7 +88,7 @@ class EmptyHeadFacts:
 def empty_source_head_eligible(facts: EmptyHeadFacts) -> bool:
     """Return whether an unvalidated head may witness an empty source.
 
-    Only the first counted page at offset zero qualifies, with empty source and adapted rows, no
+    Only the first page at offset zero of an exact-total traversal (counted or sequential) qualifies, with empty source and adapted rows, no
     usable total, no continuation, no fixed step, no earlier exact total and no caller-declared
     qualified-total confirmation. ``-1`` is the unknown-total sentinel and never counts as zero, and
     ``next=0`` is a continuation, not its absence.
@@ -149,19 +149,28 @@ def counted_head_range(
     if total is None or total < 0:
         raise CapabilityError("parallel counted traversal requires a non-negative total")
     if total < head_rows:
-        raise CapabilityError("parallel counted traversal observed total below the head page")
+        raise PaginationError(
+            "parallel counted traversal observed total below the head page",
+            rejection_code=PageRejectionCode.TOTAL_DRIFT,
+        )
     stride = _head_stride(plan, total=total, next_offset=next_offset, head_rows=head_rows, page_size=page_size)
     if not isinstance(stride, int) or isinstance(stride, bool) or stride < 1:
         raise CapabilityError("parallel counted traversal requires a positive in-band stride")
     if head_rows != min(stride, total):
-        raise CapabilityError("parallel counted head length contradicts the planned exact range")
+        raise PaginationError(
+            "parallel counted head length contradicts the planned exact range",
+            rejection_code=PageRejectionCode.RANGE_CONTRADICTION,
+        )
     if (
         plan.continuation is OffsetContinuation.SERVER_NEXT
         and next_offset is not None
         and next_offset > 0
         and next_offset != stride
     ):
-        raise CapabilityError("parallel counted head continuation contradicts its row count")
+        raise PaginationError(
+            "parallel counted head continuation contradicts its row count",
+            rejection_code=PageRejectionCode.RANGE_CONTRADICTION,
+        )
     verdict = judge_counted_page(CountedPageFacts(0, head_rows, 0, total, next_offset, plan.continuation))
     if verdict.contradiction is CountedContradiction.CONTINUATION_AFTER_TOTAL:
         raise PaginationError(

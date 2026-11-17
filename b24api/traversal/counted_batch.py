@@ -204,7 +204,9 @@ class CountedBatchStrategy:
                     head_rows=len(head_items),
                     page_size=self._page_size,
                 )
-            except CapabilityError:
+            except (CapabilityError, PaginationError):
+                # A head that proves no dense range: a flat traversal fails on it, a reference one follows the
+                # sequential counted rules, which judge the same page by its own continuation.
                 if not io.allows_sequential:
                     raise
                 dense = False

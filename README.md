@@ -412,12 +412,13 @@ page: `crm.lead.list`, `crm.deal.list`, `crm.activity.list` and `tasks.task.list
 a multiple of 50 and answer a `start` at or past the end with their last page again, and
 `department.get` ignores `start` and always returns everything without `next`. The page without
 `next` is therefore the end on every Bitrix list endpoint. A Bitrix list `total` counts the filter's
-rows, so when the traversal started at the first page, a `total` reported by the last page (or, if it has none, by the latest page that had one) must
-equal the number of rows read; otherwise the traversal raises `IncompleteTraversalError` caused by a
+rows, so when the traversal started at the first page, a `total` reported by the last page (or, if
+it has none, by the latest page that had one) must equal the number of rows read; otherwise the traversal raises `IncompleteTraversalError` caused by a
 `PaginationError` with the `total_drift` page rejection, and the report is `incomplete`, never
 `completed`. An endpoint whose `total` is not an exact count of its rows can declare that with
 `ConsistencyPolicy(total_semantics=TotalSemantics.ADVISORY)`: a mismatch is then the
-`advisory_total_mismatch` warning.
+`advisory_total_mismatch` warning. `TotalSemantics.GLOBAL` declares a `total` that counts every row of
+the endpoint rather than the filter's, so it is never compared with the rows read.
 
 <!-- tested: tests/client_v2_test.py::test_iter_list_is_sequential_mechanics_only_and_report_is_post_cleanup -->
 ```python

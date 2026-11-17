@@ -34,7 +34,7 @@
   client (`ClientClosedError`) or a lost batch (`AmbiguousExecutionError`) is raised as it is, and the report says `failed`
   (`incomplete` for a budget), as `iter_list()` and the fast keyset already did. Code that caught
   `IncompleteTraversalError` for every counted failure catches the specific error or `B24ApiError`.
-  A counted page that contradicts its planned range (its length, its `total`, its `next`), a page that
+  A counted page, the first one included, that contradicts its planned range (its length, its `total`, its `next`), a page that
   reaches the total while `next` remains, and a tail that ends short of the total now raise
   `PaginationError` (`range_contradiction` or `total_drift`) where they raised `CapabilityError`.
 - **Breaking: a counted head without `next` short of its total fails with `total_drift`.** It failed
