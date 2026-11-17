@@ -144,20 +144,89 @@ def ambiguity_of(
     return possible_execution(error, request_summary=request_summary, declared_unsafe=declared_unsafe)
 
 
-def answered_conclusively(error: BaseException, policy: ExecutionPolicy) -> bool:
-    """Return whether the server answered a send conclusively, so that its failure is the send's outcome.
+_UNAUTHORIZED = 401
 
-    A structured Bitrix error, top-level or found in the result by the request's own contract, answers it, and so
-    does any status outside 2xx that the policy does not hold ambiguous, whatever its body: an error body that
-    cannot be decoded changes nothing about the status. A 2xx answer that cannot be decoded proves nothing, as a
-    lost or late answer and an ambiguous status do not.
+
+class Verdict(Enum):
+    """What the failure that ended one send proves about whether its request ran: one value, by one rule.
+
+    The executor, the classic and the REST v3 batch dialects all read a send's failure through ``send_verdict``,
+    and derive from it both whether the request may be sent again and what its outcome is.
     """
+
+    #: The request never reached the server, or the server refused it before running it.
+    NOT_RUN = "not_run"
+    #: The server answered it: the failure is its outcome.
+    ANSWERED = "answered"
+    #: It may have run and nothing proves otherwise: its outcome is unknown.
+    MAY_HAVE_RUN = "may_have_run"
+
+
+def send_verdict(error: BaseException, policy: ExecutionPolicy, *, v3_envelope: bool = False) -> Verdict:
+    """Return what the failure that ended a send proves about whether its request ran (``Verdict``).
+
+    The failure is read whole, as the decoder left it: a 2xx body whose control members contradict each other or
+    repeat, or that is malformed, is a ``ProtocolError`` that proves nothing. A transport failure proves the request
+    did not run only when no byte of it may have reached the server. An answer the policy holds ambiguous (408 and
+    every 5xx by default) proves nothing, structured or not, unless a listed refusal code proves it refused; a
+    listed refusal status (423, 425, 429) whose body is a gateway's page proves it refused: a body without a
+    readable top-level ``error`` that the decoder did not refuse for a repeated member.
+    Any other structured error, and any other status outside 2xx whatever its body, answers it. An oversized or
+    lost answer and any failure that is not an answer prove nothing.
+
+    ``v3_envelope`` reads the top-level answer to a REST 3.0 batch envelope. Such an envelope runs its commands
+    in turn and aborts on the first that fails, its load limiter included, so its error, structured, unreadable or
+    malformed, proves nothing about the commands before that one, except a 401 (credentials no command could pass)
+    and a gateway's page at a listed refusal status. A classic batch envelope is checked and
+    limited as one request, so its answer is read as a lone request's.
+    """
+    if isinstance(error, TransportError):
+        return Verdict.MAY_HAVE_RUN if error.possible_acceptance else Verdict.NOT_RUN
     if isinstance(error, ApiResponseError):
-        return True
-    if not isinstance(error, HTTPGatewayError | ProtocolError):
-        return False
+        return _structured_verdict(error, policy, v3_envelope=v3_envelope)
+    if isinstance(error, HTTPGatewayError | ProtocolError):
+        return _status_verdict(error, policy, v3_envelope=v3_envelope)
+    # An ambiguity already decided, an oversized answer, and any failure that is not an answer prove nothing.
+    return Verdict.MAY_HAVE_RUN
+
+
+def _structured_verdict(error: ApiResponseError, policy: ExecutionPolicy, *, v3_envelope: bool) -> Verdict:
+    """Return what a structured Bitrix error proves (``send_verdict``)."""
     status = error.http_status
-    return status is not None and not http_success(status) and not ambiguous_status(status, policy)
+    if v3_envelope:
+        # A REST 3.0 envelope aborts on its first failed command, after the commands before it ran: only a
+        # refusal of the credentials, which no command of it could pass, answers every command alike.
+        return Verdict.ANSWERED if status == _UNAUTHORIZED else Verdict.MAY_HAVE_RUN
+    if str(error.original_code).strip().casefold() in policy.ambiguity.refusal_api_codes:
+        return Verdict.NOT_RUN
+    return Verdict.MAY_HAVE_RUN if ambiguous_status(status, policy) else Verdict.ANSWERED
+
+
+def _status_verdict(error: HTTPGatewayError | ProtocolError, policy: ExecutionPolicy, *, v3_envelope: bool) -> Verdict:
+    """Return what an answer without a readable structured error proves, by its status (``send_verdict``)."""
+    status = error.http_status
+    if status is None or http_success(status) or ambiguous_status(status, policy):
+        return Verdict.MAY_HAVE_RUN
+    # A gateway's page (no readable top-level `error`, no repeated top-level member) at a listed refusal status is the
+    # refusal; a body the server wrote but the client cannot read (a repeat, a contradiction, a malformed error)
+    # proves no refusal.
+    if isinstance(error, HTTPGatewayError) and status in policy.ambiguity.refusal_http_statuses:
+        return Verdict.NOT_RUN
+    if v3_envelope:
+        # As for a structured error: only a refusal of the credentials answers every command of the envelope.
+        return Verdict.ANSWERED if status == _UNAUTHORIZED else Verdict.MAY_HAVE_RUN
+    return Verdict.ANSWERED
+
+
+def carry_facts(source: BaseException, carrier: BaseException) -> None:
+    """Record on ``carrier``, a failure that carries ``source`` in its place, what is known of ``source``'s command.
+
+    The one way a failure is replaced by another that stands for it (an outcome's carrier of a foreign exception,
+    for example): whatever was recorded about whether the command ran moves with it.
+    """
+    facts = getattr(source, _FACTS, None)
+    if isinstance(facts, _ExecutionFacts):
+        carrier.__dict__[_FACTS] = facts
 
 
 def http_success(status: int) -> bool:
@@ -250,10 +319,11 @@ def _caused_by(error: BaseException, cause: BaseException) -> bool:
 
 __all__ = [
     "Execution",
+    "Verdict",
     "ambiguity_of",
     "ambiguity_reason",
     "ambiguous_status",
-    "answered_conclusively",
+    "carry_facts",
     "dropped_result",
     "execution",
     "http_success",
@@ -261,6 +331,7 @@ __all__ = [
     "record_dispatch",
     "record_execution",
     "record_withheld",
+    "send_verdict",
     "settled_as",
     "settlement",
 ]

@@ -103,7 +103,6 @@ async def execute_wave(
                 context=host.context.execution_context,
                 advisory_totals=advisory,
                 strict_envelope=True,
-                strict_json_members=True,
             )
         except BaseException as error:
             _trace_failed_call(host, plans, error, PageDispatch.BATCH)

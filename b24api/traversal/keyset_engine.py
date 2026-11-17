@@ -49,7 +49,6 @@ class FlatWaveEngine:
         context: ExecutionContext,
         advisory_totals: bool = False,
         strict_envelope: bool = False,
-        strict_json_members: bool = False,
     ) -> tuple[BatchOutcome, ...]:
         """Execute one wave of scheduled pages, by command id, as one private physical batch.
 
@@ -63,7 +62,6 @@ class FlatWaveEngine:
                 context=context,
                 advisory_totals=advisory_totals,
                 strict_envelope=strict_envelope,
-                strict_json_members=strict_json_members,
                 progress=progress,
             )
         except BaseException as error:

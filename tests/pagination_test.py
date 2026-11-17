@@ -23,7 +23,7 @@ from b24api.contracts.policy import (
     TotalSemantics,
 )
 from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode
-from b24api.contracts.request import IdentitySpec, ParameterPath, Request, ResultSelector, RouteKind
+from b24api.contracts.request import IdentitySpec, ParameterPath, ReplaySafety, Request, ResultSelector, RouteKind
 from b24api.contracts.traversal import KeysetSpec
 from b24api.errors import (
     ApiResponseError,
@@ -1163,7 +1163,11 @@ async def test_cancellation_during_failed_finalization_preserves_failure_report(
             return WireResponse(200, (("content-type", "application/json"),), b"{")
 
     transport = MalformedAfterHoldTransport()
-    stream = iter_list(Executor(transport), Request("crm.item.list", route=RouteKind.BARE), plan=SingleResponsePlan())
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+        plan=SingleResponsePlan(),
+    )
     hold = transport.hold = LedgerHold(stream._context)  # noqa: SLF001 - deterministic finalize-race regression
     primary: list[ProtocolError] = []
     post_failure_executed = False

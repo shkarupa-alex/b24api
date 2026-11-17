@@ -225,7 +225,7 @@ class Redactor:
         text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body
         try:
             parsed = json.loads(text)
-        except (json.JSONDecodeError, ValueError):
+        except (ValueError, RecursionError):  # not JSON, or deeper than the parser follows: preview the text
             preview = self.render_text(text, context=context)
         else:
             redacted = self.redact(parsed, context=context)

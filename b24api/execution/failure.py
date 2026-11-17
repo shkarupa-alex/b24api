@@ -27,6 +27,7 @@ from b24api.errors import (
     ResultShapeError,
     TransportError,
 )
+from b24api.execution.facts import carry_facts
 
 if TYPE_CHECKING:
     from b24api.contracts.report import OperationReport
@@ -173,13 +174,15 @@ def outcome_error(error: Exception, message: str) -> B24ApiError:
     """Return the error a failure outcome carries, by one rule for every family that yields outcomes.
 
     The library's own error is carried as it is; any other ``Exception`` (caller code's: a page stop, a hook) as a
-    ``CapabilityError(message)`` whose ``__cause__`` it is. Only an ``Exception`` is a failure: anything else ends the
-    operation as it is, so it never reaches an outcome.
+    ``CapabilityError(message)`` whose ``__cause__`` it is, and which carries what was recorded about whether its
+    command ran (``carry_facts``): the outcome follows those facts, never the carrier's type. Only an
+    ``Exception`` is a failure: anything else ends the operation as it is, so it never reaches an outcome.
     """
     if isinstance(error, B24ApiError):
         return error
     carried = CapabilityError(message)
     carried.__cause__ = error
+    carry_facts(error, carried)
     return carried
 
 
