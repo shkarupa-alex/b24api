@@ -237,14 +237,36 @@ def test_graph_counts_function_local_imports_and_separates_type_only_ones() -> N
     }
 
 
-def test_every_dynamic_import_names_its_module_literally() -> None:
-    unfollowed = sorted(
-        f"{path.relative_to(ROOT)}:{call.lineno}"
-        for path in _modules().values()
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
-        if (call := _dynamic_import(node)) is not None and _literal_name(call) is None
+def _unfollowed_dynamic_imports(tree: ast.AST) -> list[int]:
+    """Return the lines of dynamic imports the graph cannot follow: a name that is not an absolute literal."""
+    return sorted(
+        call.lineno
+        for node in ast.walk(tree)
+        if (call := _dynamic_import(node)) is not None
+        and ((name := _literal_name(call)) is None or name.startswith(".") or len(call.args) > 1)
     )
+
+
+def test_every_dynamic_import_names_its_module_literally() -> None:
+    unfollowed = [
+        f"{path.relative_to(ROOT)}:{line}"
+        for path in _modules().values()
+        for line in _unfollowed_dynamic_imports(ast.parse(path.read_text(encoding="utf-8")))
+    ]
     assert not unfollowed, f"the import graph cannot follow these dynamic imports: {unfollowed}"
+
+
+def test_a_dynamic_import_the_graph_cannot_follow_is_flagged() -> None:
+    tree = ast.parse(
+        "import importlib\n"
+        "name = 'b24api.client'\n"
+        "importlib.import_module('b24api.migration')\n"
+        "importlib.import_module(name)\n"
+        "importlib.import_module('.client', 'b24api')\n"
+        "__import__(name)\n"
+    )
+
+    assert _unfollowed_dynamic_imports(tree) == [4, 5, 6]
 
 
 def test_graph_resolves_relative_facade_dynamic_and_qualified_type_checking_imports() -> None:

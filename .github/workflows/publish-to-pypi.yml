@@ -5,6 +5,11 @@ name: Publish to PyPI
 # is checked first, then the full blocking CI runs on the tagged commit, then the distributions are
 # built by the locked build backend and checked against the tag. setuptools-git-versioning derives
 # the package version from that tag.
+#
+# A tag runs the workflow file of the commit it names, so a tag on a commit older than these checks
+# runs a workflow without them. The repository settings close that gap: the `pypi` environment
+# allows deployments only from tags matching MAJOR.MINOR.PATCH and requires a reviewer, and a tag
+# ruleset limits who may create such tags.
 
 on:
   push:

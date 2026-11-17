@@ -17,6 +17,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
+          version: "0.9.11"
           python-version: "3.12"
       - name: Lint without rewriting sources
         run: uv run --locked ruff check --no-fix
@@ -29,6 +30,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
+          version: "0.9.11"
           python-version: "3.12"
       - name: Type-check the library strictly
         run: uv run --locked mypy b24api
@@ -45,6 +47,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
+          version: "0.9.11"
           python-version: ${{ matrix.python-version }}
       - name: Run the default suite with the coverage floor
         # The floor is [tool.coverage.report] fail_under in pyproject.toml, the single source.
@@ -56,6 +59,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
+          version: "0.9.11"
           python-version: "3.12"
       - name: Install the lowest direct dependency versions
         run: |
@@ -71,6 +75,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
+          version: "0.9.11"
           python-version: "3.12"
       - name: Build the wheel into a temporary directory as the release does
         # Without build isolation the backend comes from the locked `build` group (publish-to-pypi.yml).
@@ -130,6 +135,7 @@ jobs:
           fetch-depth: 2
       - uses: astral-sh/setup-uv@v7
         with:
+          version: "0.9.11"
           python-version: "3.12"
       - name: Run the internal benches, which local QC leaves out
         run: make bench
@@ -143,6 +149,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
+          version: "0.9.11"
           python-version: "3.12"
       - name: Install the locked environment, then the latest httpx stack
         run: |

@@ -813,3 +813,17 @@ def test_ratchet_refuses_a_malformed_or_missing_baseline(tmp_path: Path) -> None
 
 def test_committed_mypy_baseline_never_exceeds_the_specified_starting_count() -> None:
     assert 0 <= _ratchet().read_baseline(MYPY_BASELINE) <= MYPY_TESTS_ERRORS_AT_SPECIFICATION
+
+
+def test_ci_and_release_set_up_the_same_pinned_uv() -> None:
+    # CI checks the build the release runs, so every job installs the one uv the release pins.
+    release_uv = _step("release-build", "astral-sh/setup-uv@v7")["with"]["version"]
+    ci_uvs = [
+        step.get("with", {}).get("version")
+        for job in _ci_jobs().values()
+        for step in job["steps"]
+        if "setup-uv" in step.get("uses", "")
+    ]
+
+    assert ci_uvs
+    assert set(ci_uvs) == {release_uv}
