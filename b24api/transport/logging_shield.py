@@ -1,4 +1,4 @@
-"""Keep b24api webhook URLs out of HTTPX INFO and hpack DEBUG records before handler formatting.
+"""Keep b24api webhook URLs out of HTTPX INFO, httpcore and hpack DEBUG records before handler formatting.
 
 A b24api request can emit several records, including redirect hops whose URLs b24api never built,
 so the filter scrubs any credential-shaped Bitrix URL segment and sensitive query value, not only the
@@ -45,7 +45,17 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Iterator
     from types import FrameType
 
-_LOGGER = logging.getLogger("httpx")
+#: Every logger an owned send writes request or response data to: HTTPX's own, and httpcore's trace loggers,
+#: whose DEBUG records carry response headers such as a redirect's ``Location``. The shield test pins the
+#: httpcore names against the installed httpcore.
+HTTPCORE_LOGGER_NAMES = (
+    "httpcore.connection",
+    "httpcore.http11",
+    "httpcore.http2",
+    "httpcore.proxy",
+    "httpcore.socks",
+)
+_LOGGERS = tuple(logging.getLogger(name) for name in ("httpx", *HTTPCORE_LOGGER_NAMES))
 #: Every hpack logger that can write a header; the shield test pins this list against the installed hpack.
 HPACK_LOGGER_NAMES = ("hpack.hpack", "hpack.table")
 _HPACK_LOGGERS = tuple(logging.getLogger(name) for name in HPACK_LOGGER_NAMES)
@@ -322,8 +332,7 @@ class HttpxLogShield:
             if self._transports < 1:
                 raise RuntimeError("HTTPX log shield has no registered transport")
             self._in_flight += 1
-            if self._filter not in _LOGGER.filters:
-                _LOGGER.addFilter(self._filter)
+            self._install_url_filter()
         token = _ACTIVE_OWNERSHIP.set(ownership)
         try:
             yield ownership
@@ -354,10 +363,14 @@ class HttpxLogShield:
                 if registration.finalizer is not None:
                     registration.finalizer()
 
+    def _install_url_filter(self) -> None:
+        for logger in _LOGGERS:
+            if self._filter not in logger.filters:
+                logger.addFilter(self._filter)
+
     def _ensure_installed(self) -> None:
         # The hpack filter is (re)installed only at registration: a filter removed later refuses HTTP/2 sends.
-        if self._filter not in _LOGGER.filters:
-            _LOGGER.addFilter(self._filter)
+        self._install_url_filter()
         for logger in _HPACK_LOGGERS:
             if self._hpack_filter not in logger.filters:
                 logger.addFilter(self._hpack_filter)
@@ -370,7 +383,8 @@ class HttpxLogShield:
             # An open injected client keeps its registered secret, so both scrubbers stay with it. Once it
             # closes, its secret is pruned at once; the next transport release or request exit removes them.
             return
-        _LOGGER.removeFilter(self._filter)
+        for logger in _LOGGERS:
+            logger.removeFilter(self._filter)
         for logger in _HPACK_LOGGERS:
             logger.removeFilter(self._hpack_filter)
 
