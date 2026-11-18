@@ -29,8 +29,9 @@
   went on at full rate and was refused in turn. Such a refusal now holds the whole portal for the retry
   backoff of the refusals in a row (0.5 s, then 1, 2 and so on up to 30 s by default), so the client's
   requests slow down together. A refusal of a request sent after the latest pause began grows that
-  backoff; the refusals of one burst, sent before it, do not; an answer that is no refusal, to a request
-  sent after that pause began, resets it. A
+  backoff; the refusals of one burst, sent before it, do not; an answer about anything but the load (a
+  success, or a failure with no limit's code, no 429 and no 503), to a request sent after that pause
+  began, resets it. A
   `Retry-After` or `X-Bitrix-RateLimit-Reset` sets the pause instead, as before.
 - **Breaking: `OPERATION_TIME_LIMIT` holds its method as long as the portal says.** It held the method
   for a fixed 120 s, which no setting changed. It now holds it for the answer's hint, else until the

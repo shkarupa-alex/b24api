@@ -1662,8 +1662,8 @@ async def test_a21_lineage_an_envelope_retry_the_budget_refused_is_not_followed_
     The isolation would be refused by the same budget: the window left is shorter than the retry's backoff, or the
     host holds the methods longer than the operation's time left. Each command is unknown, ended by the refusal
     caused by the envelope's failure; by that answer itself when it is the portal's answer about its load (a 503)
-    and the host's hold alone outlasts the window, as a lone request is: the hold of the test, or the busy portal's
-    own quota hold for the backoff (the abort's names no limit, so it holds nothing of its own).
+    and the host's hold alone outlasts the window, as a lone request is: the hold of the test, or the quota hold for
+    the backoff that the busy portal's answer and the abort both name (a REST 3.0 code compares without case).
     """
     clock = _Clock()
     envelope_failure = _TRANSIENT_ENVELOPE_FAILURES[failure]()
@@ -1695,7 +1695,7 @@ async def test_a21_lineage_an_envelope_retry_the_budget_refused_is_not_followed_
         assert isinstance(outcome, BatchFailure)
         assert isinstance(outcome.error, AmbiguousExecutionError)
         stop = outcome.error.__cause__
-        if failure == "busy" or (failure == "abort" and refusal == "hold"):
+        if failure in {"busy", "abort"}:
             followed = stop
         else:
             assert type(stop) is BudgetExceededError
@@ -1942,3 +1942,31 @@ def test_an_interrupt_isolated_sends_raise_as_their_reader_is_cancelled_leaves_t
     assert [(violation.code, violation.message) for violation in report.violations] == [
         ("interrupted", "operation interrupted (KeyboardInterrupt)")
     ]
+
+
+_TOO_MANY_REQUESTS = 429
+
+
+@pytest.mark.asyncio
+async def test_a21_lineage_an_envelope_refused_whole_and_held_past_its_window_ends_with_the_refusal() -> None:
+    """A SAFE envelope refused by the load (a 429 the portal holds itself for 30 s) is not retried into the hold.
+
+    Its window is shorter than the hold: each command ends with the refusal itself, as a lone request and a classic
+    envelope do, not with a budget error hiding it.
+    """
+    clock = _Clock()
+    refusal = WireResponse(_TOO_MANY_REQUESTS, (("retry-after", "30"), ("content-type", "text/plain")), b"Too many")
+    transport = _OneEnvelope(refusal, clock, takes=0.0, hold=0.0)
+    executor = _timed_executor(transport, clock)
+    transport.coordinator = executor.coordinator
+    context = executor.context(ExecutionPolicy(max_retry_elapsed_per_request=1.0, retry=RetryPolicy(jitter=0)))
+
+    outcomes = await BatchExecutor(executor).execute_requests((_v3(1), _v3(2)), context=context)
+    await executor.coordinator.close()
+
+    assert transport.sends == 1
+    for outcome in outcomes:
+        assert isinstance(outcome, BatchFailure)
+        assert not isinstance(outcome.error, BudgetExceededError)
+        assert isinstance(outcome.error, B24ApiError)
+        assert outcome.error.http_status == _TOO_MANY_REQUESTS

@@ -17,11 +17,12 @@ import b24api.client
 from b24api import Bitrix24, DirectDispatch, ExecutionPolicy, ReplaySafety, Request, RouteKind, Settings
 from b24api.contracts import Command
 from b24api.settings import api_settings
-from b24api.transport import WireResponse
+from b24api.transport import HttpxTransport, WireResponse
 from tests.scripting import ResponderTransport, on_loop, reached
 
 _WEBHOOK = "https://bitrix24.com/rest/0/test/"
 _TIMEOUT = 17.5
+_DEFAULT_TIMEOUT = 30.0
 
 
 def _assert_traceback_excludes(error: BaseException, value: str, *, test_file: Path) -> None:
@@ -143,6 +144,16 @@ async def test_settings_timeout_bounds_each_attempt_of_the_owned_transport_and_n
         assert owned.timeout == _TIMEOUT
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_the_default_attempt_timeout_is_thirty_seconds_for_the_transport_and_the_settings() -> None:
+    transport = HttpxTransport(_WEBHOOK)
+    try:
+        assert transport.timeout == _DEFAULT_TIMEOUT
+    finally:
+        await transport.aclose()
+    assert Settings(webhook_url=_WEBHOOK).http_timeout == _DEFAULT_TIMEOUT
 
 
 class _RecordingTransport:

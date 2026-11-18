@@ -645,7 +645,8 @@ class Executor:
                 cancellation.raise_if_requested()
                 return wire, response
             # The methods the coordinator admits: a classic batch envelope's own name is not one of them.
-            await self.observe_refusal(context, response_error, methods=methods, sent_at=shared.sent_at, wire=wire)
+            observe = self.observe_failure if request.method in methods else self.observe_envelope_failure
+            await observe(context, response_error, methods=methods, sent_at=shared.sent_at, wire=wire)
             cancellation.raise_if_requested()
             # A late failure meets the ambiguity rules first; the budget stops only a retry it would ask for.
             await self._prepare_retry(request, response_error, context=context, shared=shared, methods=methods)
@@ -797,7 +798,9 @@ class Executor:
             None, wire, context=context, mode=_BodyMode.JSON, summary=envelope.summary
         )
         if response_error is not None:
-            await self.observe_refusal(context, response_error, methods=methods, sent_at=attempts.sent_at, wire=wire)
+            await self.observe_envelope_failure(
+                context, response_error, methods=methods, sent_at=attempts.sent_at, wire=wire
+            )
         return _envelope_answered(wire, response_error, response, cancelled=cancellation.requested())
 
     async def _send_envelope(
@@ -923,7 +926,7 @@ class Executor:
         for method in methods:
             coordinator.observe_reset(method, operating_reset_delay(timing.operating_reset_at, date))
 
-    async def observe_refusal(
+    async def observe_failure(
         self,
         context: ExecutionContext,
         error: B24ApiError,
@@ -932,17 +935,56 @@ class Executor:
         sent_at: float,
         wire: WireResponse | None = None,
     ) -> None:
-        """Pause what a failed answer's load limit holds: the host, or each of ``methods``; any other, nothing.
+        """Record what a failed answer of ``methods``' own request says about the load.
 
-        A method's operating-time refusal holds that method alone: for the server's hint, else until its operating
-        time resets, as its latest answer said, else for the retry backoff of its limit streak. A request-rate
-        refusal holds the host for the server's hint, else for the backoff of the host's limit streak, so the sends
-        that share the host slow down together. A hint on another failure holds the host only when its status is
-        about the load (429 or 503, ``hints_load``). The host's hold is added to the operation's cooldown.
+        A failure about the load holds what its limit holds (``_hold``). Any other failure answers the request as
+        a success does: it ends the limit streaks of the host and of ``methods`` (``observe_answer``).
+        """
+        if hints_load(error):
+            await self._hold(context, error, methods=methods, sent_at=sent_at, wire=wire)
+        else:
+            context.coordinator.observe_answer(methods, sent_at=sent_at)
+
+    async def observe_envelope_failure(
+        self,
+        context: ExecutionContext,
+        error: B24ApiError,
+        *,
+        methods: frozenset[str],
+        sent_at: float,
+        wire: WireResponse,
+    ) -> None:
+        """Record what a failed answer of a whole batch envelope, admitted under ``methods``, says about the load.
+
+        A failure about the load cannot be attributed to one command: it holds every method its limit holds
+        (``_hold``). Any other failure is the host's answer, not its commands': it ends the host's limit streak.
+        """
+        if hints_load(error):
+            await self._hold(context, error, methods=methods, sent_at=sent_at, wire=wire)
+        else:
+            context.coordinator.observe_answer(frozenset(), sent_at=sent_at)
+
+    async def _hold(
+        self,
+        context: ExecutionContext,
+        error: B24ApiError,
+        *,
+        methods: frozenset[str],
+        sent_at: float,
+        wire: WireResponse | None,
+    ) -> None:
+        """Pause what a failure about the load holds: the host, or each of ``methods``.
+
+        A method's operating-time refusal holds each of ``methods`` alone: for the server's hint, else until its
+        operating time resets, as its latest answer said, else for the retry backoff of its limit streak. A
+        request-rate refusal holds the host for the server's hint, else for the backoff of the host's limit streak,
+        so the sends that share the host slow down together. Any other failure about the load (429 or 503,
+        ``hints_load``) holds the host for its hint, if it has one. The host's hold is added to the operation's
+        cooldown.
         """
         coordinator = context.coordinator
         limit = limit_of(error)
-        hint = _retry_after_seconds(wire) if wire is not None and hints_load(error) else None
+        hint = _retry_after_seconds(wire) if wire is not None else None
         if limit is Limit.METHOD:
             for method in sorted(methods):
                 delay = hint if hint is not None else coordinator.method_reset(method)
@@ -968,11 +1010,10 @@ class Executor:
 
         An entry carries no hint of its own.
         """
-        if isinstance(answer, B24ApiError) and limit_of(answer) is not None:
-            await self.observe_refusal(context, answer, methods=frozenset({method}), sent_at=sent_at)
+        if isinstance(answer, B24ApiError):
+            await self.observe_failure(context, answer, methods=frozenset({method}), sent_at=sent_at)
         else:
-            response = answer if isinstance(answer, Response) else None
-            self.observe_answer(context, None, response, methods=frozenset({method}), sent_at=sent_at)
+            self.observe_answer(context, None, answer, methods=frozenset({method}), sent_at=sent_at)
 
     def plan_replay(
         self,

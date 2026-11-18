@@ -7,13 +7,21 @@ from typing import TYPE_CHECKING
 import pytest
 
 from b24api import ReplaySafety, Request, RouteKind, TerminalState
-from b24api.contracts import Command
+from b24api.batch.correlation import _Command
+from b24api.batch.engine import BatchExecutor, BatchProgress
+from b24api.contracts import Command, ExecutionPolicy
+from b24api.errors import BatchFailed
+from b24api.execution import Executor, RateCoordinator
+from b24api.execution.facts import Execution
 from b24api.testing import ScriptedTransport
 from b24api.transport import WireResponse
 from tests.scripting import client_for, json_response
 
 if TYPE_CHECKING:
-    from b24api.contracts import OperationReport
+    from collections.abc import AsyncIterator
+
+    from b24api.contracts import CommandSuccess, OperationReport
+    from b24api.contracts.stream import OperationStream
     from b24api.transport import WireRequest
 
 
@@ -140,3 +148,88 @@ async def test_answered_outcomes_the_consumer_did_not_take_are_neither_possibly_
 
     assert (report.admitted, report.emitted) == (3, 1)
     assert (report.undelivered_possibly_run, report.undelivered_not_sent) == (0, 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", [RouteKind.BARE, RouteKind.API_V3])
+async def test_commands_of_an_envelope_waiting_for_its_permit_when_the_chunk_is_cancelled_were_not_sent(
+    route: RouteKind,
+) -> None:
+    # The host is held, so the chunk's envelope waits for its permit; the chunk is cancelled there. Nothing of it
+    # left, in either dialect: each of its commands was not sent.
+
+    async def never(_seconds: float) -> None:
+        await asyncio.Future()
+
+    transport = _HangingTransport(hang_at=0)
+    coordinator = RateCoordinator(max_concurrency=2, sleep=never)
+    executor = Executor(transport, coordinator=coordinator)
+    await coordinator.observe_throttle(30.0, reason="quota")
+    commands = tuple(
+        _Command(index, f"c{index:012d}", Request("x.item.add", {"id": index}, ReplaySafety.UNSAFE, route=route), None)
+        for index in range(5)
+    )
+    progress = BatchProgress()
+    chunk = asyncio.ensure_future(
+        BatchExecutor(executor).execute_chunk(
+            commands, context=executor.context(ExecutionPolicy(max_elapsed=120.0)), halt=False, progress=progress
+        )
+    )
+    waiting = False
+    for _turn in range(100):
+        if waiting := any(count for _work_class, count in (await coordinator.snapshot()).queued):
+            break
+        await asyncio.sleep(0)
+    assert waiting
+    chunk.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await chunk
+    await coordinator.close()
+
+    assert transport.sends == 0
+    assert [progress.execution(command.index) for command in commands] == [Execution.NOT_SENT] * 5
+
+
+async def _failing_source(count: int) -> AsyncIterator[Command[int]]:
+    for index in range(count):
+        yield Command(Request.bare("x.item.add", {"id": index}, ReplaySafety.UNSAFE), index)
+    raise _SourceFailedError
+
+
+class _SourceFailedError(RuntimeError):
+    """The caller's command source failed."""
+
+
+@pytest.mark.asyncio
+async def test_commands_admitted_from_a_source_that_then_failed_are_reported_not_sent() -> None:
+    # The source yields three commands, then fails: none of them is sent. The consumer stops after the first
+    # outcome; the two it left behind were never sent.
+    async with client_for(_HangingTransport(hang_at=0)) as client:
+        stream = client.batch_outcomes(_failing_source(3))
+        async with stream:
+            async for _outcome in stream:
+                break
+    report = stream.report
+    assert report is not None
+
+    assert (report.admitted, report.emitted) == (3, 1)
+    assert (report.undelivered_possibly_run, report.undelivered_not_sent) == (0, 2)
+
+
+async def _drain(stream: OperationStream[CommandSuccess[int]]) -> None:
+    async with stream:
+        async for _outcome in stream:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_a_fail_fast_batch_whose_source_failed_reports_its_admitted_commands_not_sent() -> None:
+    async with client_for(_HangingTransport(hang_at=0)) as client:
+        stream = client.batch(_failing_source(3))
+        with pytest.raises(BatchFailed):
+            await _drain(stream)
+    report = stream.report
+    assert report is not None
+
+    assert (report.admitted, report.emitted) == (3, 0)
+    assert (report.undelivered_possibly_run, report.undelivered_not_sent) == (0, 3)

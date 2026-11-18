@@ -651,6 +651,27 @@ async def test_coordinator_merges_cooldowns_and_alternates_retries_with_first_se
 
 
 @pytest.mark.asyncio
+async def test_coordinator_grants_interactive_first_sends_twice_as_often_as_batches() -> None:
+    coordinator = RateCoordinator(max_concurrency=1)
+    first = await coordinator.acquire(WorkClass.TRAVERSAL_DIRECT, methods=frozenset({"m"}))
+    order: list[str] = []
+
+    async def wait(work_class: WorkClass, name: str) -> None:
+        permit = await coordinator.acquire(work_class, methods=frozenset({"m"}))
+        order.append(name)
+        await permit.release()
+
+    tasks = [asyncio.create_task(wait(WorkClass.INTERACTIVE_DIRECT, "I")) for _ in range(8)]
+    tasks += [asyncio.create_task(wait(WorkClass.BATCH, "B")) for _ in range(4)]
+    await asyncio.sleep(0)
+    await first.release()
+    await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+    await coordinator.close()
+
+    assert "".join(order) == "BIIBIIBIIBII"
+
+
+@pytest.mark.asyncio
 async def test_cancelled_waiter_is_removed_without_leaking_permit() -> None:
     coordinator = RateCoordinator(max_concurrency=1)
     first = await coordinator.acquire(WorkClass.BATCH, methods=frozenset({"profile"}))
@@ -1497,3 +1518,16 @@ def test_a_settled_task_lets_its_coroutine_be_closed() -> None:
     assert not is_interrupt(GeneratorExit())
     assert is_interrupt(KeyboardInterrupt())
     assert is_interrupt(SystemExit())
+
+
+_HOUR = 3600.0
+
+
+@pytest.mark.asyncio
+async def test_a_method_hold_is_capped_at_an_hour() -> None:
+    coordinator = RateCoordinator()
+    coordinator.hold_method("m", 2 * _HOUR)
+    held = coordinator.admission_delay(frozenset({"m"}))
+    await coordinator.close()
+
+    assert held == pytest.approx(_HOUR, abs=1)

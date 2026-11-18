@@ -183,8 +183,12 @@ _LOAD_STATUSES = frozenset({_HTTP_TOO_MANY_REQUESTS, 503})
 
 
 def limit_of(error: B24ApiError) -> Limit | None:
-    """Return the load limit a refusal names, if it names one: by its code, or HTTP 429."""
-    code = error.normalized_code if isinstance(error, ApiResponseError) else None
+    """Return the load limit a refusal names, if it names one: by its code, compared without letter case, or HTTP 429.
+
+    A REST 3.0 code keeps its exact case in ``normalized_code``; the limit is the same in any case, as the retry and
+    ambiguity policies compare it.
+    """
+    code = str(error.original_code).strip().casefold() if isinstance(error, ApiResponseError) else None
     if code == _METHOD_LIMIT_CODE:
         return Limit.METHOD
     if code in _HOST_LIMIT_CODES or error.http_status == _HTTP_TOO_MANY_REQUESTS:

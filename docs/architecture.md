@@ -57,7 +57,9 @@ chunk's `BatchProgress`, which the batch engine keeps by the same rule: a comman
 with its envelope, was answered, and one answered with a success succeeded; one whose latest send, or one
 before it, may have run without an answer may have run; one never sent was not sent. Until the chunk ends, a
 command without a final outcome may still be sent (a replay it waits for), so a page cancelled meanwhile may
-have run; a REST v3 group keeps its state to itself, so its commands in progress may have run. A fast keyset
+have run. A REST v3 group sends each command it still resolves in every envelope, so the lineage of its sends is
+each such command's own, as a classic round's is: a group cancelled while it waits for its first permit sent
+nothing. A chunk whose source failed before it was sent never sends any of it. A fast keyset
 wave engine, flat or shared by reference bindings, settles each page it was handed by its command id from what
 that command did, also when its call raises; the page ledger (`FastPageLedger`) settles a page never handed to
 an engine as not executed, which retires it, the one rule on every path. A page answered with a success
@@ -219,13 +221,15 @@ outcome.
   attempt by the window left itself, so the window's end is classified by phase too; the executor cuts
   any other transport's attempt when the window closes, and that cut proves nothing about how far it
   got. `Settings` sets no policy: the client's default policy is `ExecutionPolicy()`.
-- Load limits are the coordinator's holds, set where an answer is read (`Executor.observe_refusal`,
-  for a direct answer, a classic envelope, a REST 3.0 envelope and a classic command's entry): a
+- Load limits are the coordinator's holds, set where an answer is read (`Executor.observe_failure` for
+  a direct answer and a command's own entry, a classic entry or a REST 3.0 element;
+  `observe_envelope_failure` for a classic or REST 3.0 envelope as a whole): a
   request-rate refusal (`throttle.limit_of`: the quota code, the REST 3.0 rate limit, a 429) holds the
   host for the server's hint, else for the backoff of the host's refusals in a row
   (`RateCoordinator.limit_streak`: a refusal of a send that left after the latest pause began grows the
-  streak, one of the burst that pause answers does not, and an answer that is no refusal, to a send that
-  left after that pause began, ends it); an
+  streak, one of the burst that pause answers does not, and an answer about anything but the load (a
+  success, or a failure with no limit's code, no 429 and no 503), to a send that left after that pause
+  began, ends it, an envelope's own failure only the host's); an
   `OPERATION_TIME_LIMIT` holds its method (`hold_method`) for the hint, else until the operating time
   that method's latest answer gave resets (`observe_reset`, from `time.operating_reset_at`, a classic
   command's `result_time` included), else for the method's streak backoff. A hint holds the host only

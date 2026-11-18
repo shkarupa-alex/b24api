@@ -591,3 +591,271 @@ async def test_a_first_send_refuses_a_command_whose_hold_outlasts_what_the_hosts
     assert plan is not None
     assert plan.plans[0] is _SendPlan.SEND
     assert plan.plans[1].refused
+
+
+def _staggered(time: _Time, respond: Callable[[Request], object]) -> Callable[[Request], object]:
+    """Let each send leave 0.1 seconds after the one before it, and answer it once the sends are all in flight."""
+
+    async def answer(request: Request) -> object:
+        time.now += 0.1
+        for _ in range(8):
+            await asyncio.sleep(0)
+        return respond(request)
+
+    return answer
+
+
+@pytest.mark.asyncio
+async def test_a_burst_whose_sends_left_at_different_moments_before_the_pause_pauses_the_host_once() -> None:
+    # The sends of a burst leave one after another, all before the first refusal begins the pause: every one of
+    # them belongs to the burst that pause answers, so the host pauses once, for the initial delay.
+    time = _Time()
+    answers = iter([_refusal("QUERY_LIMIT_EXCEEDED")] * 3 + [{"result": 1}] * 3)
+    transport = ResponderTransport(_staggered(time, lambda _request: next(answers)))
+    executor = _executor(transport, time, max_concurrency=3)
+    context = executor.context(_POLICY)
+
+    await asyncio.gather(*(executor.execute(_get(f"crm.item.get{index}"), context=context) for index in range(3)))
+    snapshot = await context.snapshot()
+    await executor.coordinator.close()
+
+    assert snapshot.cooldown_seconds == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_an_answer_to_a_send_that_left_before_the_pause_keeps_the_streak() -> None:
+    # A and B leave together; A is refused, then B is answered. B left before the pause began, so its answer says
+    # nothing of the limit after it: C, refused after the pause, doubles it.
+    time = _Time()
+    sent_at: dict[str, list[float]] = {}
+    refused = asyncio.Event()
+
+    async def respond(request: Request) -> object:
+        sent_at.setdefault(request.method, []).append(time.now)
+        if request.method == "a.x":
+            for _ in range(4):
+                await asyncio.sleep(0)
+            refused.set()
+            return _refusal("QUERY_LIMIT_EXCEEDED")
+        if request.method == "b.y":
+            await refused.wait()
+            for _ in range(4):
+                await asyncio.sleep(0)
+            return {"result": 1}
+        return _refusal("QUERY_LIMIT_EXCEEDED") if len(sent_at["c.z"]) == 1 else {"result": 1}
+
+    executor = _executor(ResponderTransport(respond), time)
+    one = ExecutionPolicy(max_attempts_per_request=1, retry=RetryPolicy(jitter=0))
+    await asyncio.gather(
+        executor.execute(_get("a.x"), policy=one), executor.execute(_get("b.y"), policy=one), return_exceptions=True
+    )
+    await executor.execute(_get("c.z"), policy=_POLICY)
+    await executor.coordinator.close()
+
+    assert sent_at["c.z"] == [0.5, 1.5]
+
+
+_SECOND = 2
+
+
+@pytest.mark.asyncio
+async def test_a_time_limit_after_its_methods_reset_has_passed_holds_it_for_the_retry_backoff() -> None:
+    # The reset the method's answer said has passed: it is unknown again, and the time limit holds the method for
+    # the backoff of its streak, as with no reset known.
+    time = _Time()
+    sent_at: list[float] = []
+    answered = {"result": 1, "time": {"operating_reset_at": wall.time() + 1, "operating": 470}}
+    transport = ResponderTransport(
+        _timed(
+            sent_at,
+            time,
+            replies(
+                WireResponse(200, (*_JSON, _now_date()), json.dumps(answered).encode()),
+                _refusal("OPERATION_TIME_LIMIT"),
+                {"result": _SECOND},
+            ),
+        )
+    )
+    executor = _executor(transport, time)
+
+    await executor.execute(_get(), policy=_POLICY)
+    time.now += 5.0
+    retried = await executor.execute(_get(), policy=_POLICY)
+    await executor.coordinator.close()
+
+    assert retried.result == _SECOND
+    assert sent_at == [0.0, 5.0, 5.5]
+
+
+@pytest.mark.asyncio
+async def test_a_time_limit_with_a_hint_holds_its_method_for_the_hint_not_until_its_reset() -> None:
+    time = _Time()
+    sent_at: list[float] = []
+    answered = {"result": 1, "time": {"operating_reset_at": wall.time() + 100, "operating": 470}}
+    transport = ResponderTransport(
+        _timed(
+            sent_at,
+            time,
+            replies(
+                WireResponse(200, (*_JSON, _now_date()), json.dumps(answered).encode()),
+                _refusal("OPERATION_TIME_LIMIT", headers=(("retry-after", "2"),)),
+                {"result": 2},
+            ),
+        )
+    )
+    executor = _executor(transport, time)
+
+    await executor.execute(_get(), policy=_POLICY)
+    await executor.execute(_get(), policy=_POLICY)
+    await executor.coordinator.close()
+
+    assert sent_at == [0.0, 0.0, 2.0]
+
+
+@pytest.mark.asyncio
+async def test_a_methods_time_limit_streak_is_its_own_not_the_hosts() -> None:
+    # The host was refused by quota and still counts that streak; the method's first time limit is the first of its
+    # own streak, held for the initial delay.
+    time = _Time()
+    sent_at: list[float] = []
+    answers = replies(_refusal("QUERY_LIMIT_EXCEEDED"), _refusal("OPERATION_TIME_LIMIT"), {"result": 1})
+    transport = ResponderTransport(_timed(sent_at, time, answers))
+    executor = _executor(transport, time)
+    one = ExecutionPolicy(max_attempts_per_request=1, retry=RetryPolicy(jitter=0))
+
+    with pytest.raises(BudgetExceededError, match="attempt budget"):
+        await executor.execute(_get("crm.deal.list"), policy=one)
+    await executor.execute(_get(), policy=_POLICY)
+    await executor.coordinator.close()
+
+    assert sent_at == [0.0, 0.5, 1.0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [429, 503])
+async def test_a_rest_v3_rate_limit_holds_the_host_by_its_code(status: int) -> None:
+    # REST 3.0 codes keep their exact case; the rate limit is the same whatever the status that carries it.
+    time = _Time()
+    sent_at: list[float] = []
+    body = json.dumps({"error": {"code": "BITRIX_REST_V3_EXCEPTION_RATELIMITEXCEPTION", "message": "limit"}})
+    refusal = WireResponse(status, _JSON, body.encode())
+    transport = ResponderTransport(_timed(sent_at, time, replies(refusal, {"result": 1})))
+    executor = _executor(transport, time)
+    one = ExecutionPolicy(max_attempts_per_request=1, retry=RetryPolicy(jitter=0))
+
+    with pytest.raises(BudgetExceededError, match="attempt budget") as refused:
+        await executor.execute(_get(), policy=one)
+    await executor.execute(_get("crm.deal.list"), policy=one)
+    await executor.coordinator.close()
+
+    assert isinstance(refused.value.__cause__, ApiResponseError)
+    assert refused.value.__cause__.normalized_code == "BITRIX_REST_V3_EXCEPTION_RATELIMITEXCEPTION"
+    assert sent_at == [0.0, 0.5]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "code", "held"),
+    [
+        (400, "ERROR_ARGUMENT", 0.5),
+        (403, "ACCESS_DENIED", 0.5),
+        (500, "INTERNAL_SERVER_ERROR", 0.5),
+        (503, "BUSY", 1.0),
+    ],
+)
+async def test_a_direct_answer_that_fails_about_anything_but_the_load_ends_the_hosts_streak(
+    status: int, code: str, held: float
+) -> None:
+    # A quota refusal, then a request sent after its pause answered with an ordinary failure, then a quota refusal
+    # again: the failure answered the request, as a command's entry does, so the second refusal starts a new streak
+    # and holds the host for the first backoff. A 503 is about the load: it ends nothing, and the streak doubles.
+    time = _Time()
+    executor = _executor(
+        ResponderTransport(
+            replies(_refusal("QUERY_LIMIT_EXCEEDED"), _refusal(code, status=status), _refusal("QUERY_LIMIT_EXCEEDED"))
+        ),
+        time,
+    )
+    one = ExecutionPolicy(max_attempts_per_request=1, retry=RetryPolicy(jitter=0))
+    for method in ("a.x", "b.y", "c.z"):
+        with pytest.raises(B24ApiError):
+            await executor.execute(_get(method), policy=one)
+    hold = executor.coordinator.admission_delay(frozenset({"d.w"}))
+    await executor.coordinator.close()
+
+    assert hold == pytest.approx(held)
+
+
+@pytest.mark.asyncio
+async def test_a_direct_answer_that_fails_with_no_load_limit_ends_its_methods_streak() -> None:
+    # As a command's entry does: a time limit, an ordinary failure of the same method, a time limit again.
+    time = _Time()
+    answers = replies(
+        _refusal("OPERATION_TIME_LIMIT"), _refusal("NOT_FOUND", status=400), _refusal("OPERATION_TIME_LIMIT")
+    )
+    executor = _executor(ResponderTransport(answers), time)
+    policy = ExecutionPolicy(
+        max_attempts_per_request=1, retry=RetryPolicy(initial_delay=0.05, maximum_delay=5.0, jitter=0)
+    )
+    for _ in range(3):
+        time.now += 1.0
+        with pytest.raises(B24ApiError):
+            await executor.execute(_get(), policy=policy)
+    held = executor.coordinator.admission_delay(frozenset({"crm.item.get"}))
+    await executor.coordinator.close()
+
+    assert held == pytest.approx(0.05)
+
+
+_BACKOFF = 5.0
+
+
+class _FirstElementFails(ScriptedTransport):
+    """Answer a batch envelope with its first command's element carrying ``code`` and every other a plain item."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(())
+        self.code = code
+
+    async def send_wire(self, wire: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        del attempt_timeout, max_response_bytes
+        failed: dict[str, object] = {"error": {"code": self.code}}
+        if wire.array_body is not None:
+            elements = [failed, *({"item": 1} for _ in wire.array_body.commands[1:])]
+            return WireResponse(200, _JSON, json.dumps({"result": elements}).encode())
+        commands = wire.parameters["cmd"]
+        assert isinstance(commands, dict)
+        entries = {key: failed if index == 0 else {"item": 1} for index, key in enumerate(commands)}
+        return WireResponse(200, _JSON, json.dumps({"result": {"result": entries, "result_error": []}}).encode())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", [RouteKind.API_V3, RouteKind.BARE])
+@pytest.mark.parametrize(
+    ("code", "method_held", "host_held"),
+    [("OPERATION_TIME_LIMIT", _BACKOFF, 0.0), ("QUERY_LIMIT_EXCEEDED", _BACKOFF, _BACKOFF)],
+)
+async def test_a_limit_an_element_declares_holds_its_method_or_the_host_as_a_direct_answer_does(
+    route: RouteKind, code: str, method_held: float, host_held: float
+) -> None:
+    # The command's own error contract finds the limit code in its element of the envelope's answer, a REST 3.0
+    # array's element as a classic entry: a time limit holds its method, a quota refusal the host, for the backoff.
+    time = _Time()
+    executor = _executor(_FirstElementFails(code), time)
+    spec = ResultErrorSpec(ResultSelector(("error",)), ("code",))
+    chunk = tuple(
+        _Command(
+            index,
+            f"c{index:012d}",
+            Request("m.x", {"i": index}, ReplaySafety.UNSAFE, route=route, result_error=spec),
+            None,
+        )
+        for index in range(2)
+    )
+    policy = ExecutionPolicy(max_attempts_per_request=1, retry=RetryPolicy(initial_delay=_BACKOFF, jitter=0))
+
+    await BatchExecutor(executor).execute_chunk(chunk, context=executor.context(policy), halt=False)
+    held = executor.coordinator.admission_delays((frozenset({"m.x"}), frozenset({"other.y"})))
+    await executor.coordinator.close()
+
+    assert held == (method_held, host_held)

@@ -247,13 +247,15 @@ class BatchProgress:
     reads it by the rule a command's own failure follows: a command whose latest send may have run without an
     answer, or one before it, may have run; one answered, by its entry or with its envelope, was answered
     (it ran, or was refused, as its answer says); one never sent was not sent. Until the chunk has ended, a
-    command without a final outcome may still be sent, so it may run; a REST v3 group in progress keeps its state
-    to itself, so its commands may have run.
+    command without a final outcome may still be sent, so it may run. A REST v3 group sends each command it still
+    resolves in every envelope, so the group's lineage is each such command's own, as a classic round's is.
     """
 
     def __init__(self) -> None:
         """Start with nothing sent."""
         self._final: Mapping[int, BatchOutcome] = {}
+        # The final outcomes of the group in progress, which it settles before the chunk's map has them.
+        self._group: Mapping[int, BatchOutcome] = {}
         self._lineup: _Lineup | None = None
         self._attempts: _RequestAttempts | None = None
         self._round: frozenset[int] = frozenset()
@@ -267,9 +269,7 @@ class BatchProgress:
     def _outcome(self, index: int) -> BatchOutcome | None:
         """Return the final outcome of command ``index``, or ``None`` while it has none."""
         outcome = self._final.get(index)
-        if outcome is None and self._lineup is not None:
-            outcome = self._lineup.settled.get(index)
-        return outcome
+        return self._group.get(index) if outcome is None else outcome
 
     def track_groups(self, settled: Mapping[int, BatchOutcome]) -> None:
         """Read the chunk's final outcomes from ``settled``, which the engine fills as each group ends."""
@@ -277,7 +277,7 @@ class BatchProgress:
 
     def track_bare(self, lineup: _Lineup, attempts: _RequestAttempts) -> None:
         """Read a classic envelope's commands from its lineup and the attempts its rounds share."""
-        self._lineup, self._attempts, self._opaque = lineup, attempts, frozenset()
+        self._lineup, self._attempts, self._opaque, self._group = lineup, attempts, frozenset(), lineup.settled
 
     def track_round(self, commands: tuple[_Command, ...]) -> None:
         """Mark the commands of the latest classic round, whose sends ``execution`` adds to each one's lineage.
@@ -287,9 +287,11 @@ class BatchProgress:
         """
         self._round = frozenset(command.index for command in commands)
 
-    def track_opaque(self, commands: tuple[_Command, ...]) -> None:
-        """Mark the commands of a REST v3 group in progress."""
-        self._lineup, self._attempts, self._round = None, None, frozenset()
+    def track_group(
+        self, commands: tuple[_Command, ...], attempts: _RequestAttempts, settled: Mapping[int, BatchOutcome]
+    ) -> None:
+        """Read a REST v3 group's commands from the attempts its envelopes share and the outcomes it settled."""
+        self._lineup, self._attempts, self._round, self._group = None, attempts, frozenset(), settled
         self._opaque = frozenset(command.index for command in commands)
 
     def settlement(self, index: int) -> CommandSettlement:
@@ -309,8 +311,10 @@ class BatchProgress:
         outcome = self._outcome(index)
         if outcome is not None:
             return Execution.ANSWERED if isinstance(outcome, BatchSuccess) else execution(outcome.error)
-        if not self._ended or index in self._opaque:
+        if not self._ended:
             return Execution.POSSIBLY_RUN
+        if index in self._opaque and self._attempts is not None:
+            return self._attempts.lineage.unsent()
         waiting = None if self._lineup is None else self._lineup.waiting.get(index)
         lineage = _Lineage() if waiting is None else waiting.lineage
         if index in self._round and self._attempts is not None:
@@ -433,8 +437,9 @@ class BatchExecutor:
             if on_envelope is not None:
                 on_envelope()
             if sending[0].request.route is RouteKind.API_V3:
-                progress.track_opaque(sending)
-                outcomes = await _V3Resolution(self.executor, context).run(sending)
+                resolution = _V3Resolution(self.executor, context)
+                progress.track_group(sending, resolution.attempts, resolution.settled)
+                outcomes = await resolution.run(sending)
             else:
                 outcomes = await self._execute_bare(sending, context=context, options=options, progress=progress)
             settled.update((outcome.command_index, outcome) for outcome in outcomes)

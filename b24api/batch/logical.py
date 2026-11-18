@@ -286,10 +286,15 @@ class LogicalBatchKernelStream[C]:
                     CommandNotExecuted(command.index, command.correlation, command.request.summary, reason)
                     for command in chunk.commands
                 )
+                # The chunk ends before anything of it is sent: what is not delivered of it was never sent.
+                unsent = BatchProgress()
+                unsent.end()
+                self._chunk, self._delivered = (tuple(command.index for command in chunk.commands), unsent), set()
                 if self._fail_fast:
                     raise _BatchWindowError(cast("tuple[CommandOutcome[object], ...]", pending), source_error=failure)
                 for pending_outcome in pending:
                     self._emitted += 1
+                    self._delivered.add(pending_outcome.index)
                     yield pending_outcome
                     self._completion.terminal(pending_outcome.index, BindingClosure.FAILURE)
                 raise failure
