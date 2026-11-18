@@ -11,11 +11,11 @@ import time
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 from b24api._error_types import FailurePhase
 from b24api.contracts.evidence import ResponseEvidence
-from b24api.contracts.json import _json_type_name
+from b24api.contracts.json import _json_type_name, repeated_names
 from b24api.contracts.policy import ExecutionPolicy
 from b24api.contracts.request import ReplaySafety, Request, ResultErrorShape, diagnostic_context
 from b24api.contracts.response import (
@@ -30,7 +30,6 @@ from b24api.errors import (
     BatchCommandError,
     BudgetExceededError,
     CapabilityError,
-    ClientClosedError,
     EnvelopeContractError,
     HTTPGatewayError,
     ProtocolError,
@@ -41,12 +40,12 @@ from b24api.execution.boundary import send_transport, send_wire_envelope
 from b24api.execution.context import CancellationMark, ExecutionContext, mark_cancellation
 from b24api.execution.facts import (
     Execution,
-    ambiguous_status,
-    answered_conclusively,
+    Verdict,
     http_success,
     possible_execution,
     record_dispatch,
     record_withheld,
+    send_verdict,
 )
 from b24api.execution.rate import DeadlineBudget, RateCoordinator, WorkClass
 from b24api.execution.throttle import _retry_after_seconds, _retry_delay, _throttle_reason
@@ -59,7 +58,7 @@ from b24api.transport.base import (
     transport_supports_json_array_body,
 )
 from b24api.transport.disposition import disposition_filename
-from b24api.transport.protocol import ProtocolCodec
+from b24api.transport.protocol import ProtocolCodec, decode_json
 
 if TYPE_CHECKING:
     from b24api.contracts.request_summary import RequestSummary
@@ -95,7 +94,6 @@ class _BodyMode(Enum):
 
     BINARY = "binary"
     JSON = "json"
-    JSON_STRICT_MEMBERS = "json_strict_members"
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,7 +171,7 @@ class _Lineage:
         """Return whether ``error`` leaves the latest send possibly run: it is what left it so, or settles nothing."""
         latest = self.latest
         return isinstance(latest, _PossiblyRun) and (
-            error is latest.failure or not answered_conclusively(error, policy)
+            error is latest.failure or send_verdict(error, policy) is Verdict.MAY_HAVE_RUN
         )
 
     def record(self, error: BaseException, policy: ExecutionPolicy) -> None:
@@ -387,15 +385,20 @@ class _RequestAttempts:
         The one rule for every stop before a send, by the budget or otherwise (a closed client), whichever single
         request, batch round or isolated send it stops: what ended the send is the outcome, and what it followed is
         its cause. The stop ran nothing, so whoever records how the request ended records what the sends before it
-        left open (``record_open``), never the stop as a send that may have run.
+        left open (``record_open``), never the stop as a send that may have run. A stop raised where the request is
+        not known (the attempt budget, for example) names the request of the failure it followed.
         """
-        if self.retry_cause is not None:
-            error.__cause__ = self.retry_cause
+        cause = self.retry_cause
+        if cause is not None:
+            error.__cause__ = cause
+            if error.request_summary is None:
+                error.request_summary = error.request = cause.request_summary
 
-    def settle(self, error: B24ApiError, policy: ExecutionPolicy) -> None:
-        """Record how the last send failed."""
-        settled = _proves_not_run(error, policy) or answered_conclusively(error, policy)
-        self.classified(error, may_have_run=not settled)
+    def settle(self, error: B24ApiError, policy: ExecutionPolicy) -> Verdict:
+        """Record how the last send failed, by what its failure proves (``send_verdict``), and return that."""
+        verdict = send_verdict(error, policy)
+        self.classified(error, may_have_run=verdict is Verdict.MAY_HAVE_RUN)
+        return verdict
 
     def classified(self, failure: B24ApiError | None, *, may_have_run: bool) -> None:
         """Record how the last send ended: possibly run (``failure`` explains it), or answered or refused.
@@ -425,9 +428,8 @@ class PhysicalAttemptOutcome:
     """What one physical send of a batch envelope produced, before any dialect classification or retry.
 
     ``dispatch_started`` comes from dispatch facts (an attempt was reserved and handed to a transport that did
-    not refuse it before it left), never from the absence of a response. ``transport_proves_not_accepted`` is set
-    only when nothing reached the server: the attempt failed before dispatch, or the transport proved it was not
-    accepted.
+    not refuse it before it left), never from the absence of a response. What a dispatched attempt's failure
+    proves is ``send_verdict``'s, read by the dialect.
     """
 
     kind: Literal["response", "error", "cancelled"]
@@ -435,23 +437,6 @@ class PhysicalAttemptOutcome:
     response: Response | None = dataclasses.field(repr=False)
     error: BaseException | None = dataclasses.field(repr=False)
     dispatch_started: bool
-    transport_proves_not_accepted: bool
-
-
-class _DecodedJsonObject(dict[str, object]):
-    """Last-member-wins JSON object retaining duplicate-name evidence."""
-
-    __slots__ = ("duplicate_names",)
-
-    def __init__(self, pairs: list[tuple[str, object]]) -> None:
-        duplicates: list[str] = []
-        values: dict[str, object] = {}
-        for key, value in pairs:
-            if key in values:
-                duplicates.append(key)
-            values[key] = value
-        super().__init__(values)
-        self.duplicate_names = tuple(duplicates)
 
 
 _HTTP_CLIENT_ERROR_MINIMUM = 400
@@ -508,7 +493,6 @@ class Executor:
         context: ExecutionContext | None = None,
         policy: ExecutionPolicy | None = None,
         work_class: WorkClass = WorkClass.INTERACTIVE_DIRECT,
-        strict_json_members: bool = False,
         _admission_methods: frozenset[str] | None = None,
         _attempts: _RequestAttempts | None = None,
     ) -> Response:
@@ -517,36 +501,35 @@ class Executor:
             raise ValueError("pass context or policy, not both")
         if not isinstance(request, Request):
             raise TypeError("request must be canonical Request")
-        if not isinstance(strict_json_members, bool):
-            raise TypeError("strict_json_members must be a boolean")
         context = context or self.context(policy)
         attempts = _attempts or _RequestAttempts()
         try:
-            wire, parsed = await self._execute_wire_attempts(
+            wire, response = await self._execute_wire_attempts(
                 request,
                 context=context,
                 work_class=work_class,
-                mode=_BodyMode.JSON_STRICT_MEMBERS if strict_json_members else _BodyMode.JSON,
+                mode=_BodyMode.JSON,
                 methods=_admission_methods or frozenset({request.method}),
                 shared=attempts,
             )
+            response = _decoded(response)
+            try:
+                _raise_embedded_result_error(
+                    request,
+                    response.result,
+                    http_status=wire.status_code,
+                    retry_codes=context.policy.retry.transient_api_codes,
+                    redactor=self.codec.redactor,
+                )
+            except B24ApiError as error:
+                # The request's own contract found the answer's error: the send ends as any failed send does.
+                self._conclude(request, error, policy=context.policy, shared=attempts)
+                raise
         except BaseException as error:
             # Each send's failure was classified where it ended; a failure that ends the request after them adds
             # nothing (a stop before a further send, or a cancellation): what they left open is the lineage's, the
             # sends of an envelope an isolated command was in included. Before any send it keeps no facts.
             attempts.record_open(error)
-            raise
-        try:
-            response = _decode_success(wire, parsed, request_summary=request.summary)
-            _raise_embedded_result_error(
-                request,
-                response.result,
-                http_status=wire.status_code,
-                retry_codes=context.policy.retry.transient_api_codes,
-                redactor=self.codec.redactor,
-            )
-        except BaseException as error:
-            attempts.record(error, context.policy)
             raise
         return response
 
@@ -566,7 +549,7 @@ class Executor:
         context = context or self.context(policy)
         attempts = _RequestAttempts()
         try:
-            wire, _parsed = await self._execute_wire_attempts(
+            wire, _response = await self._execute_wire_attempts(
                 request,
                 context=context,
                 work_class=work_class,
@@ -594,8 +577,8 @@ class Executor:
         mode: _BodyMode,
         methods: frozenset[str],
         shared: _RequestAttempts,
-    ) -> tuple[WireResponse, _ParsedBody | None]:
-        """Run the attempt loop and return one conclusive raw response; ``shared`` counts every dispatch."""
+    ) -> tuple[WireResponse, Response | None]:
+        """Run the attempt loop and return one conclusive response, decoded unless binary; ``shared`` counts sends."""
         self.preflight_request(request)
         wire_request = WireRequest(request) if self._wire_transport is not None else None
         cancellation = await mark_cancellation()
@@ -626,11 +609,11 @@ class Executor:
                 attempts += 1
                 continue
 
-            response_error, parsed = self._classify_response(request, wire, context=context, mode=mode)
+            response_error, response = self._classify_response(request, wire, context=context, mode=mode)
             if response_error is None:
                 # An answer that arrives after the budget is still the answer: it is returned, never discarded.
                 cancellation.raise_if_requested()
-                return wire, parsed
+                return wire, response
             code = response_error.normalized_code if isinstance(response_error, ApiResponseError) else None
             if code == "operation_time_limit":
                 # The methods the coordinator admits: a classic batch envelope's own name is not one of them.
@@ -693,15 +676,19 @@ class Executor:
     ) -> WireResponse:
         """Hand an admitted, counted send to its transport, and record it sent unless the transport kept it.
 
-        A transport that refuses the send before it leaves the process raises ``ClientClosedError``, whichever
-        transport it is (a closed one, for example): that is a stop before the send, as at the permit. The
+        A transport that refuses the send before it leaves the process, for good, raises a ``TransportError`` of
+        phase ``not_dispatched`` that is not retryable, whichever transport it is: ``ClientClosedError`` from a
+        closed one, a request HTTPX could not build. That is a stop before the send, as at the permit. The
         reservation is released, so it is no physical request, nothing is recorded sent, so no batch round or
         isolated send counts it, and it is chained to the failure it followed. Any other outcome, a cancellation
-        included, is a send that may have left.
+        and a retryable failure before dispatch (a refused connection) included, is a send.
         """
         try:
             wire = await send
-        except ClientClosedError as error:
+        except TransportError as error:
+            if error.phase is not FailurePhase.NOT_DISPATCHED or error.retryable:
+                attempts.dispatched()
+                raise
             context.release_attempt()
             attempts.chain_stop(error)
             raise
@@ -771,8 +758,7 @@ class Executor:
             if cancellation.requested():
                 # The transport turned a cancellation into this failure: the envelope ends cancelled.
                 return _dispatched_attempt("cancelled", error=asyncio.CancelledError())
-            proven = isinstance(error, TransportError) and not error.possible_acceptance
-            return _dispatched_attempt("error", error=error, proven_not_accepted=proven)
+            return _dispatched_attempt("error", error=error)
         return await self._classify_envelope(envelope, wire, context=context, cancellation=cancellation)
 
     async def _send_envelope(
@@ -805,9 +791,8 @@ class Executor:
         cancellation: CancellationMark,
     ) -> PhysicalAttemptOutcome:
         """Classify one envelope response with the shared primitives, observing any host throttle hint."""
-        summary = envelope.summary
-        response_error, parsed = self._classify_response(
-            None, wire, context=context, mode=_BodyMode.JSON, summary=summary
+        response_error, response = self._classify_response(
+            None, wire, context=context, mode=_BodyMode.JSON, summary=envelope.summary
         )
         if response_error is not None:
             await self._observe_throttle_hint(wire, response_error, context=context)
@@ -815,10 +800,6 @@ class Executor:
             return _dispatched_attempt("cancelled", wire=wire, error=asyncio.CancelledError())
         if response_error is not None:
             return _dispatched_attempt("error", wire=wire, error=response_error)
-        try:
-            response = _decode_success(wire, parsed, request_summary=summary)
-        except ProtocolError as error:
-            return _dispatched_attempt("error", wire=wire, error=error)
         return _dispatched_attempt("response", wire=wire, response=response)
 
     def _classify_response(
@@ -829,29 +810,27 @@ class Executor:
         context: ExecutionContext,
         mode: _BodyMode,
         summary: RequestSummary | None = None,
-    ) -> tuple[B24ApiError | None, _ParsedBody | None]:
-        """Classify one conclusive response, parsing a JSON success body exactly once.
+    ) -> tuple[B24ApiError | None, Response | None]:
+        """Classify one response whole: its failure, or the success it decodes to (``None`` for a binary one).
 
-        An envelope with no canonical ``Request`` form passes ``request=None`` and its own ``summary``.
+        A JSON success body is parsed exactly once, and its envelope decoded, before anything in it is read as an
+        answer: a body that cannot be decoded is the send's failure, as an error status is. An envelope with no
+        canonical ``Request`` form passes ``request=None`` and its own ``summary``.
         """
         request_summary = request.summary if request is not None else summary
         success = http_success(wire.status_code)
         if success and mode is _BodyMode.BINARY:
             return None, None
-        parsed = None
         body: bytes | Mapping[str, object] | None = wire.body
         if success:
-            parsed = _parse_success_body(wire.body, strict_members=mode is _BodyMode.JSON_STRICT_MEMBERS)
-            if parsed.failure is not None and not isinstance(parsed.failure, json.JSONDecodeError):
-                # Invalid UTF-8, a non-finite number or a duplicate correlation key is a defect only the
-                # strict parse sees; a lenient second parse must not turn it into a structured API error.
-                return None, parsed
-            if parsed.failure is None:
-                payload = parsed.payload
-                if not (isinstance(payload, Mapping) and "error" in payload):
-                    return None, parsed
+            read = _read_success(wire, summary=request_summary)
+            if isinstance(read, B24ApiError):
+                return read, None
+            if isinstance(read, Response):
+                return None, read
+            if read is not None:
                 # The codec classifies the structured error from the one strict parse, not a second one.
-                body = payload
+                body = read
         content_type = (wire.content_type or "").split(";", 1)[0].strip().casefold()
         if mode is _BodyMode.BINARY and content_type != "application/json" and not content_type.endswith("+json"):
             body = None
@@ -860,7 +839,7 @@ class Executor:
                 f"HTTP gateway error {wire.status_code}",
                 request_summary=request_summary,
                 evidence=_wire_evidence(wire),
-            ), parsed
+            ), None
         response_error = self.codec.error_from_http(
             status_code=wire.status_code,
             body=body,
@@ -869,13 +848,15 @@ class Executor:
             retry_codes=context.policy.retry.transient_api_codes,
             diagnostics=diagnostic_context(request) if request is not None else None,
         )
-        if response_error is None and not success:
+        if response_error is None and success:  # a 2xx body the parse refused (an empty one) stays malformed
+            response_error = _malformed_success(wire, None, request_summary=request_summary)
+        elif response_error is None:
             response_error = HTTPGatewayError(
                 f"HTTP gateway error {wire.status_code}",
                 request_summary=request_summary,
                 evidence=_wire_evidence(wire),
             )
-        return response_error, parsed
+        return response_error, None
 
     async def _observe_throttle_hint(
         self, wire: WireResponse, error: B24ApiError, *, context: ExecutionContext
@@ -960,14 +941,7 @@ class Executor:
         shared: _RequestAttempts,
         methods: frozenset[str],
     ) -> None:
-        shared.settle(error, context.policy)
-        safety = request.replay_safety or ReplaySafety.UNKNOWN
-        # A send that may have run is never repeated for work that is not SAFE: the request ends unknown.
-        message = _possible_acceptance(error, context.policy)
-        if safety is not ReplaySafety.SAFE and message is not None:
-            raise possible_execution(
-                error, request_summary=request.summary, declared_unsafe=safety is ReplaySafety.UNSAFE, message=message
-            ) from error
+        safety = self._conclude(request, error, policy=context.policy, shared=shared)
         # SAFE work is retried within the budget; UNSAFE/UNKNOWN only when the failure proves nothing ran (owner
         # decision, 2026-09-25). A classic batch envelope's caller decides its replay, per command.
         retryable = _is_retryable(error, safety=safety, policy=context.policy)
@@ -984,6 +958,27 @@ class Executor:
             raise stop
         await self._wait(context, shared, replay.pause)
 
+    @staticmethod
+    def _conclude(
+        request: Request, error: B24ApiError, *, policy: ExecutionPolicy, shared: _RequestAttempts
+    ) -> ReplaySafety:
+        """Record how a send ended by what its failure proves (``send_verdict``); return the request's safety.
+
+        The one ending of every failed send, whatever found the failure (the transport, the status, the decoder or
+        the request's own embedded-error contract): a send that may have run ends a request that is not ``SAFE``
+        with an ``AmbiguousExecutionError``, its failure the cause.
+        """
+        verdict = shared.settle(error, policy)
+        safety = request.replay_safety or ReplaySafety.UNKNOWN
+        if safety is not ReplaySafety.SAFE and verdict is Verdict.MAY_HAVE_RUN:
+            raise possible_execution(
+                error,
+                request_summary=request.summary,
+                declared_unsafe=safety is ReplaySafety.UNSAFE,
+                message=_ambiguity_message(error),
+            ) from error
+        return safety
+
     async def _wait(self, context: ExecutionContext, attempts: _RequestAttempts, pause: _Pause) -> None:
         """Record and wait out a planned pause; the coordinator's hold ends within the backoff when that is longer.
 
@@ -996,19 +991,15 @@ class Executor:
             await self._sleep(pause.backoff)
 
 
-def _possible_acceptance(error: B24ApiError, policy: ExecutionPolicy) -> str | None:
-    """Say how a failed send may have been accepted: an oversized or lost answer, or an ambiguous status."""
+def _ambiguity_message(error: B24ApiError) -> str:
+    """Say how a failed send that may have run may have been accepted: by what ended it."""
     if isinstance(error, ResponseTooLargeError):
         return "Request may have executed before its oversized response was rejected"
     if isinstance(error, TransportError):
-        return "Request may have executed; automatic replay is forbidden" if error.possible_acceptance else None
-    if (
-        isinstance(error, HTTPGatewayError)
-        and not isinstance(error, EnvelopeContractError)
-        and ambiguous_status(error.http_status, policy)
-    ):
+        return "Request may have executed; automatic replay is forbidden"
+    if isinstance(error, HTTPGatewayError) and not isinstance(error, EnvelopeContractError):
         return "Request may have executed before the unstructured HTTP failure"
-    return None
+    return "Request may have executed; its answer does not prove whether it ran"
 
 
 async def _send_envelope_attempt(
@@ -1031,11 +1022,16 @@ async def _send_envelope_attempt(
         ) from error
 
 
+def _decoded(response: Response | None) -> Response:
+    """Return the decoded answer a JSON send returns."""
+    if response is None:  # pragma: no cover - a JSON mode always decodes its answer
+        raise RuntimeError("JSON success response lacks its decoded envelope")
+    return response
+
+
 def _local_attempt_failure(error: B24ApiError) -> PhysicalAttemptOutcome:
     """An attempt that failed before dispatch: nothing reached the transport."""
-    return PhysicalAttemptOutcome(
-        "error", None, None, error, dispatch_started=False, transport_proves_not_accepted=True
-    )
+    return PhysicalAttemptOutcome("error", None, None, error, dispatch_started=False)
 
 
 def _dispatched_attempt(
@@ -1044,15 +1040,17 @@ def _dispatched_attempt(
     wire: WireResponse | None = None,
     response: Response | None = None,
     error: BaseException | None = None,
-    proven_not_accepted: bool = False,
 ) -> PhysicalAttemptOutcome:
-    return PhysicalAttemptOutcome(
-        kind, wire, response, error, dispatch_started=True, transport_proves_not_accepted=proven_not_accepted
-    )
+    return PhysicalAttemptOutcome(kind, wire, response, error, dispatch_started=True)
 
 
-def _is_retryable(error: B24ApiError, *, safety: ReplaySafety, policy: ExecutionPolicy) -> bool:
-    """SAFE work is retried after any transient failure; other work only when the failure proves nothing ran."""
+def _is_retryable(
+    error: B24ApiError, *, safety: ReplaySafety, policy: ExecutionPolicy, v3_envelope: bool = False
+) -> bool:
+    """SAFE work is retried after any transient failure; other work only when the failure proves nothing ran.
+
+    Whether it proves that is ``send_verdict``'s, the one rule; ``v3_envelope`` reads a REST 3.0 envelope's answer.
+    """
     if isinstance(error, TransportError | ApiResponseError):
         transient = error.retryable
     else:
@@ -1063,41 +1061,34 @@ def _is_retryable(error: B24ApiError, *, safety: ReplaySafety, policy: Execution
             and not http_success(error.http_status)
             and error.http_status in policy.retry.transient_http_statuses
         )
-    return transient and (safety is ReplaySafety.SAFE or _proves_not_run(error, policy))
-
-
-def _proves_not_run(error: B24ApiError, policy: ExecutionPolicy) -> bool:
-    """Return whether a failure proves the request did not run: it was never dispatched, or Bitrix refused it."""
-    if isinstance(error, TransportError):
-        return not error.possible_acceptance
-    if isinstance(error, ApiResponseError):
-        return _refused_before_running(error, policy)
-    # Only a listed refusal status (423, 425, 429 by default) proves the request was not accepted.
-    return (
-        isinstance(error, HTTPGatewayError)
-        and not isinstance(error, EnvelopeContractError)
-        and error.http_status in policy.ambiguity.refusal_http_statuses
-        and error.http_status not in policy.ambiguity.ambiguous_unstructured_statuses
+    return transient and (
+        safety is ReplaySafety.SAFE or send_verdict(error, policy, v3_envelope=v3_envelope) is Verdict.NOT_RUN
     )
 
 
-def _refused_before_running(error: ApiResponseError, policy: ExecutionPolicy) -> bool:
-    """Return whether Bitrix answered with a listed refusal (a request or time quota by default) before running."""
-    return str(error.original_code).strip().casefold() in policy.ambiguity.refusal_api_codes
+class _PathRead(NamedTuple):
+    """What a path through a decoded result reaches: ``found`` and its ``value``, unless an object on it repeats."""
+
+    found: bool
+    value: object
+    repeated: bool = False
 
 
-def _resolve_optional_path(value: object, path: tuple[str | int, ...]) -> tuple[bool, object]:
+def _read_path(value: object, path: tuple[str | int, ...]) -> _PathRead:
+    """Follow ``path``; a repeated name the path goes through stops it, since the value it would reach is unknown."""
     current = value
     for part in path:
+        if part in repeated_names(current):
+            return _PathRead(found=False, value=None, repeated=True)
         if isinstance(part, str):
             if not isinstance(current, Mapping) or part not in current:
-                return False, None
+                return _PathRead(found=False, value=None)
             current = current[part]
         else:
             if not isinstance(current, list | tuple) or part >= len(current):
-                return False, None
+                return _PathRead(found=False, value=None)
             current = current[part]
-    return True, current
+    return _PathRead(found=True, value=current)
 
 
 def _result_protocol_error(
@@ -1127,7 +1118,13 @@ def _raise_embedded_result_error(  # noqa: C901, PLR0912, PLR0913
     spec = request.result_error
     if spec is None:
         return
-    found, selected = _resolve_optional_path(result, spec.selector.path)
+    # A name repeated on the way to the error or its code holds two answers where the decoder kept the last: the one
+    # read, an error or none, proves nothing.
+    found, selected, repeated = _read_path(result, spec.selector.path)
+    if repeated:
+        raise _result_protocol_error(
+            "Embedded result error repeats a member name", request, observed=None, path=spec.selector.path
+        )
     if not found or selected is None:
         return
     candidates: tuple[tuple[int | None, Mapping[object, object]], ...]
@@ -1158,9 +1155,14 @@ def _raise_embedded_result_error(  # noqa: C901, PLR0912, PLR0913
                 observed=candidate,
                 path=candidate_path,
             )
-        found, code = _resolve_optional_path(candidate, spec.code_path)
-        if not found or code is None or code == "" or (type(code) is int and code == 0):
+        found, code, repeated = _read_path(candidate, spec.code_path)
+        if not repeated and (not found or code is None or code == "" or (type(code) is int and code == 0)):
             continue
+        if repeated or repeated_names(candidate):
+            # Any member of an error repeated (its code, its message) leaves the error read here unreadable.
+            raise _result_protocol_error(
+                "Embedded result error repeats a member name", request, observed=candidate, path=candidate_path
+            )
         if isinstance(code, bool) or not isinstance(code, str | int):
             raise _result_protocol_error(
                 "Embedded result error code must be a string or integer",
@@ -1170,7 +1172,14 @@ def _raise_embedded_result_error(  # noqa: C901, PLR0912, PLR0913
             )
         description: str | None = None
         if spec.description_path is not None:
-            description_found, raw_description = _resolve_optional_path(candidate, spec.description_path)
+            description_found, raw_description, description_repeated = _read_path(candidate, spec.description_path)
+            if description_repeated:
+                raise _result_protocol_error(
+                    "Embedded result error repeats a member name",
+                    request,
+                    observed=candidate,
+                    path=(*candidate_path, *spec.description_path),
+                )
             if description_found and raw_description is not None:
                 if isinstance(raw_description, bool) or not isinstance(raw_description, str | int):
                     raise _result_protocol_error(
@@ -1192,32 +1201,57 @@ def _raise_embedded_result_error(  # noqa: C901, PLR0912, PLR0913
         )
 
 
-def _parse_success_body(body: bytes, *, strict_members: bool) -> _ParsedBody:
-    """Run the one strict JSON parse of a success body, keeping a failure for the envelope decoder."""
+def _read_success(
+    wire: WireResponse, *, summary: RequestSummary | None
+) -> B24ApiError | Response | Mapping[str, object] | None:
+    """Read a 2xx JSON body once: its failure, its decoded success, or its top-level error for the codec.
+
+    ``None`` is a body that is not JSON at all, which the codec reads as its malformed answer.
+    """
+    parsed = _parse_success_body(wire.body)
+    if isinstance(parsed.failure, json.JSONDecodeError):
+        return None
+    if parsed.failure is not None:
+        # Invalid UTF-8, a non-finite number or a repeated control member is a defect only the strict parse sees; a
+        # lenient second parse must not turn it into a structured API error.
+        return _malformed_success(wire, parsed.failure, request_summary=summary)
+    payload = parsed.payload
+    if isinstance(payload, Mapping) and "error" in payload:
+        return payload
     try:
-        payload = json.loads(
-            body.decode("utf-8"),
-            parse_constant=_reject_json_constant,
-            object_pairs_hook=_DecodedJsonObject if strict_members else None,
-        )
-        if strict_members:
-            _reject_duplicate_batch_correlation_keys(payload)
+        return _decode_success(wire, payload, request_summary=summary)
+    except ProtocolError as error:
+        return error
+
+
+def _parse_success_body(body: bytes) -> _ParsedBody:
+    """Run the one strict JSON parse of a success body (``decode_json``), keeping a failure for the classifier."""
+    try:
+        payload = decode_json(body.decode("utf-8"), allow_constants=False)
     except ValueError as error:  # JSONDecodeError and UnicodeDecodeError are ValueErrors
         return _ParsedBody(None, error)
     return _ParsedBody(payload, None)
 
 
-def _decode_success(wire: WireResponse, parsed: _ParsedBody | None, *, request_summary: RequestSummary) -> Response:
-    if parsed is None:
-        raise RuntimeError("JSON success response lacks its parsed body")
+def _malformed_success(
+    wire: WireResponse, failure: ValueError | None, *, request_summary: RequestSummary | None
+) -> EnvelopeContractError:
+    """Return the failure of a 2xx answer whose body cannot be decoded: it proves nothing about the send."""
+    error = EnvelopeContractError(
+        "Malformed successful HTTP response", request_summary=request_summary, evidence=_wire_evidence(wire)
+    )
+    error.__cause__ = failure
+    return error
+
+
+def _decode_success(wire: WireResponse, payload: object, *, request_summary: RequestSummary | None) -> Response:
+    """Decode the envelope of a 2xx answer without a top-level error; raise ``ProtocolError`` when it is not one.
+
+    The server's timing (``time``) is diagnostic: one that cannot be read, a negative duration after a server clock
+    step for example, is left out (``Response.time`` is ``None``) and the answer is kept. ``total`` and ``next``
+    drive pagination, so a malformed one makes the answer unreadable.
+    """
     evidence = _wire_evidence(wire)
-    if parsed.failure is not None:
-        raise EnvelopeContractError(
-            "Malformed successful HTTP response",
-            request_summary=request_summary,
-            evidence=evidence,
-        ) from parsed.failure
-    payload = parsed.payload
     if not isinstance(payload, Mapping) or "result" not in payload:
         raise EnvelopeContractError(
             "Successful response is missing the result envelope",
@@ -1254,13 +1288,11 @@ def _decode_success(wire: WireResponse, parsed: _ParsedBody | None, *, request_s
             evidence=evidence,
         )
     try:
-        return Response(
-            payload["result"],
-            time=_decode_response_time(payload.get("time")),
-            total=total,
-            next=next_value,
-            evidence=evidence,
-        )
+        time: ResponseTime | None = _decode_response_time(payload.get("time"))
+    except (TypeError, ValueError, OverflowError):
+        time = None
+    try:
+        return Response(payload["result"], time=time, total=total, next=next_value, evidence=evidence)
     except (TypeError, ValueError, OverflowError) as error:
         raise ProtocolError(
             "Successful response violates the canonical response contract",
@@ -1305,23 +1337,6 @@ def _wire_evidence(wire: WireResponse) -> ResponseEvidence:
         request_id=safe_headers.get("x-request-id"),
         headers=tuple(sorted(safe_headers.items())),
     )
-
-
-def _reject_json_constant(value: str) -> None:
-    raise ValueError(f"non-standard JSON constant is forbidden: {value}")
-
-
-def _reject_duplicate_batch_correlation_keys(payload: object) -> None:
-    """Enforce unique command keys without changing ordinary row JSON semantics."""
-    if not isinstance(payload, Mapping):
-        return
-    batch_envelope = payload.get("result")
-    if not isinstance(batch_envelope, Mapping):
-        return
-    for field in ("result", "result_error", "result_total", "result_next"):
-        correlation = batch_envelope.get(field)
-        if isinstance(correlation, _DecodedJsonObject) and correlation.duplicate_names:
-            raise ValueError(f"duplicate batch correlation key in {field}")
 
 
 __all__ = ["Executor"]

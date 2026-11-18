@@ -8,18 +8,75 @@ from typing import cast
 type JsonScalar = None | bool | int | float | str
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 type FrozenJson = JsonScalar | tuple[FrozenJson, ...] | FrozenMapping
-_MAX_JSON_DEPTH = 256
+MAX_JSON_DEPTH = 256
+
+
+class DecodedJsonObject(dict[str, JsonValue]):
+    """A decoded JSON object whose member names repeat: the last member wins, and the repeated names are kept."""
+
+    __slots__ = ("repeated_names",)
+
+    def __init__(self, pairs: list[tuple[str, JsonValue]]) -> None:
+        """Keep the last value of each name, and each name seen again."""
+        super().__init__(pairs)
+        seen: set[str] = set()
+        repeated: list[str] = []
+        for name, _ in pairs:
+            if name in seen:
+                repeated.append(name)
+            seen.add(name)
+        self.repeated_names = tuple(repeated)
+
+    @classmethod
+    def holding(cls, values: dict[str, JsonValue], repeated: tuple[str, ...]) -> DecodedJsonObject:
+        """Return an object of ``values`` that records ``repeated``, as a thawed copy of a frozen one does."""
+        decoded = cls([])
+        decoded.update(values)
+        decoded.repeated_names = repeated
+        return decoded
+
+
+def repeated_names(value: object) -> tuple[str, ...]:
+    """Return the member names a decoded JSON object repeated, decoded or frozen; empty for any other value."""
+    return value.repeated_names if isinstance(value, DecodedJsonObject | FrozenMapping) else ()
+
+
+def nests_deeper_than_supported(body: object) -> bool:
+    """Return whether a decoded body holds a value more than ``MAX_JSON_DEPTH`` levels below a top-level member.
+
+    A response keeps each top-level member (its ``result`` above all) as a frozen JSON value of its own, which holds
+    ``MAX_JSON_DEPTH`` levels below itself, so a member is measured from depth 0.
+    """
+    pending: list[tuple[object, int]] = [(body, -1)]
+    while pending:
+        item, depth = pending.pop()
+        children = item.values() if isinstance(item, dict) else item if isinstance(item, list) else ()
+        for child in children:
+            if depth + 1 > MAX_JSON_DEPTH:
+                return True
+            if isinstance(child, dict | list):
+                pending.append((child, depth + 1))
+    return False
 
 
 class FrozenMapping(Mapping[str, FrozenJson]):
     """Immutable mapping used for canonical JSON storage and page views."""
 
-    __slots__ = ("_key", "_values")
+    __slots__ = ("_key", "_repeated", "_values")
 
-    def __init__(self, values: Mapping[str, FrozenJson]) -> None:
-        """Copy values into canonical immutable storage."""
+    def __init__(self, values: Mapping[str, FrozenJson], *, repeated: tuple[str, ...] = ()) -> None:
+        """Copy values into canonical immutable storage, with the member names a decoded object repeated."""
         self._values = dict(values)
         self._key: object | None = None
+        self._repeated = repeated
+
+    @property
+    def repeated_names(self) -> tuple[str, ...]:
+        """Member names the decoded JSON object this was frozen from repeated (each kept its last value).
+
+        Empty for a mapping built in code. It takes no part in equality: it records how the answer was written.
+        """
+        return self._repeated
 
     def __getitem__(self, key: str) -> FrozenJson:
         """Return one frozen value."""
@@ -95,7 +152,7 @@ def _freeze_json(
     active: set[int] | None = None,
     depth: int = 0,
 ) -> FrozenJson:
-    if depth > _MAX_JSON_DEPTH:
+    if depth > MAX_JSON_DEPTH:
         raise ValueError("JSON nesting exceeds the supported depth")
     active = active if active is not None else set()
     kind = type(value)
@@ -116,7 +173,7 @@ def _freeze_json(
                 frozen[key if type(key) is str else str.__str__(key)] = _freeze_json(
                     item, active=active, depth=depth + 1
                 )
-            return FrozenMapping(frozen)
+            return FrozenMapping(frozen, repeated=repeated_names(value))
         finally:
             active.remove(identity)
     if isinstance(value, Sequence) and not isinstance(value, bytes | bytearray | str):
@@ -146,7 +203,9 @@ def _has_empty_container(value: FrozenJson) -> bool:
 def thaw_json(value: FrozenJson) -> JsonValue:
     """Return a plain mutable JSON copy of a frozen value: dicts for mappings, lists for arrays."""
     if isinstance(value, FrozenMapping):
-        return {key: thaw_json(item) for key, item in value.items()}
+        thawed: dict[str, JsonValue] = {key: thaw_json(item) for key, item in value.items()}
+        # A repeated member name stays visible to whoever reads the answer's control members from the copy.
+        return DecodedJsonObject.holding(thawed, value.repeated_names) if value.repeated_names else thawed
     if isinstance(value, tuple):
         return [thaw_json(item) for item in value]
     return value

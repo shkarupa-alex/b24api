@@ -252,7 +252,9 @@ async def test_physical_batch_replay_matrix(
             assert outcome.error is raised[0]
             assert outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
         assert stream.report.failures == count
-    assert stream.report.physical_requests == len(transport.sent)
+    # A transport that refuses a send for good before it leaves the process sent nothing: no physical request.
+    refused_unsent = phase is FailurePhase.NOT_DISPATCHED and not retryable
+    assert stream.report.physical_requests == (0 if refused_unsent else len(transport.sent))
     assert stream.report.batch_requests == 1
 
 

@@ -84,7 +84,6 @@ class SharedWaveEngine:
             {command_id: request},
             context=context,
             strict_envelope=True,
-            strict_json_members=True,
         )
         return outcome
 
@@ -95,14 +94,13 @@ class SharedWaveEngine:
         context: ExecutionContext,
         advisory_totals: bool = False,
         strict_envelope: bool = False,
-        strict_json_members: bool = False,
     ) -> tuple[BatchOutcome, ...]:
         """Queue one atomic wave of scheduled pages, by command id, and return their outcomes in that order."""
         if context is not self._context:
             raise RuntimeError("a fast keyset wave must be charged to the shared operation context")
         if not pages or len(pages) > self._cap:
             raise ValueError("fast keyset wave must contain 1..portal_command_cap requests")
-        options = _DecodeOptions(advisory_totals, strict_envelope, strict_json_members)
+        options = _DecodeOptions(advisory_totals, strict_envelope)
         errors: dict[int, BaseException] = {}
         key = self._run.producer_key
         self._state.runnable.discard(key)

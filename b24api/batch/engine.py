@@ -25,6 +25,7 @@ from b24api.batch.outcome import (
 )
 from b24api.batch.v3 import _V3Resolution
 from b24api.contracts.dispatch import PORTAL_BATCH_CAP
+from b24api.contracts.json import repeated_names
 from b24api.contracts.policy import (
     ReplayDisposition,
 )
@@ -50,13 +51,12 @@ from b24api.execution.executor import (
     _is_retryable,
     _Lineage,
     _raise_embedded_result_error,
-    _refused_before_running,
     _RequestAttempts,
     _retry_refusal,
     _SendPlan,
     _Settled,
 )
-from b24api.execution.facts import Execution, execution, record_execution, settled_as
+from b24api.execution.facts import Execution, Verdict, execution, record_execution, send_verdict, settled_as
 
 if TYPE_CHECKING:
     from b24api.contracts.completion import CommandSettlement
@@ -97,7 +97,6 @@ class _RoundOptions:
     halt: bool
     advisory_totals: bool
     strict_envelope: bool
-    strict_json_members: bool
     # Whether a command held longer than its envelope's first send may wait is left out (``_split_held``).
     split_held: bool = False
 
@@ -342,7 +341,6 @@ class BatchExecutor:
         halt: bool,
         advisory_totals: bool = False,
         strict_envelope: bool = False,
-        strict_json_members: bool = False,
         on_envelope: Callable[[], None] | None = None,
         split_held: bool = False,
         progress: BatchProgress | None = None,
@@ -375,9 +373,7 @@ class BatchExecutor:
                 for command in commands
             }
         elif eligible:
-            options = _RoundOptions(
-                halt, advisory_totals, strict_envelope, strict_json_members, split_held and not halt
-            )
+            options = _RoundOptions(halt, advisory_totals, strict_envelope, split_held and not halt)
             progress = BatchProgress() if progress is None else progress
             try:
                 settled = await self._execute_groups(
@@ -544,7 +540,6 @@ class BatchExecutor:
                 request,
                 context=context,
                 work_class=WorkClass.BATCH,
-                strict_json_members=options.strict_json_members,
                 _admission_methods=frozenset(command.request.method for command in commands),
                 _attempts=attempts,
             )
@@ -658,7 +653,11 @@ class BatchExecutor:
                 if isinstance(outcome, BatchFailure):
                     attempts.record(outcome.error, context.policy)
             outcomes.append(outcome)
-            halted = halted or (options.halt and key in envelope.errors and key not in envelope.contradictory)
+            # The server halts after an error it answered a command with; an entry that names no error proves none.
+            answered_error = isinstance(outcome, BatchFailure) and isinstance(outcome.error, BatchCommandError)
+            halted = halted or (
+                options.halt and key in envelope.errors and key not in envelope.contradictory and answered_error
+            )
         return tuple(outcomes)
 
     def _decode_command(
@@ -676,7 +675,10 @@ class BatchExecutor:
                 envelope.errors[command.stable_key],
                 command,
                 retry_codes=context.policy.retry.transient_api_codes,
+                evidence=envelope.evidence,
             )
+            if isinstance(command_error, ProtocolError):
+                return _shared_failure(command, command_error)
             command_evidence = BatchCommandEvidence(
                 command.index,
                 command.stable_key,
@@ -687,7 +689,7 @@ class BatchExecutor:
                 command,
                 command_error,
                 evidence=command_evidence,
-                refused=_refused_before_running(command_error, context.policy),
+                refused=send_verdict(command_error, context.policy) is Verdict.NOT_RUN,
             )
         try:
             command_response = Response(
@@ -717,7 +719,10 @@ class BatchExecutor:
                 normalized_code=error.normalized_code,
             )
             return _command_failure(
-                command, error, evidence=command_evidence, refused=_refused_before_running(error, context.policy)
+                command,
+                error,
+                evidence=command_evidence,
+                refused=send_verdict(error, context.policy) is Verdict.NOT_RUN,
             )
         except ProtocolError as error:
             return _shared_failure(command, error)
@@ -739,7 +744,6 @@ class BatchExecutor:
         context: ExecutionContext,
         advisory_totals: bool = False,
         strict_envelope: bool = False,
-        strict_json_members: bool = False,
         on_envelope: Callable[[], None] | None = None,
         progress: BatchProgress | None = None,
     ) -> tuple[BatchOutcome, ...]:
@@ -761,7 +765,6 @@ class BatchExecutor:
             halt=False,
             advisory_totals=advisory_totals,
             strict_envelope=strict_envelope,
-            strict_json_members=strict_json_members,
             on_envelope=on_envelope,
             progress=progress,
         )
@@ -772,22 +775,24 @@ class BatchExecutor:
         command: _Command,
         *,
         retry_codes: frozenset[str],
-    ) -> BatchCommandError:
-        if not isinstance(raw, Mapping):
-            return BatchCommandError(
-                code="malformed_batch_error",
-                description="Batch error entry must be an object",
+        evidence: ResponseEvidence,
+    ) -> BatchCommandError | ProtocolError:
+        """Read a command's error entry: the server's error, or a ``ProtocolError`` for an entry that names none.
+
+        An entry that is not an object with a scalar ``error`` code, or that repeats a member name, answers nothing:
+        the command may have run.
+        """
+        code, description = (
+            (raw.get("error"), raw.get("error_description")) if isinstance(raw, Mapping) else (None, None)
+        )
+        if not isinstance(code, str | int) or isinstance(code, bool) or repeated_names(raw):
+            return ProtocolError(
+                "Batch error entry is not an object with a scalar error code",
+                origin=ErrorOrigin.PROTOCOL,
                 request_summary=command.request.summary,
-            )
-        code = raw.get("error")
-        if not isinstance(code, str | int) or isinstance(code, bool):
-            return BatchCommandError(
-                code="malformed_batch_error",
-                description="Batch error entry has no scalar error code",
-                request_summary=command.request.summary,
+                evidence=evidence,
             )
         normalized = str(code).strip().casefold()
-        description = raw.get("error_description")
         # Each command renders through its own request's context: the physical batch keeps one map per key.
         return BatchCommandError(
             code=code,
@@ -829,6 +834,10 @@ def _build_query(parameters: Mapping[str | int, object], path: str = "%s") -> st
     return encode_php_query(parameters, path)
 
 
+# The members of a classic batch envelope that map command keys to each command's answer.
+_COMMAND_MAPS = ("result", "result_error", "result_total", "result_next", "result_time")
+
+
 def _decode_batch_envelope(
     raw: JsonValue,
     *,
@@ -840,6 +849,11 @@ def _decode_batch_envelope(
         raise ProtocolError("Batch result envelope must be an object", origin=ErrorOrigin.PROTOCOL)
     if "result_error" not in raw:
         raise ProtocolError("Batch result envelope is missing result_error", origin=ErrorOrigin.PROTOCOL)
+    # A repeated member or command key holds two answers where the decoder kept one: none of them can be trusted.
+    if repeated_names(raw) or any(repeated_names(raw.get(field)) for field in _COMMAND_MAPS):
+        raise ProtocolError(
+            "Batch result envelope repeats a member name", origin=ErrorOrigin.PROTOCOL, evidence=evidence
+        )
     results = _decode_php_map(raw.get("result"), field="result")
     errors = _decode_php_map(raw["result_error"], field="result_error")
     totals = _decode_optional_php_map(raw, field="result_total")

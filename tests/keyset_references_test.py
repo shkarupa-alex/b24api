@@ -72,6 +72,7 @@ from b24api.contracts.page_stop import ContinuePage
 from b24api.contracts.policy import RetryPolicy
 from b24api.contracts.request import RouteKind
 from b24api.errors import (
+    AmbiguousExecutionError,
     ApiResponseError,
     BudgetExceededError,
     CapabilityError,
@@ -506,15 +507,16 @@ _NESTED = 100_000
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("replay", "outcome"), [("transport", ReferenceOutcomeUnknown), ("undecodable", ReferenceFailure)]
+    ("replay", "code"),
+    [("transport", PageRejectionCode.AMBIGUOUS_EXECUTION), ("undecodable", PageRejectionCode.BATCH_ENVELOPE)],
 )
 async def test_a_wave_whose_replay_fails_settles_each_page_from_its_own_command(
-    monkeypatch: pytest.MonkeyPatch, replay: str, outcome: type[object]
+    monkeypatch: pytest.MonkeyPatch, replay: str, code: PageRejectionCode
 ) -> None:
     # The second wave is answered, but the server refuses its first command (QUERY_LIMIT_EXCEEDED); the send that
     # replays it then fails: the transport breaks, or the answer cannot be decoded (nested too deep for the JSON
-    # parser, a failure that is not the client's own). Each page settles from what its own command did: the
-    # replayed one may have run, every other one was answered with a success, as the flat path settles them.
+    # parser). Each page settles from what its own command did: the replayed one may have run, so the binding's
+    # outcome is unknown, and every other one was answered with a success, as the flat path settles them.
     events: list[object] = []
     emit = CompletionGate.emit
 
@@ -559,11 +561,11 @@ async def test_a_wave_whose_replay_fails_settles_each_page_from_its_own_command(
         CommandSettlement.UNKNOWN,
         *[CommandSettlement.SUCCESS] * (len(wave) - 1),
     ]
-    assert isinstance(outcomes[-1], outcome)
+    assert isinstance(outcomes[-1], ReferenceOutcomeUnknown)
     # Each page is traced the way it settled, at its command's index in the batch: the answered ones are rejected
     # with the wave that failed around them.
     assert _failed_pages(report) == [
-        (0, "body", PageDispatch.BATCH, 0, *_UNKNOWN_PAGE),
+        (0, "body", PageDispatch.BATCH, 0, PageOutcome.UNKNOWN, code),
         *[
             (0, "body", PageDispatch.BATCH, index, PageOutcome.REJECTED, PageRejectionCode.TRANSACTION_ABORTED)
             for index in range(1, len(wave))
@@ -577,10 +579,9 @@ async def test_sequential_pages_of_a_chunk_whose_replay_fails_settle_and_trace_f
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Two bindings' first pages share one chunk. The server answers one and refuses the other
-    # (QUERY_LIMIT_EXCEEDED); the send that replays the refused one cannot be decoded, a failure that is not the
-    # client's own, and the chunk fails as a whole. Each page settles and is traced from what its own command did:
-    # the answered one succeeded and is rejected with the chunk that failed around it (``transaction_aborted``: its
-    # own command did not fail), the replayed one may have run.
+    # (QUERY_LIMIT_EXCEEDED); the send that replays the refused one cannot be decoded. Each page settles from what
+    # its own command did: the replayed one may have run, so its binding's outcome is unknown, traced for the
+    # batch envelope; the answered one succeeded, and its binding reads on to its end.
     events: list[object] = []
     emit = CompletionGate.emit
 
@@ -597,6 +598,8 @@ async def test_sequential_pages_of_a_chunk_whose_replay_fails_settle_and_trace_f
             portal.waves.append(1)
             return WireResponse(200, (("content-type", "application/json"),), b"[" * _NESTED + b"]" * _NESTED)
         answer = await portal.send(request, attempt_timeout=1.0, max_response_bytes=1 << 22)
+        if sent:
+            return answer
         commands = request.copy_parameters()["cmd"]
         assert isinstance(commands, dict)
         first = next(iter(commands))
@@ -612,22 +615,26 @@ async def test_sequential_pages_of_a_chunk_whose_replay_fails_settle_and_trace_f
             )
         )
 
-    assert portal.waves == [2, 1]
+    assert portal.waves[:2] == [2, 1]
     # The first command of the chunk (the first binding's page) is the refused one.
-    settled = {event.binding_id: event.outcome for event in events if isinstance(event, PageCommandOutcome)}
-    assert settled == {0: CommandSettlement.UNKNOWN, 1: CommandSettlement.SUCCESS}
+    settled = {
+        event.binding_id: event.outcome
+        for event in events
+        if isinstance(event, PageCommandOutcome) and event.binding_id == 0
+    }
+    assert settled == {0: CommandSettlement.UNKNOWN}
     traced = sorted(
         (record.outcome, record.rejection_code)
         for record in report.page_trace
         if record.outcome is not PageOutcome.COMMITTED
     )
-    assert traced == sorted(
-        [
-            (PageOutcome.REJECTED, PageRejectionCode.TRANSACTION_ABORTED),
-            (PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION),
-        ]
-    )
-    assert [type(outcome) for outcome in outcomes] == [ReferenceFailure, ReferenceFailure]
+    assert traced == [(PageOutcome.UNKNOWN, PageRejectionCode.BATCH_ENVELOPE)]
+    terminals = {
+        str(outcome.correlation): type(outcome)
+        for outcome in outcomes
+        if isinstance(outcome, ReferenceComplete | ReferenceFailure | ReferenceOutcomeUnknown)
+    }
+    assert terminals == {"p0": ReferenceOutcomeUnknown, "p1": ReferenceComplete}
 
 
 @pytest.mark.asyncio
@@ -683,7 +690,13 @@ async def test_a_page_whose_answer_was_lost_settles_and_traces_as_possibly_run_w
     if end == "undecodable":
         _outcomes, report = reader.result()
         traced = [(r.outcome, r.rejection_code) for r in report.page_trace if r.outcome is not PageOutcome.COMMITTED]
-        assert traced == [(PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION)] * 2
+        # The lost answer may have run; the replay's answer could not be decoded, a failure of its batch envelope.
+        assert sorted(traced) == sorted(
+            [
+                (PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION),
+                (PageOutcome.UNKNOWN, PageRejectionCode.BATCH_ENVELOPE),
+            ]
+        )
     else:
         assert reader.cancelled()
 
@@ -1829,6 +1842,7 @@ _DENIED = WireResponse(
     200, (("content-type", "application/json"),), b'{"error":"ACCESS_DENIED","error_description":"denied"}'
 )
 _UNKNOWN_PAGE = (PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION)
+_ENVELOPE_PAGE = (PageOutcome.UNKNOWN, PageRejectionCode.BATCH_ENVELOPE)
 
 
 def _failing(portal: BatchPortal, failing_send: int, answer: WireResponse) -> ResponderTransport:
@@ -1884,14 +1898,14 @@ async def test_a_shared_keyset_batch_that_fails_as_a_whole_traces_each_page_the_
         )
         outcomes, report = await _drain(stream)
 
-    assert sorted(str(outcome.correlation) for outcome in outcomes if isinstance(outcome, ReferenceFailure)) == [
+    assert sorted(str(outcome.correlation) for outcome in outcomes if isinstance(outcome, ReferenceOutcomeUnknown)) == [
         "p0",
         "p1",
         "p2",
     ]
     per_binding = 2 if phase == "boundary" else 1
     assert sorted(_failed_pages(report), key=lambda page: str(page[3])) == [
-        (index // per_binding, phase, PageDispatch.BATCH, index, *_UNKNOWN_PAGE) for index in range(3 * per_binding)
+        (index // per_binding, phase, PageDispatch.BATCH, index, *_ENVELOPE_PAGE) for index in range(3 * per_binding)
     ]
 
 
@@ -1912,17 +1926,17 @@ async def test_a_shared_keyset_wave_split_over_two_batches_traces_its_answered_p
         )
         outcomes, report = await _drain(stream)
 
-    assert sorted(str(outcome.correlation) for outcome in outcomes if isinstance(outcome, ReferenceFailure)) == [
+    assert sorted(str(outcome.correlation) for outcome in outcomes if isinstance(outcome, ReferenceOutcomeUnknown)) == [
         "p0",
         "p1",
         "p2",
     ]
     assert portal.waves == [5]
     assert sorted(_failed_pages(report), key=lambda page: (str(page[1]), str(page[0]), str(page[3]))) == [
-        (2, "boundary", PageDispatch.BATCH, 0, *_UNKNOWN_PAGE),
+        (2, "boundary", PageDispatch.BATCH, 0, *_ENVELOPE_PAGE),
         (2, "boundary", PageDispatch.BATCH, 4, PageOutcome.REJECTED, PageRejectionCode.TRANSACTION_ABORTED),
-        (0, "finish", PageDispatch.BATCH, 1, *_UNKNOWN_PAGE),
-        (1, "finish", PageDispatch.BATCH, 2, *_UNKNOWN_PAGE),
+        (0, "finish", PageDispatch.BATCH, 1, *_ENVELOPE_PAGE),
+        (1, "finish", PageDispatch.BATCH, 2, *_ENVELOPE_PAGE),
     ]
 
 
@@ -1934,10 +1948,10 @@ async def test_a_shared_keyset_wave_split_over_two_batches_traces_its_answered_p
         (
             1,
             _UNDECODABLE,
-            RecursionError,
+            AmbiguousExecutionError,
             [
-                (None, "boundary", PageDispatch.BATCH, 0, *_UNKNOWN_PAGE),
-                (None, "boundary", PageDispatch.BATCH, 1, *_UNKNOWN_PAGE),
+                (None, "boundary", PageDispatch.BATCH, 0, *_ENVELOPE_PAGE),
+                (None, "boundary", PageDispatch.BATCH, 1, *_ENVELOPE_PAGE),
             ],
         ),
         # The direct finish request is refused: rejected by its own failure, with no batch to point to.
@@ -2096,7 +2110,7 @@ async def _keyset_run(path: str, transport: BatchPortal | ResponderTransport) ->
             keyset=_keyset(),
             execution=AutoKeysetExecution(_CONTRACT),
         )
-        with pytest.raises((IncompleteTraversalError, RecursionError)):  # a flat traversal raises its failure
+        with pytest.raises((IncompleteTraversalError, AmbiguousExecutionError)):  # a flat traversal raises its failure
             await _drain(flat)
     flat_report = flat.report
     assert flat_report is not None
@@ -2119,7 +2133,7 @@ async def test_a_keyset_page_s_completion_record_retires_it_with_the_code_its_tr
         transport: BatchPortal | ResponderTransport = _refuse_second_then_undecodable(BatchPortal(answer))
         traced = [
             ("boundary", 0, PageOutcome.REJECTED, PageRejectionCode.TRANSACTION_ABORTED),
-            ("boundary", 1, *_UNKNOWN_PAGE),
+            ("boundary", 1, *_ENVELOPE_PAGE),
         ]
     else:
         transport = BatchPortal(_breaks_descending_identity(answer))

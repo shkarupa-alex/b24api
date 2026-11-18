@@ -255,7 +255,6 @@ class _DecodeOptions:
 
     advisory_totals: bool = False
     strict_envelope: bool = False
-    strict_json_members: bool = False
 
 
 _PLAIN_DECODING = _DecodeOptions()
@@ -1289,7 +1288,6 @@ class _BatchPageDispatcher:
                 context=self.context,
                 advisory_totals=options.advisory_totals,
                 strict_envelope=options.strict_envelope,
-                strict_json_members=options.strict_json_members,
                 on_envelope=self._count_batch_request,
                 progress=progress,
             )

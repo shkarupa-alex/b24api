@@ -99,7 +99,6 @@ class WaveEngine(Protocol):
         context: ExecutionContext,
         advisory_totals: bool = False,
         strict_envelope: bool = False,
-        strict_json_members: bool = False,
     ) -> tuple[BatchOutcome, ...]:
         """Return one correlated outcome per scheduled page of ``pages``, keyed by command id, in its order.
 

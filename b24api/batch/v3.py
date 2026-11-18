@@ -30,18 +30,16 @@ from b24api.errors import (
     B24ApiError,
     BatchCommandError,
     BudgetExceededError,
-    HTTPGatewayError,
     ProtocolError,
 )
 from b24api.execution.executor import (
     _is_retryable,
-    _proves_not_run,
     _raise_embedded_result_error,
-    _refused_before_running,
     _RequestAttempts,
     _retry_refusal,
     _SendPlan,
 )
+from b24api.execution.facts import Verdict, send_verdict
 from b24api.transport.base import WireRequest
 
 if TYPE_CHECKING:
@@ -118,8 +116,8 @@ class _V3Resolution:
                 raise TypeError("physical batch attempt failed without a typed error")
             if not attempt.dispatch_started:
                 return self._stop(pending, failure, followed=followed), False
-            if attempt.transport_proves_not_accepted or _unstructured_refusal(failure, self.context):
-                return await self._not_run(pending, failure, safe=safe), True
+            if send_verdict(failure, self.context.policy, v3_envelope=True) is not Verdict.MAY_HAVE_RUN:
+                return await self._answered_whole(pending, failure, safe=safe), True
             error = failure
         return await self._unresolved(pending, error, safe=safe), True
 
@@ -174,20 +172,29 @@ class _V3Resolution:
                 normalized_code=error.normalized_code,
             )
             self.attempts.record(error, policy)
-            return _command_failure(command, error, evidence=coded, refused=_refused_before_running(error, policy))
+            refused = send_verdict(error, policy) is Verdict.NOT_RUN
+            return _command_failure(command, error, evidence=coded, refused=refused)
         except ProtocolError as error:
             self.attempts.record(error, policy)
             return _shared_failure(command, error)
         return _command_success(command, command_response, evidence)
 
-    async def _not_run(self, pending: tuple[_Command, ...], error: B24ApiError, *, safe: bool) -> tuple[_Command, ...]:
-        """Proven nonexecution of the envelope: the ordinary bounded retry, whatever the safety class."""
+    async def _answered_whole(
+        self, pending: tuple[_Command, ...], error: B24ApiError, *, safe: bool
+    ) -> tuple[_Command, ...]:
+        """The envelope's answer settles every command alike (``send_verdict``), as a classic envelope's does.
+
+        Refused before it ran (a transport failure that proves it was not accepted, a listed refusal status), it is
+        sent again within the budget whatever the safety class; answered with a refusal of its credentials (a 401,
+        the one answer no command of it could have run past), it is a failure of every command, sent again only
+        when ``SAFE`` and transient, and never isolated: each command alone would be refused alike.
+        """
         self.attempts.classified(error, may_have_run=False)
         self.attempts.record(error, self.context.policy)
         for command in pending:
             self.last[command.index] = _shared_failure(command, error)
         safety = ReplaySafety.SAFE if safe else ReplaySafety.UNKNOWN
-        if _is_retryable(error, safety=safety, policy=self.context.policy):
+        if _is_retryable(error, safety=safety, policy=self.context.policy, v3_envelope=True):
             refusal = await self._pause(pending)
             if refusal is None:
                 return pending
@@ -341,11 +348,6 @@ def _complete_array(response: Response, expected: int) -> list[JsonValue] | None
     if not isinstance(result, list) or len(result) != expected or any(not isinstance(item, dict) for item in result):
         return None
     return result
-
-
-def _unstructured_refusal(error: B24ApiError, context: ExecutionContext) -> bool:
-    """A listed unstructured refusal status proves the envelope was not accepted; a structured error never does."""
-    return isinstance(error, HTTPGatewayError) and _proves_not_run(error, context.policy)
 
 
 __all__: list[str] = []

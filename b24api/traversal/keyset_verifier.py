@@ -189,7 +189,6 @@ class _Verifier:
                     wave,
                     context=self.context,
                     strict_envelope=True,
-                    strict_json_members=True,
                 )
                 for reservation, outcome in zip(reservations, outcomes, strict=True):
                     if isinstance(outcome, BatchFailure):
@@ -219,7 +218,6 @@ class _Verifier:
                     request,
                     context=self.context,
                     work_class=WorkClass.TRAVERSAL_DIRECT,
-                    strict_json_members=True,
                 )
                 self.context.commit_page(reservation)
                 responses.append(response)

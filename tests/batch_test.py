@@ -1039,7 +1039,9 @@ async def test_malformed_batch_pagination_metadata_leaves_its_command_unknown() 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fault", ["extra", "duplicate"])
-async def test_public_batch_preserves_tolerant_unknown_or_duplicate_correlation_keys(fault: str) -> None:
+async def test_public_batch_tolerates_an_unknown_correlation_key_but_not_a_repeated_one(fault: str) -> None:
+    # A key no command was sent under is ignored; a command key repeated gives its command two answers, so the
+    # envelope is unreadable and the command, which may have run, is unknown.
     def malformed_correlation(request: Request) -> WireResponse:
         key = _batch_keys(request)[0]
         if fault == "extra":
@@ -1056,7 +1058,12 @@ async def test_public_batch_preserves_tolerant_unknown_or_duplicate_correlation_
     )
     outcome = await anext(stream)
 
-    assert isinstance(outcome, BatchSuccess)
+    if fault == "extra":
+        assert isinstance(outcome, BatchSuccess)
+    else:
+        assert isinstance(outcome, BatchFailure)
+        assert isinstance(outcome.error, AmbiguousExecutionError)
+        assert isinstance(outcome.error.__cause__, ProtocolError)
 
 
 @pytest.mark.asyncio

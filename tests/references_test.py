@@ -489,7 +489,8 @@ async def test_batch_dispatch_coalesces_pages_and_preserves_total_metadata() -> 
 
 
 @pytest.mark.asyncio
-async def test_reference_batch_preserves_tolerant_duplicate_json_members() -> None:
+async def test_reference_batch_refuses_a_repeated_command_key() -> None:
+    # Two answers under one command key leave the page unreadable: it is not taken as either of them.
     class DuplicateMemberTransport:
         host = "fixture.invalid"
 
@@ -517,10 +518,10 @@ async def test_reference_batch_preserves_tolerant_duplicate_json_members() -> No
         identity=_identity(),
     )
 
-    outcomes = [outcome async for outcome in stream]
+    with pytest.raises(AmbiguousExecutionError) as raised:
+        [outcome async for outcome in stream]
 
-    assert len(outcomes) == 1
-    assert isinstance(outcomes[0], KernelReferenceItem)
+    assert isinstance(raised.value.__cause__, ProtocolError)
 
 
 @pytest.mark.asyncio
@@ -1520,7 +1521,8 @@ async def test_primary_reference_failure_survives_secondary_cleanup_budget_failu
     stream = fan_out(
         Executor(CancellationResistantTransport()),
         [
-            ReferenceRequest(Request("bad", route=RouteKind.BARE), "bad"),
+            # A SAFE read: its malformed answer is its failure itself, not an ambiguity around it.
+            ReferenceRequest(Request("bad", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), "bad"),
             ReferenceRequest(Request("slow", route=RouteKind.BARE), "slow"),
         ],
         dispatch=KernelDirectDispatch(concurrency=TWO_REFERENCES),

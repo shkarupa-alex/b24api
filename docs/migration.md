@@ -75,6 +75,94 @@
   server as the same value, so a rule that alternates between them now fails with
   `ContinuationError(CONTINUATION_CYCLE)` at the repetition instead of running until a budget ends it.
 
+## One verdict per send
+
+What the failure that ended a send proves about whether its request ran is now one value, read by one rule
+from the whole checked answer, for `call()`, direct and batch fan-out, references, classic and REST 3.0 batch
+alike (see the execution facts in `docs/architecture.md`).
+
+- **Breaking: an ambiguous status (408, 5xx) proves nothing, structured or not.** A structured error with a
+  status the ambiguity policy holds ambiguous (408 or any 5xx by default), such as `INTERNAL_SERVER_ERROR`
+  with 500 or the REST 3.0 `BITRIX_REST_V3_EXCEPTION_LIMITER_QUERYTIMELIMITEXCEPTION` with 503, was the
+  request's conclusive answer: `call()` raised the `ApiResponseError` and the outcome was a `CommandFailure`.
+  It now leaves the request possibly run, as an unstructured one does: `call()` of `UNSAFE` or `UNKNOWN` work raises
+  `AmbiguousExecutionError` whose cause is the `ApiResponseError`, and the outcome is `CommandOutcomeUnknown`.
+  A `SAFE` request still raises the `ApiResponseError`, and is retried only when its code is transient. A
+  listed refusal code (`QUERY_LIMIT_EXCEEDED`, which the portal sends with 503, or `OPERATION_TIME_LIMIT`)
+  still proves the request did not run, and it is still sent again whatever its safety. A classic batch
+  envelope answered so was a `CommandFailure` for each of its commands; each is now unknown and is not
+  replayed unless `SAFE` and transient, so a write that ran before the server failed is never reported failed.
+- **Breaking: `call()` of a write whose answer cannot be read raises `AmbiguousExecutionError`.** A 2xx answer
+  that cannot be decoded (truncated JSON, `{}`, a `total` or `next` that is not an integer) already made the
+  outcome of a batch or fan-out command unknown, but `call()` raised the `EnvelopeContractError` or
+  `ProtocolError` itself. For `UNSAFE` and `UNKNOWN` work it now raises `AmbiguousExecutionError` with that
+  error as its cause, as for a lost answer. So does a malformed error the request's own `ResultErrorSpec`
+  finds. `SAFE` work still raises the decoder's error.
+- **Breaking: a REST 3.0 envelope refused for its credentials fails its commands without isolation.** A 401 on
+  a REST 3.0 batch envelope (`expired_token`, `invalid_token`) was read as an abort that may have run: `SAFE`
+  commands were each sent alone and `UNSAFE` ones were unknown, so a thousand reads cost a thousand refused
+  requests. No command can pass credentials the envelope failed, so a 401 now answers every command, as on a
+  classic envelope: each is a `CommandFailure` with that error, never sent alone. Any other structured error on
+  a REST 3.0 envelope, a 403 or 404 included, may come from the one command that aborted it after earlier ones
+  ran, so it still proves nothing about them, as a refusal code of the REST 3.0 load limiter does not. Nor does
+  an error body on a REST 3.0 envelope that cannot be read or contradicts itself, at any status but a 401: only
+  a gateway's page (not JSON, or JSON without a top-level `error` and without a repeated top-level member) at a
+  listed refusal status (423, 425, 429) still proves the envelope was refused.
+- **An answer that contradicts itself proves nothing.** A body that is both a `result` and an `error` (for
+  example `{"result": 42, "error": "QUERY_LIMIT_EXCEEDED"}`) was read as the error, so a quota code there
+  sent an `UNSAFE` creation again. It is now a `ProtocolError` that proves nothing: the request may have run.
+  Outside 2xx the status decides, as for any error body the client cannot read, but such a body never proves
+  a refusal: a 429 that also carries a result is the request's answer, not a gateway's refusal.
+- **A repeated control member makes the answer unreadable.** A member name repeated where the answer is
+  decided kept only its last value, so a repeated command key in `result_error` could turn a server error into
+  a quota refusal and replay a write. Now:
+  - a body that repeats a top-level member or a member of a REST 3.0 `error` object is malformed
+    (`EnvelopeContractError` for a 2xx answer, `ProtocolError` at any other status). At 2xx or an ambiguous
+    status (408, 5xx) the request may have run; at any other status the status answers it, and at a refusal
+    status (423, 425, 429) it proves no refusal, with or without an `error` member: a gateway's page repeats
+    none of its top-level members, so the body is taken for the server's own answer;
+  - a classic batch envelope that repeats one of its members or a command key leaves each of its commands
+    unknown, caused by a `ProtocolError`;
+  - a command's error entry, or the error a request's `ResultErrorSpec` finds in its result, that repeats a
+    member leaves that command unknown; its neighbours keep their answers. So does a repeat on the way to that
+    error, its code or its description (`{"error": {"code": "ERR", "code": ""}}`), which would otherwise hide
+    the error or change it.
+
+  A malformed classic envelope is not transient, so it is not sent again, `SAFE` or not; `SAFE` commands of a
+  REST 3.0 envelope that cannot be read are still sent alone, as after any abort. A name repeated in a result's
+  own data still keeps its last value, a direct result whose members happen to be named `result` or
+  `result_error` included: the keyset paths no longer have a stricter mode of their own, and
+  `Executor.execute()` no longer takes the `strict_json_members` keyword that selected it.
+- **A malformed classic error entry is unknown.** A `result_error` entry that is not an object with a scalar
+  `error` code (`null`, `[]`, `{}`, `{"error": []}`) was a `CommandFailure` with a `BatchCommandError` of code
+  `malformed_batch_error`, as if the server had answered it. It is now `CommandOutcomeUnknown` caused by a
+  `ProtocolError`, and under fail-fast it no longer proves that the server halted the commands after it.
+- **A body nested more than 256 levels below a top-level member is a malformed answer, at any status.** It
+  escaped as a bare `RecursionError` where the parser could not follow it (`call()` raised it, a tolerant
+  `batch_outcomes()` ended with it, and a fan-out command was a `CommandFailure` that said it was never sent),
+  and was decoded where it could, so the same bytes meant different things on different interpreters. The
+  decoder now refuses it at a fixed depth, the 256 levels a member such as `result` holds once frozen, and it
+  is read like any other unreadable body: at 2xx, 408 or 5xx the request may have run (unknown,
+  `AmbiguousExecutionError` from `call()` of a write); at a listed refusal status (423, 425, 429) it is a
+  gateway's page that proves a refusal; at any other status the status answers it. A failure an outcome
+  carries in a `CapabilityError` (a caller's exception) now keeps what was recorded about whether its command
+  ran.
+- **A leading byte order mark is ignored.** A body that began with a UTF-8 byte order mark was malformed, so a
+  sent write was unknown; the mark is now skipped, as RFC 8259 allows, and the answer is read.
+- **Unreadable server timing no longer drops the answer.** A `time` block that could not be read (a negative
+  `duration` after a server clock step, numbers as strings) failed the whole response with `ProtocolError`. The
+  timing is diagnostic: `Response.time` is now `None` and the result is returned.
+- **A request its transport could not build is not a physical request.** A `TransportError` of phase
+  `not_dispatched` that is not retryable (a request HTTPX could not build, a lone surrogate in a parameter for
+  example) was counted in `physical_requests` and recorded as answered, so its settlement was a failure. It is
+  now a stop before the send, as a closed client's `ClientClosedError` is: not counted, settled not executed. A
+  retryable failure of that phase (a refused connection) is still a send that is retried.
+- **A spent retry budget names its request and cause.** The `BudgetExceededError` that ends a retried request
+  ("per-request attempt budget exhausted", for example) now carries the request's summary, and the CLI's error
+  output adds the failure it followed as `cause` (its type, code and HTTP status).
+- **A reference binding with an unknown page stays unknown.** A later page of the same binding that failed
+  conclusively no longer clears the mark, so the binding closes `UNKNOWN`, not `FAILURE`.
+
 ## The retry path
 
 - **A REST 3.0 isolation waits and is admitted as a retry is, and sends one command at a time.** When
@@ -1037,8 +1125,8 @@ now unknown with reason `CONNECTION_LOST_AFTER_DISPATCH` and a cause chain that 
   `CommandFailure` carrying `EnvelopeContractError` or `ProtocolError` in classic batch and
   direct fan-out, and a `ReferenceFailure` in `iter_reference_outcomes()` with direct or batch
   dispatch. It is now unknown with reason `HTTP_STATUS_AFTER_DISPATCH` and that error as its cause, as
-  REST v3 batch already reported it. `call()` still raises the `EnvelopeContractError` or
-  `ProtocolError` itself.
+  REST v3 batch already reported it. `call()` still raised the `EnvelopeContractError` or
+  `ProtocolError` itself until [One verdict per send](#one-verdict-per-send).
 - **A command answer that cannot be decoded is unknown.** Malformed paging metadata of a classic
   batch command (a `result_total` that is not an integer, for example) and an embedded error that
   the command's `ResultErrorSpec` finds malformed were a `CommandFailure` with `ProtocolError` in

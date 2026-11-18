@@ -55,7 +55,13 @@ from b24api.contracts.completion import (
     PageScheduled,
 )
 from b24api.contracts.policy import ConfirmationPolicy, ReplayDisposition, SnapshotRequirement
-from b24api.errors import BatchCommandError, BudgetExceededError, IncompleteTraversalError
+from b24api.errors import (
+    AmbiguousExecutionError,
+    BatchCommandError,
+    BudgetExceededError,
+    IncompleteTraversalError,
+    ProtocolError,
+)
 from b24api.execution import ExecutionContext
 from b24api.transport import WireResponse
 from tests.scripting import (
@@ -864,11 +870,11 @@ _TAIL_CHUNK, _REPLAY = 2, 3  # the sends of the first tail chunk and of its refu
 async def test_a_counted_tail_page_that_fails_with_its_chunk_is_traced_the_way_it_settles(
     monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
-    # The first tail chunk, which carries both bindings' tail pages, fails as a whole: its answer cannot be
-    # decoded, or its first command is refused (QUERY_LIMIT_EXCEEDED) and the answer of that command's replay
-    # cannot be decoded. Each binding fails at its first tail page, which is traced the way it settles: one that may
-    # have run is unknown, one whose own command succeeded is rejected with the chunk (``transaction_aborted``). Each
-    # page settles the same way, on the completion events.
+    # The first tail chunk carries both bindings' tail pages. Its answer cannot be decoded: every page may have
+    # run, so each binding fails at its first tail page, unknown for the batch envelope. Or its first command is
+    # refused (QUERY_LIMIT_EXCEEDED) and the answer of that command's replay cannot be decoded: that command alone
+    # may have run, so the first binding fails there and the second, its commands answered, completes. Each page
+    # settles the same way, on the completion events.
     events = _observed(monkeypatch)
     portal = BatchPortal(_dense(301))
     undecodable = WireResponse(200, (("content-type", "application/json"),), b"[" * _NESTED + b"]" * _NESTED)
@@ -905,11 +911,15 @@ async def test_a_counted_tail_page_that_fails_with_its_chunk_is_traced_the_way_i
         for record in _report(stream).page_trace
         if record.outcome is not PageOutcome.COMMITTED
     )
-    unknown = (PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION)
-    second = unknown if mode == "undecodable" else (PageOutcome.REJECTED, PageRejectionCode.TRANSACTION_ABORTED)
+    unknown = (PageOutcome.UNKNOWN, PageRejectionCode.BATCH_ENVELOPE)
     # Each page keeps its command's index in the chunk, the first binding's six tail pages ahead of the second's.
-    assert traced == [(0, WIDTH, 0, *unknown), (1, WIDTH, _TAIL_PAGES, *second)]
-    assert [event.correlation for event in outcomes if isinstance(event, ReferenceFailure)] == [1, 2]
+    if mode == "undecodable":
+        assert traced == [(0, WIDTH, 0, *unknown), (1, WIDTH, _TAIL_PAGES, *unknown)]
+        assert [event.correlation for event in outcomes if isinstance(event, ReferenceOutcomeUnknown)] == [1, 2]
+    else:
+        assert traced == [(0, WIDTH, 0, *unknown)]
+        assert [event.correlation for event in outcomes if isinstance(event, ReferenceOutcomeUnknown)] == [1]
+    assert not any(isinstance(event, ReferenceFailure) for event in outcomes)
     # The tail pages: every one may have run when the chunk's answer is lost; otherwise only the refused command's,
     # whose replay's answer is lost, and the rest of the chunk, its commands answered with successes, succeeded.
     settled = Counter((event.binding_id, event.outcome) for event in events if isinstance(event, PageCommandOutcome))
@@ -927,15 +937,16 @@ async def test_a_counted_tail_page_that_fails_with_its_chunk_is_traced_the_way_i
             (0, CommandSettlement.UNKNOWN): 1,
             (1, CommandSettlement.SUCCESS): 1 + tail,
         }
-    # Every tail page whose command succeeded is rejected as aborted: the second binding's first one, where it
-    # stops, as its trace says, and each it never consumes.
+    # Every tail page whose command succeeded and that a failed binding never consumes is rejected as aborted.
     aborted = Counter(
         event.binding_id
         for event in events
         if isinstance(event, PageRejected) and event.reason == PageRejectionCode.TRANSACTION_ABORTED.value
     )
-    assert aborted == ({} if mode == "undecodable" else {0: tail - 1, 1: tail})
-    assert not any(isinstance(event, ReferenceComplete) for event in outcomes)
+    assert aborted == ({} if mode == "undecodable" else {0: tail - 1})
+    assert [event.correlation for event in outcomes if isinstance(event, ReferenceComplete)] == (
+        [] if mode == "undecodable" else [2]
+    )
 
 
 @pytest.mark.asyncio
@@ -1383,11 +1394,10 @@ _SECOND_FLAT_TAIL = 3
 async def test_a_flat_counted_tail_batch_that_fails_as_a_whole_traces_the_page_it_stops_at(
     monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
-    # The second tail batch fails as a whole, with no outcome per page: its answer cannot be decoded, or its second
-    # command is refused (QUERY_LIMIT_EXCEEDED) and the answer of that command's replay cannot be decoded. The
-    # traversal stops at the batch's first page, which is traced the way it settles, with its index in its batch,
-    # as a reference tail page failing with its chunk is: it may have run, or its own command succeeded and it is
-    # rejected with the batch (``transaction_aborted``).
+    # The second tail batch's answer cannot be decoded: every page of it may have run, so the traversal stops at
+    # the batch's first page, unknown for the batch envelope, with its index in its batch. Or its second command
+    # is refused (QUERY_LIMIT_EXCEEDED) and the answer of that command's replay cannot be decoded: the first page
+    # of the batch is read, and the traversal stops at the second, the one that may have run.
     events = _observed(monkeypatch)
     portal = BatchPortal(_dense(301))
     undecodable = WireResponse(200, (("content-type", "application/json"),), b"[" * _NESTED + b"]" * _NESTED)
@@ -1422,15 +1432,15 @@ async def test_a_flat_counted_tail_batch_that_fails_as_a_whole_traces_the_page_i
                 async for _ in stream:
                     pass
 
-        with pytest.raises(RecursionError):
+        with pytest.raises(IncompleteTraversalError) as raised:
             await drain()
 
-    first = (
-        (PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION)
-        if mode == "undecodable"
-        else (PageOutcome.REJECTED, PageRejectionCode.TRANSACTION_ABORTED)
-    )
-    assert _failed_trace(_report(stream)) == [(None, 4 * WIDTH, PageDispatch.BATCH, 0, *first)]
+    assert isinstance(raised.value.__cause__, AmbiguousExecutionError)
+    assert isinstance(raised.value.__cause__.__cause__, ProtocolError)
+    stop = (4, 0) if mode == "undecodable" else (5, 1)
+    assert _failed_trace(_report(stream)) == [
+        (None, stop[0] * WIDTH, PageDispatch.BATCH, stop[1], PageOutcome.UNKNOWN, PageRejectionCode.BATCH_ENVELOPE)
+    ]
     settled, aborted, closure = _flat_settlement(events)
     batch = (
         [CommandSettlement.UNKNOWN] * 3
@@ -1438,9 +1448,8 @@ async def test_a_flat_counted_tail_batch_that_fails_as_a_whole_traces_the_page_i
         else [CommandSettlement.SUCCESS, CommandSettlement.UNKNOWN, CommandSettlement.SUCCESS]
     )
     assert settled == dict.fromkeys(range(4), CommandSettlement.SUCCESS) | dict(zip(range(4, 7), batch, strict=True))
-    # A page whose command succeeded is rejected as aborted: the page the traversal stops at, as its trace says,
-    # and the one past the stop it never consumes.
-    assert aborted == ([] if mode == "undecodable" else [4, 6])
+    # A page whose command succeeded and that the traversal never consumes, past its stop, is rejected as aborted.
+    assert aborted == ([] if mode == "undecodable" else [6])
     assert closure is BindingClosure.UNKNOWN
 
 

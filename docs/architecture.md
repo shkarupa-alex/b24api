@@ -115,15 +115,37 @@ batch's envelope, which every replay send of the command keeps: a page replayed 
 keeps the index of the batch it was first submitted with, whichever send's answer settled it. A page with no
 batch command to point to, such as a direct page, has none. Classic and REST v3 batch, `call()`, direct and
 batch fan-out, references and list traversal all use them, and none of them chooses from the exception type,
-which names the cause of a failure and never proves that a command did not run. A sent command is unknown
-unless a listed refusal proves it did not run or a conclusive answer settles it. A conclusive answer is a
-structured Bitrix error, top-level or found in the result by the command's own contract, or any status outside
-2xx that the ambiguity policy does not hold ambiguous, whatever its body, so a malformed error body on such a
-status is conclusive too. A REST v3 batch envelope is the one exception: a top-level structured error on it is
-an abort, which may come after some of its commands ran, so it settles none of them; a command is answered
-only by its own element or its own isolated send, or proven not run by a transport failure that proves the
-envelope was not accepted or a listed refusal status of the envelope. A 2xx answer the client cannot decode
-settles nothing, whichever part is malformed: the envelope, a command's paging metadata or its embedded error.
+which names the cause of a failure and never proves that a command did not run.
+
+What the failure that ended one send proves is one value, `facts.Verdict`, computed by one function,
+`facts.send_verdict`, for the executor's own sends, a classic envelope and a REST v3 envelope alike: not run,
+answered, or may have run. Whether the send may be repeated and what the command's outcome is both derive from
+it. The answer is read whole before any part of it proves anything. The decoder (`transport.protocol.decode_json`)
+refuses a body whose top-level members or REST 3.0 `error` object repeat a name, and a body holding a value
+more than 256 levels below a top-level member (deeper than that member frozen may be), whatever this
+interpreter's parser could follow; a name repeated anywhere else keeps its last value and is recorded on the decoded object
+(`contracts.json.repeated_names`, kept through a `Response`'s frozen copy). The reader that knows a member decides
+an answer refuses its repeats: the classic envelope decoder its members and maps of command keys, and each
+command's error entry; the embedded-error check the error a command's own contract finds. A name repeated in result
+data stays data. The codec refuses a body that is both a `result` and an `error`. Each is a `ProtocolError` that
+proves nothing, so no part of it can prove a refusal.
+Then, in this order: a transport failure proves the send did not run only when no byte of it may have reached
+the server; a listed refusal code proves it refused; a status the ambiguity policy holds ambiguous (408 and every
+5xx by default) proves nothing, structured or not; a listed refusal status (423, 425, 429) proves it refused when
+its body is a gateway's page (not JSON, malformed JSON, or JSON without a top-level `error`), and a body the
+server wrote proves no refusal even when it cannot be read (an `error` that is malformed or contradicts a
+`result`, or any member the decoder refuses as repeated, with or without an `error`); any other structured error, found at the top level or in the result by the command's own contract, and
+any other status outside 2xx, whatever its body, answers it. A 2xx answer the client cannot decode, an oversized
+or a lost answer prove nothing, whichever part is malformed: the envelope, a command's paging metadata, its error
+entry or its embedded error. A classic envelope is limited and refused as one request, so its answer is read as
+a lone request's. A REST v3 envelope differs: it runs its commands in turn and aborts on the first that fails, its
+load limiter included, so an error on the envelope, structured, unreadable or contradictory, may come after some
+commands ran and proves nothing about them; only a 401, credentials no command could pass, answers every command,
+which is not isolated, and a gateway's page at a listed refusal status proves the envelope was refused. A
+`SAFE` command whose answer proves nothing is still not `UNSAFE`: it is retried after a transient failure, and
+`call()` raises the failure itself rather than an ambiguity. A failure that stands for another (an outcome's
+`CapabilityError` carrying a caller's exception) carries its facts through `facts.carry_facts`, the one way a
+failure is replaced, so the outcome follows them and not the carrier's type.
 
 A command keeps one send lineage across executor retries, classic batch replay rounds and REST v3
 isolation: what the sends it was in left open. The commands a REST v3 envelope group still resolves are

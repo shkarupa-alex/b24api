@@ -8,6 +8,13 @@ from typing import TYPE_CHECKING, Any
 
 from b24api._error_types import ErrorOrigin
 from b24api.contracts.evidence import ResponseEvidence
+from b24api.contracts.json import (
+    MAX_JSON_DEPTH,
+    DecodedJsonObject,
+    JsonValue,
+    nests_deeper_than_supported,
+    repeated_names,
+)
 from b24api.contracts.v3_codes import NON_RETRYABLE_V3_ERROR_CODES, render_code
 from b24api.errors import (
     ApiResponseError,
@@ -38,6 +45,50 @@ _MAX_VALIDATION_TEXT = 256
 _MAX_V3_SAFE_BYTES = 8 * 1024
 
 
+class RepeatedControlMemberError(ValueError):
+    """A JSON body the server wrote that repeats a member name where it decides the answer: unreadable, not foreign."""
+
+
+def decode_json(text: str, *, allow_constants: bool = True) -> object:
+    """Decode a response body, refusing one whose answer cannot be read unambiguously; raises ``ValueError``.
+
+    What any body proves about whether its request ran is read from its top-level members (``result``, ``error``
+    and the paging and timing metadata) and a REST 3.0 ``error`` object. A name repeated among them keeps two
+    answers where the decoder would see one, so the body is refused. Elsewhere a repeated name keeps its last
+    value, as any JSON decoder does, and the decoded object records it (``contracts.json.repeated_names``) for the
+    reader that knows the member decides an answer: a classic batch envelope and a result's embedded error. A body
+    holding a value more than ``MAX_JSON_DEPTH`` levels below a top-level member, deeper than that member frozen
+    may be, is refused as any other malformed body, whatever depth this interpreter's parser could follow, and so,
+    unless ``allow_constants``, is ``NaN`` or ``Infinity``. A leading byte order mark is ignored, as RFC 8259 lets
+    a parser ignore it.
+    """
+    text = text.removeprefix("\ufeff")
+    try:
+        payload = json.loads(
+            text,
+            object_pairs_hook=_members,
+            parse_constant=None if allow_constants else _reject_json_constant,
+        )
+    except RecursionError as error:
+        raise ValueError("JSON nesting exceeds the supported depth") from error
+    # A value too deep has the body and MAX_JSON_DEPTH + 1 containers above it: a body with fewer openers is not walked.
+    if text.count("[") + text.count("{") > MAX_JSON_DEPTH + 1 and nests_deeper_than_supported(payload):
+        raise ValueError("JSON nesting exceeds the supported depth")
+    if isinstance(payload, Mapping) and (repeated_names(payload) or repeated_names(payload.get("error"))):
+        raise RepeatedControlMemberError("a JSON member name is repeated where it decides the answer")
+    return payload
+
+
+def _members(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonValue]:
+    """Build one decoded object, recording the names it repeats."""
+    decoded = dict(pairs)
+    return decoded if len(decoded) == len(pairs) else DecodedJsonObject(pairs)
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant is forbidden: {value}")
+
+
 class ProtocolCodec:
     """Decode bounded HTTP error evidence without retaining raw bodies."""
 
@@ -50,7 +101,7 @@ class ProtocolCodec:
         """Return the redactor, with its registered exact secrets, that renders every decoded error."""
         return self._redactor
 
-    def error_from_http(  # noqa: PLR0911, PLR0913 - distinct structured, gateway, and malformed response exits
+    def error_from_http(  # noqa: PLR0913 - the response's status, body, headers and the request's context
         self,
         *,
         status_code: int,
@@ -62,37 +113,24 @@ class ProtocolCodec:
     ) -> B24ApiError | None:
         """Return a structured error before generic HTTP status; ``diagnostics`` aliases the request's fields."""
         parsed, malformed = self._parse_body(body)
+        # A body the decoder refuses for a repeated member is the server's own answer, whether or not it names an
+        # `error`, so it is never a gateway's page (a refusal); its status decides the rest. Any other body without
+        # a readable top-level `error` (not JSON, malformed, or JSON without one) outside 2xx is the gateway's.
+        repeated = isinstance(malformed, RepeatedControlMemberError)
 
         if isinstance(parsed, Mapping) and "error" in parsed:
             safe_headers = self._safe_headers(headers or {})
             preview = self._body_preview(body, diagnostics)
-            original_code = parsed["error"]
-            description: str | None
-            validation: tuple[ValidationIssue, ...] = ()
-            truncated = False
-            code_is_exact = isinstance(original_code, Mapping)
-            if isinstance(original_code, Mapping):
-                try:
-                    original_code, description, validation, truncated = self._v3_error(original_code, diagnostics)
-                except (TypeError, ValueError):
-                    return self._protocol_error(
-                        "Malformed V3 error object",
-                        status_code=status_code,
-                        request_summary=request_summary,
-                        headers=safe_headers,
-                        body_preview=preview,
-                    )
-            else:
-                raw = parsed.get("error_description")
-                description = None if raw is None else str(raw)
-            if not isinstance(original_code, str | int):
+            defect, original_code, description, validation, truncated = self._read_structured(parsed, diagnostics)
+            if defect is not None:
                 return self._protocol_error(
-                    "Structured error code must be a string or integer",
+                    defect,
                     status_code=status_code,
                     request_summary=request_summary,
                     headers=safe_headers,
                     body_preview=preview,
                 )
+            code_is_exact = isinstance(parsed["error"], Mapping)
             retryable = str(original_code).strip().casefold() in {code.casefold() for code in retry_codes} and not (
                 code_is_exact and original_code in NON_RETRYABLE_V3_ERROR_CODES
             )
@@ -123,7 +161,7 @@ class ProtocolCodec:
                 diagnostics=diagnostics,
             )
 
-        if status_code >= HTTP_ERROR_MINIMUM:
+        if status_code >= HTTP_ERROR_MINIMUM and not repeated:
             return self._gateway_error(
                 status_code,
                 request_summary,
@@ -131,17 +169,41 @@ class ProtocolCodec:
                 self._body_preview(body, diagnostics),
             )
 
-        if malformed:
+        if malformed is not None:
             safe_headers = self._safe_headers(headers or {})
             preview = self._body_preview(body, diagnostics)
             return self._protocol_error(
-                "Malformed JSON response",
+                "JSON response repeats a member name where it decides the answer"
+                if repeated
+                else "Malformed JSON response",
                 status_code=status_code,
                 request_summary=request_summary,
                 headers=safe_headers,
                 body_preview=preview,
             )
         return None
+
+    def _read_structured(
+        self, parsed: Mapping[str, Any], diagnostics: DiagnosticContext | None
+    ) -> tuple[str | None, str | int, str | None, tuple[ValidationIssue, ...], bool]:
+        """Read a structured error body: its defect, or its code, description, validation issues and truncation.
+
+        A body that is both a ``result`` and an ``error`` answers the request two ways: neither is its answer, so
+        it proves nothing, a refusal least of all.
+        """
+        if "result" in parsed:
+            return "Response carries both a result and an error", "", None, (), False
+        original_code = parsed["error"]
+        if isinstance(original_code, Mapping):
+            try:
+                code, description, validation, truncated = self._v3_error(original_code, diagnostics)
+            except (TypeError, ValueError):
+                return "Malformed V3 error object", "", None, (), False
+            return None, code, description, validation, truncated
+        if not isinstance(original_code, str | int):
+            return "Structured error code must be a string or integer", "", None, (), False
+        raw = parsed.get("error_description")
+        return None, original_code, None if raw is None else str(raw), (), False
 
     def _gateway_error(
         self,
@@ -254,18 +316,17 @@ class ProtocolCodec:
         return code, SafeText(render(message)), tuple(bounded), truncated
 
     @staticmethod
-    def _parse_body(body: bytes | str | Mapping[str, Any] | None) -> tuple[object, bool]:
-        if body is None:
-            return None, False
+    def _parse_body(body: bytes | str | Mapping[str, Any] | None) -> tuple[object, ValueError | None]:
+        """Return the decoded body, or the failure that made it unreadable."""
         if isinstance(body, Mapping):
-            return body, False
-        if body in {b"", ""}:
-            return None, False
+            return body, None
+        if body is None or body in {b"", ""}:
+            return None, None
         text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body
         try:
-            return json.loads(text), False
-        except (json.JSONDecodeError, ValueError):
-            return None, True
+            return decode_json(text), None
+        except ValueError as error:
+            return None, error
 
     def _safe_headers(self, headers: Mapping[str, str]) -> tuple[tuple[str, str], ...]:
         return tuple(
