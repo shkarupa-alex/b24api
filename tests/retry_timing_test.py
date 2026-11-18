@@ -147,6 +147,29 @@ async def test_a_throttle_hint_shorter_than_a_nonzero_backoff_keeps_the_backoff(
     assert sent_at == pytest.approx([0.0, 0.3, 0.6])
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("backoff", "attempts"), [(1e200, 4), (2.0, 1_100)], ids=["huge-factor", "many-retries"])
+async def test_the_backoff_saturates_at_its_maximum_however_far_it_grows(backoff: float, attempts: int) -> None:
+    # 1e200 squared, or two to the 1024th, overflows a float: each retry waits the maximum delay instead.
+    time = _Time()
+    transport = ResponderTransport(always(WireResponse(429, (), b"")))
+    executor = _executor(transport, time)
+    policy = ExecutionPolicy(
+        max_attempts_per_request=attempts,
+        max_requests=attempts,
+        max_elapsed=1e6,
+        max_retry_elapsed_per_request=1e6,
+        retry=RetryPolicy(initial_delay=0.001, maximum_delay=0.002, backoff=backoff, jitter=0),
+    )
+
+    with pytest.raises(BudgetExceededError, match="attempt budget"):
+        await executor.execute(_request(ReplaySafety.SAFE, "crm.item.get"), policy=policy)
+    await executor.coordinator.close()
+
+    assert len(transport.requests) == attempts
+    assert time.sleeps == pytest.approx([0.001, *[0.002] * (attempts - 2)])
+
+
 def _imf_date(moment: float) -> str:
     return email.utils.formatdate(moment, usegmt=True)
 

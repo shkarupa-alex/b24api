@@ -29,11 +29,26 @@ def _retry_delay(
     random_source: Callable[[], float],
 ) -> float:
     retry = policy.retry
-    base = min(retry.maximum_delay, retry.initial_delay * retry.backoff ** max(0, retry_number - 1))
+    base = backoff_delay(policy, retry_number)
     if retry.jitter == 0 or base == 0:
         return base
     factor = 1 - retry.jitter + (2 * retry.jitter * random_source())
     return max(0.0, base * factor)
+
+
+def backoff_delay(policy: ExecutionPolicy, number: int) -> float:
+    """Return the ``number``-th exponential delay of ``policy.retry``, without jitter, saturated at its maximum.
+
+    The power is taken only below the exponent at which it reaches the maximum, so no retry count, however
+    large, overflows it.
+    """
+    retry = policy.retry
+    exponent = max(0, number - 1)
+    if retry.initial_delay == 0 or retry.backoff == 1:
+        return retry.initial_delay
+    if exponent >= math.log(retry.maximum_delay / retry.initial_delay, retry.backoff):
+        return retry.maximum_delay
+    return min(retry.maximum_delay, retry.initial_delay * retry.backoff**exponent)
 
 
 def _retry_after_seconds(wire: WireResponse) -> float | None:
