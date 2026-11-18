@@ -1,5 +1,93 @@
 # Migration guide
 
+## Load limits, holds and attempt timeouts
+
+- **Breaking: `Settings.http_timeout` bounds each attempt, and the client's default policy is
+  `ExecutionPolicy()`.** `http_timeout` was each request's retry window under the client's default
+  policy, `ExecutionPolicy.from_settings(settings)`, and an attempt had no timeout of its own: one that
+  hung (a server that accepts TCP and never answers the TLS handshake, say) spent the whole window, and
+  was reported sent, so an `UNSAFE` request ended unknown though no byte of it left, and a `SAFE` one
+  was never retried. A `policy=` replaced the default wholesale, so
+  `Bitrix24(Settings(http_timeout=2.0), policy=ExecutionPolicy(max_requests=7))` silently got a
+  120-second window. `http_timeout` (30 s by default) now bounds each attempt of the client's own HTTPX
+  transport: each phase of it (connecting, TLS included, waiting for a pooled connection, writing the
+  request, each read of the answer) times out after it, and earlier when the retry window has less
+  left. An attempt that times out before anything was sent is proven not sent and retried whatever its
+  safety. `ExecutionPolicy.from_settings()` is removed and `Settings` puts nothing in a policy: the
+  client's default policy is `ExecutionPolicy()`, whose retry window is 120 s, and a `policy=` keeps the
+  configured attempt timeout. To keep the old 30-second window, pass
+  `ExecutionPolicy(max_retry_elapsed_per_request=30.0)`. `HttpxTransport` takes `timeout=` (30 s by
+  default) and reports it as `timeout`; a transport you inject keeps its own timeouts. The window's end
+  cuts an attempt of the client's transport where the transport knows how far it got: a transport that
+  ends each attempt by its `attempt_timeout` itself and classifies that timeout by its phase declares
+  `TransportCapabilities(bounds_attempts=True)`, as `HttpxTransport` does, and the executor then sets no
+  deadline of its own around the attempt. Any other transport is cut by the executor, which cannot tell
+  how far the attempt got, so a send it cuts may have run, as before.
+- **Breaking: a quota refusal slows every request to the portal.** A `QUERY_LIMIT_EXCEEDED`, a REST 3.0
+  rate limit or a 429 without a `Retry-After` (the portal sends none: it answers a burst with HTTP 503
+  `QUERY_LIMIT_EXCEEDED`) only delayed the refused request's own retry: every other request of the client
+  went on at full rate and was refused in turn. Such a refusal now holds the whole portal for the retry
+  backoff of the refusals in a row (0.5 s, then 1, 2 and so on up to 30 s by default), so the client's
+  requests slow down together. A refusal of a request sent after the latest pause began grows that
+  backoff; the refusals of one burst, sent before it, do not; an answer that is no refusal, to a request
+  sent after that pause began, resets it. A
+  `Retry-After` or `X-Bitrix-RateLimit-Reset` sets the pause instead, as before.
+- **Breaking: `OPERATION_TIME_LIMIT` holds its method as long as the portal says.** It held the method
+  for a fixed 120 s, which no setting changed. It now holds it for the answer's hint, else until the
+  method's operating time resets, as its latest answer said (`time.operating_reset_at`), else for the
+  backoff of that method's refusals in a row. A classic batch command's `result_time` is now decoded
+  (`CommandSuccess.response.time` was always `None`) and counts the same.
+- **Breaking: a throttle hint holds the portal only on an answer about its load.** A `Retry-After` on
+  any failed answer held every request to the portal, for up to an hour: a 401 `expired_token` with
+  `Retry-After: 3600` refused every later call at once. A hint now holds the portal only on a 429, a
+  503 or an answer with a load limit's code; on any other failure it is ignored.
+- **Breaking: a request held longer than its window ends with the portal's refusal.** A request whose
+  retry the portal's hold kept past its window ended with `BudgetExceededError` ("retry delay would
+  exceed elapsed budget"), the portal's code only in its `__cause__`. When the hold alone, whatever the
+  backoff, outlasts what the window allows (for an `UNSAFE` or `UNKNOWN` request, half of what is left),
+  the request now ends with the refusal itself: `ApiResponseError` with `normalized_code`
+  `operation_time_limit` or `query_limit_exceeded`, or the 429 or 503 as `HTTPGatewayError`. A batch
+  command that followed its envelope's refusal, and a REST 3.0 group, end the same way; a command its
+  own entry answered keeps that answer, as before. When the backoff is what does not fit, the request
+  still ends with `BudgetExceededError` caused by the refusal. Code that caught `BudgetExceededError`
+  for a held request must catch the refusal too.
+- **Breaking: a limit refusal declared inside a result is a refusal.** A request whose
+  `ResultErrorSpec` finds `QUERY_LIMIT_EXCEEDED` or `OPERATION_TIME_LIMIT` inside a 200 answer
+  raised it at once. It is now classified within the attempt, as a refusal of the whole answer is:
+  it holds the portal or the method, and the request is retried after the hold, an `UNSAFE` one
+  included, since the refusal proves it did not run.
+- **Breaking: a held command goes in a later envelope.** The first send of a `batch()` or
+  `batch_outcomes()` chunk left out a command whose method was held longer than the retry window when
+  another command could go, and that command failed unsent with `BudgetExceededError` ("coordinator
+  hold exceeds execution time budget"): after one `OPERATION_TIME_LIMIT` on `crm.deal.update`, a chunk
+  of 49 updates and one get sent the get and failed the updates. The command now goes in a later
+  envelope of its chunk, once its hold ends; only a command whose hold outlasts what the operation has
+  left (`max_elapsed`, after the portal's own hold) is refused unsent. A chunk is still sent whole when
+  every command can go at once, or none can.
+- **Breaking: a replay round of `SAFE` commands waits for the least held.** A classic replay round
+  of `SAFE` commands only waited for the longest hold among them before it sent them all. It now
+  waits as long as its `UNSAFE` and `UNKNOWN` commands need and at least until one command can go;
+  a `SAFE` command held longer goes in a later round, as one beside an `UNSAFE` command already
+  did.
+- **Breaking: retries take turns with first sends.** A retry, whose window runs while it queues,
+  got one permit in six from the client's shared limiter, behind every other class of work.
+  Retries and first sends now alternate, so a retry waits for at most one other permit.
+- **New: a cancelled batch stream tells in flight from never sent.** A `batch_outcomes()` or `batch()`
+  stream ended before it delivered every outcome (cancelled mid-envelope, say) reported `unknown=0`,
+  though up to an envelope of commands may have run. `OperationReport.undelivered_possibly_run` counts
+  the admitted commands never delivered that a send may have run (in flight, or sent without an answer),
+  and `undelivered_not_sent` those never sent; the rest of `admitted - emitted` were answered.
+- **`cooldown_seconds` counts the time the portal was held.** Concurrent refusals each added their
+  whole hint: ten 429s at once with a 0.2-second hint reported 2 s of cooldown for 0.2 s of pause. Each
+  now adds only how far it extended the hold.
+- **The backoff saturates.** A large `RetryPolicy.backoff` or many attempts raised `OverflowError`
+  computing the delay (`backoff=1e200` after three sends, `backoff=2.0` after 1,025). The delay now
+  saturates at `maximum_delay`.
+- **Breaking: the rate coordinator's limit API.** `RateCoordinator(operation_time_limit_delay=...)`,
+  `observe_operation_time_limit()` and `observe_api_throttle()` are removed. A method is held with
+  `hold_method(method, seconds)` and its reset recorded with `observe_reset(method, seconds)`;
+  `RateCoordinator` takes `sleep=` to wait out a hold on its `clock`'s time.
+
 ## Offset traversal ends at the page without `next`
 
 - **Breaking: `iter_list()` ends at the page without `next`.** It followed `next` and then asked for
@@ -265,7 +353,8 @@ alike (see the execution facts in `docs/architecture.md`).
   attempt left, its retry window closed, or a wait longer than the window left) sends nothing and records
   nothing. Either refusal, and one of the envelope retry, now ends each command as a refused retry of a
   classic batch does: unknown, with the refusal (`BudgetExceededError`) caused by the envelope's failure,
-  where it kept the envelope's failure alone. An envelope retry the budget refused is no longer followed
+  where it kept the envelope's failure alone; a group held longer than its window after the portal's
+  answer about its load keeps that answer, as a lone request does (see "Load limits, holds and attempt timeouts"). An envelope retry the budget refused is no longer followed
   by an isolation, which the same budget would refuse.
 - **Breaking: a retry stopped before its send ends with that stop, caused by what it followed.** When
   a request or a batch was sent again after a failure and that retry was stopped before its send by
@@ -835,26 +924,21 @@ send meets a method pause, have changed.
   minutes with all its other commands, or, when the operation had less time left than the pause, failed
   all of them with `BudgetExceededError`. The first send now weighs each command against its own
   method's pause, as a replay round already did: by how much longer its method is held than the portal
-  as a whole (a `Retry-After` hint holds every command alike), against the retry window
-  (`max_retry_elapsed_per_request`) or what the operation has left after the portal's pause, whichever
-  is shorter. When some commands of a chunk can wait that long and others cannot, each command that
-  cannot is not sent and ends at once with `BudgetExceededError` ("coordinator hold exceeds execution
-  time budget"), never sent and not eligible for replay, and the others are sent after the longest pause
-  among them. This is what breaks: a command whose own method is held longer than it may wait (by
-  default, longer than the 30 s retry window), in a chunk whose other commands may go, used to wait with
-  them and succeed when the operation had the time, and now fails unsent with `BudgetExceededError`.
-  When every command of a chunk can wait, or none can, leaving some out would let no other command go,
-  so nothing is left out: as for a lone `call()`, the chunk waits for its pauses within `max_elapsed`
-  (and `batch_outcomes()` reads no further while it waits), or fails at once when a pause outlasts what
-  the operation has left. A fail-fast `batch()` is never split either, since the failure of the command
+  as a whole (a `Retry-After` hint holds every command alike). The least held commands go at once, a
+  command held longer goes in a later envelope of its chunk once its pause ends, and only a command
+  whose pause outlasts what the operation has left after the portal's pause is not sent: it ends at
+  once with `BudgetExceededError` ("coordinator hold exceeds execution time budget"), never sent and
+  not eligible for replay. This is what breaks: a chunk of a held method and others takes more than one
+  envelope, so more requests, and its commands are sent in a different order. When every command of a
+  chunk can go at once, or none can, leaving some out would let no other command go, so nothing is left
+  out: as for a lone `call()`, the chunk waits for its pauses within `max_elapsed` (and
+  `batch_outcomes()` reads no further while it waits), or fails at once when a pause outlasts what the
+  operation has left. A fail-fast `batch()` is never split either, since the failure of the command
   left out would fail the batch: its chunk is treated the same way, so it waits for the pause, as
   before, or fails at once when the pause outlasts what the operation has left. Unchanged in that last
   case: every later chunk of the held method fails the same way, so a source of only that method is
   still read, chunk by chunk, until `max_elapsed` ends the operation. This holds for classic and REST
-  3.0 envelopes alike. To let such commands wait for a long pause again, raise the retry window above
-  it: `http_timeout` sets it only under the client's default policy (`ExecutionPolicy.from_settings`);
-  with an explicit `policy=`, raise its `max_retry_elapsed_per_request`. The pause must also fit in what
-  is left of `max_elapsed`.
+  3.0 envelopes alike.
 - **Unchanged: traversals and dispatched commands wait for a held method.** The pages of a list or
   reference traversal and the commands that `fan_out()` and `fan_out_outcomes()` gather into a
   `BatchDispatch` wave are never left out for their method's pause: a wave waits for it within
@@ -939,8 +1023,8 @@ Public signatures are unchanged; when a retry waits and when it is sent have cha
   request that queued behind others was refused without a send, or sent with a sliver of time and
   reported unknown. The window now opens when the first send gets its permit, so queueing for that
   permit is bounded only by the operation's `max_elapsed`, 900 s by default, where it used to be
-  bounded by `http_timeout`. Every send, retry wait and later permit wait spends the window, and an
-  attempt still has no timeout of its own: it may use what is left of the window. A pause the client
+  bounded by `http_timeout`. Every send, retry wait and later permit wait spends the window, and each
+  attempt is also bounded by its transport's timeout (see "Load limits, holds and attempt timeouts"). A pause the client
   already knows about that outlasts what is left of `max_elapsed` (a `Retry-After` or an
   `OPERATION_TIME_LIMIT` cooldown on the request's methods) fails at once with
   `BudgetExceededError` instead of waiting the budget out. To bound the queue more tightly again,
@@ -951,14 +1035,14 @@ Public signatures are unchanged; when a retry waits and when it is sent have cha
   0.05 seconds, and a send cut that way was reported unknown. Such a retry is now sent only while the
   window left after its wait is at least as long as the wait, measured as the time it actually waited
   when that was longer than planned. Otherwise the request ends with `BudgetExceededError`, whose cause
-  is the refusal, and its outcome stays proven not run: at once, without waiting, when the planned wait
-  already does not fit, or after the wait, before the send, when the wait overran its plan (a late wake
-  or a long permit queue). With the default 30-second window, a `Retry-After` of 15 seconds or more ends
-  an `UNSAFE` or `UNKNOWN` request without a retry even when its first send took no time; each second
-  the request has already spent lowers that bound by half a second. To let it wait longer, raise the
-  retry window: `http_timeout` under the client's default policy, `max_retry_elapsed_per_request` with
-  an explicit `policy=`. A `SAFE` retry is still sent with any window left: it may succeed, and
-  repeating it is harmless.
+  is the refusal, or with the refusal itself when the portal's hold alone does not fit (see "Load limits, holds and attempt timeouts"), and
+  its outcome stays proven not run: at once, without waiting, when the planned wait already does not
+  fit, or after the wait, before the send, when the wait overran its plan (a late wake or a long permit
+  queue). With the default 120-second window, a `Retry-After` of 60 seconds or more ends an `UNSAFE` or
+  `UNKNOWN` request without a retry even when its first send took no time; each second the request has
+  already spent lowers that bound by half a second. To let it wait longer, raise
+  `max_retry_elapsed_per_request`. A `SAFE` retry is still sent with any window left: it may succeed,
+  and repeating it is harmless.
 - **The `SAFE` commands of a classic batch keep their replay.** The same rule applies to the replay
   rounds of a classic batch, whether its commands' own entries were refused or the whole batch was
   refused (a 429, or a quota error for the batch). When the window is too short for its `UNSAFE` or
@@ -967,7 +1051,8 @@ Public signatures are unchanged; when a retry waits and when it is sent have cha
   wait is not repeated; a pause the client still holds on their methods is). The other commands are not
   sent again. One whose own entry answered it keeps that answer, a `BatchCommandError` with its refusal;
   when the whole batch was refused, each ends with `BudgetExceededError` whose cause is that refusal,
-  proven not run and not eligible for replay. Each command is weighed against its own method's pause
+  proven not run and not eligible for replay, or with that refusal itself when its own hold alone
+  outlasts the window. Each command is weighed against its own method's pause
   too, as the client knows it when the round is planned (a method paused by `OPERATION_TIME_LIMIT`, for
   example), so such a pause does not take the replay away from the other commands: a command whose own
   pause outlasts the window is not sent again, and a round waits only as long as its `UNSAFE` and
@@ -987,7 +1072,7 @@ Public signatures are unchanged; when a retry waits and when it is sent have cha
   separate envelopes, so each envelope is admitted or refused whole; one that was refused as a whole and
   whose replay the budget then stops (the window, or a pause or a full queue at its permit) now ends the
   same way, with `BudgetExceededError` whose cause is the refusal, where it used to keep the refusal
-  itself.
+  itself; it keeps the refusal when its hold alone outlasts the window.
 - **408 and 504 are retried, 507 is not.** `RetryPolicy.transient_http_statuses` now defaults to
   408, 423, 425, 429, 500, 502, 503 and 504. An unstructured 408 or 504 is retried for `SAFE`
   requests and stays ambiguous for `UNSAFE` and `UNKNOWN` ones, which are never sent again after it.
@@ -1001,18 +1086,15 @@ Public signatures are unchanged; when a retry waits and when it is sent have cha
   client to one of those methods waits for it, direct calls included.
 
 To restore a short bound on the wait for a permit, lower `max_elapsed` for one call or for the
-client's default policy. For `call()` it bounds the whole call, queue included. A first send gets
+client (`policy=`). For `call()` it bounds the whole call, queue included. A first send gets
 whatever the queue left of `max_elapsed`, so a tight bound brings back the first sends cut to a sliver:
 an `UNSAFE` or `UNKNOWN` one cut that way is reported unknown (`AmbiguousExecutionError`). Keep
 `max_elapsed` well above the longest queue you expect plus one send:
 
 ```python
-import dataclasses
+from b24api import ExecutionPolicy
 
-from b24api import ExecutionPolicy, Settings
-
-settings = Settings(webhook_url="https://example.bitrix24.com/rest/1/token/")
-bounded = dataclasses.replace(ExecutionPolicy.from_settings(settings), max_elapsed=settings.http_timeout)
+bounded = ExecutionPolicy(max_elapsed=30.0)
 ```
 
 **What `max_elapsed` bounds.** It bounds the operation at its scheduling points: when a request, a page
@@ -2146,7 +2228,8 @@ latency-oriented workloads. The dispatcher shutdown remains cancellation-based; 
   `envelope_contract`. Malformed non-empty JSON remains a plain `ProtocolError`.
 - `ExecutionPolicy.from_settings(settings)` returns the client's default policy (the library
   defaults with `max_retry_elapsed_per_request = settings.http_timeout`). A `policy=` argument still
-  replaces that default wholesale; derive it with `dataclasses.replace` to keep the timeout.
+  replaces that default wholesale; derive it with `dataclasses.replace` to keep the timeout. (Removed
+  since: see "Load limits, holds and attempt timeouts".)
 - Counted identity is optional. Without it, matching a qualified total yields count-only assurance;
   with it, the report records identity-and-count assurance.
 - `iter_list_counted()` no longer fails when the first page has no rows, no `next`, and no usable

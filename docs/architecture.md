@@ -211,19 +211,41 @@ outcome.
   immutable counters are built only for a snapshot or the terminal report.
 - A request's retry window (`max_retry_elapsed_per_request`) opens when its first send is granted
   a coordinator permit; queueing before that is bounded by the operation's `max_elapsed`, and a known
-  coordinator hold that outlasts the budget left fails at once. A retry waits the longer of its own
-  backoff and the coordinator's hold on its methods (a host throttle hint or a method cooldown). A
+  coordinator hold that outlasts the budget left fails at once. Each attempt is bounded by the shorter
+  of the window left and its transport's own timeout (`HttpxTransport(timeout=...)`, which
+  `Settings.http_timeout` sets for the client's own transport): the transport knows the phase an attempt
+  timed out in, so one cut before it was sent (connecting, TLS, the pool) is proven not sent and retried
+  whatever its safety. A transport that declares `TransportCapabilities.bounds_attempts` ends each
+  attempt by the window left itself, so the window's end is classified by phase too; the executor cuts
+  any other transport's attempt when the window closes, and that cut proves nothing about how far it
+  got. `Settings` sets no policy: the client's default policy is `ExecutionPolicy()`.
+- Load limits are the coordinator's holds, set where an answer is read (`Executor.observe_refusal`,
+  for a direct answer, a classic envelope, a REST 3.0 envelope and a classic command's entry): a
+  request-rate refusal (`throttle.limit_of`: the quota code, the REST 3.0 rate limit, a 429) holds the
+  host for the server's hint, else for the backoff of the host's refusals in a row
+  (`RateCoordinator.limit_streak`: a refusal of a send that left after the latest pause began grows the
+  streak, one of the burst that pause answers does not, and an answer that is no refusal, to a send that
+  left after that pause began, ends it); an
+  `OPERATION_TIME_LIMIT` holds its method (`hold_method`) for the hint, else until the operating time
+  that method's latest answer gave resets (`observe_reset`, from `time.operating_reset_at`, a classic
+  command's `result_time` included), else for the method's streak backoff. A hint holds the host only
+  on an answer about the load (`hints_load`: a 429, a 503 or a limit's code). The coordinator alternates
+  retries with first sends, so a retry, whose window runs while it queues, waits for at most one other
+  permit. A retry waits the longer of its own backoff and the coordinator's hold on its methods. A
   retry that may not be repeated is planned only with more than twice its wait left, and starts only
   with at least as much window left as it actually waited since then (more than the planned wait
   when the wait overran), so a wait never takes more of the window than the send after it gets; a
-  send that the window still cuts is reported unknown.
+  send that the window still cuts is reported unknown. A send whose hold alone outlasts its window,
+  whatever the backoff, is held out (`_SendPlan.HELD_OUT`): after the server's answer about its load it
+  ends with that answer, its code and evidence (`ends_held_out`), a lone request, a classic command that
+  followed its envelope's failure and a REST 3.0 group alike; otherwise the budget refuses it.
   `Executor.plan_replay` plans the executor's own retries of a direct request and every replay round
   of a physical batch; each round's caller decides it: the executor for a direct request, the REST
   3.0 resolution for its envelopes (one safety class each, admitted or refused whole), and the
   classic batch engine for a classic envelope, which the executor then sends once per call. The
   engine plans each command on its own safety and its own method's hold as known when planning: a
-  round waits only as long as its `UNSAFE` and `UNKNOWN` commands can afford, carries a `SAFE` command
-  held longer to a later round (an attempt is spent per send of the envelope, when `_RequestAttempts`
+  round waits as long as its `UNSAFE` and `UNKNOWN` commands need and at least until one command can
+  go, carries a `SAFE` command held longer to a later round (an attempt is spent per send of the envelope, when `_RequestAttempts`
   records it once its transport returned or failed: a round that is sent spends one, a round stopped
   before its send, at its permit, its admission or its transport, spends none, and a carried command
   spends none of its own;
@@ -261,13 +283,15 @@ outcome.
   Each isolated send is an ordinary request on its command's copy of the lineage, which the executor
   admits at its permit and paces through its own retries. A replay its plan refuses, by the deadline
   (recorded) or while time is left by the attempts, the window or a wait it cannot carry, sends nothing
-  more and ends each command with that refusal caused by the envelope's failure, in both dialects, as a
-  lone request's refused retry ends. An envelope's first send is admitted under all its methods, so for a user's
-  logical batch (`batch()`, `batch_outcomes()`) `Executor.plan_first_send` weighs its commands with
-  the same `_Pause.admits` and `_plan_round`, with no backoff, by how much longer each command's own
-  method is held than the host, against the window its send opens or what the operation has left after
-  the host hold: when some commands can wait and others cannot, the engine refuses those unsent and
-  sends the rest; otherwise the envelope goes whole to its permit. A fail-fast envelope, traversal
+  more and ends each command with that refusal caused by the envelope's failure, or with that failure
+  when it is held out, in both dialects, as a lone request's refused retry ends. An envelope's first
+  send is admitted under all its methods, so for a user's logical batch (`batch()`, `batch_outcomes()`)
+  `Executor.plan_first_send` plans it as a round with the same `_plan_round`, with no backoff, by how
+  much longer each command's own method is held than the host, against what the operation has left
+  after the host hold: the least held commands go now, one held longer goes in a later envelope of the
+  same chunk once its hold ends (`BatchExecutor` plans that envelope again when it comes up), and only
+  one whose hold outlasts what the operation has left is refused unsent; when every command goes now,
+  or none can, the envelope goes whole to its permit. A fail-fast envelope, traversal
   pages and dispatcher waves (`BatchExecutor.execute_requests`) are never split: leaving a command out
   of them lets no other command go.
 - The request budget and the deadline end an operation: `ExecutionContext.admit_request` refuses a
@@ -444,7 +468,10 @@ outcome.
   failure (an interrupt included), after the close has run (only an inline kernel consults the closed read's
   marker; an isolated runner's own close is its CLOSING phase). A stream its reader's cancellation ended gives
   `CANCELLED_REASON`, whatever its source reached. The report counts an item as emitted only once
-  `LifecycleHooks.delivered` says the reader has it. Every task the library starts around caller code (a
+  `LifecycleHooks.delivered` says the reader has it. Of a batch stream's admitted commands never
+  delivered, it tells those a send may have run (in flight when the operation ended, or sent without an
+  answer: `undelivered_possibly_run`) from those never sent (`undelivered_not_sent`), as each chunk's
+  `BatchProgress` holds them. Every task the library starts around caller code (a
   source's pull and close, the worker-thread hop, the reference scheduler's producer and binding tasks, a
   wave's or a counted tail's page fetch, a stream's read and cleanup, the client's close) runs through
   `spawn_settled`: it returns how it ended (`Settled`) and its owner raises the failure. The batch
