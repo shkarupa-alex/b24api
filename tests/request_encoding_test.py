@@ -12,6 +12,7 @@ from b24api import (
     IdentityCoercion,
     IdentitySpec,
     KeysetTraversal,
+    RangeKeysetExecution,
     ReplaySafety,
     Request,
     ResultSelector,
@@ -166,7 +167,7 @@ async def test_counted_traversal_refuses_an_empty_container_before_its_direct_he
 
 
 @pytest.mark.asyncio
-async def test_fast_keyset_refuses_an_empty_container_before_any_request() -> None:
+async def test_explicit_fast_keyset_refuses_an_empty_container_before_any_request() -> None:
     transport = ResponderTransport(_answer)
     async with client_for(transport) as client:
         with pytest.raises(CapabilityError, match="SequentialKeysetExecution"):
@@ -174,6 +175,7 @@ async def test_fast_keyset_refuses_an_empty_container_before_any_request() -> No
                 _CLEARING,
                 selector=ResultSelector.root(),
                 identity=IdentitySpec(("id",), "ID", "id", IdentityCoercion.EXACT_INTEGER),
+                execution=RangeKeysetExecution(StableIntegerKeysetContract()),
             )
 
     assert transport.requests == []

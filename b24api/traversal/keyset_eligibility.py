@@ -104,9 +104,10 @@ def reject_unencodable_fast_request(request: Request) -> None:
     A reference template is not sent as it stands, so this applies to the flat request and to each
     bound reference request, never to the template.
     """
-    if request.has_empty_container:
+    obstacle = request.classic_batch_obstacle
+    if obstacle is not None:
         raise CapabilityError(
-            "fast keyset traversal sends classic batch commands, which cannot carry an empty array or object; "
+            f"fast keyset traversal sends classic batch commands, which cannot carry {obstacle}; "
             "use SequentialKeysetExecution"
         )
 

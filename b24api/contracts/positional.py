@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import cast
 
-from b24api.contracts.json import FrozenJson, JsonValue, _freeze_json, thaw_json
+from b24api.contracts.json import FrozenJson, JsonValue, _freeze_json, _string_free_tuple, thaw_json
 
 type SlotPathPart = str | int
 _LAYOUT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,100}$")
@@ -70,7 +70,11 @@ class PositionalLayout:
         if not isinstance(self.layout_id, str) or not _LAYOUT_ID_RE.fullmatch(self.layout_id):
             raise ValueError("layout_id must be a bounded safe identifier")
         object.__setattr__(self, "slots", tuple(self.slots))
-        object.__setattr__(self, "control_paths", frozenset(tuple(path) for path in self.control_paths))
+        object.__setattr__(
+            self,
+            "control_paths",
+            frozenset(_string_free_tuple(path, label="control path") for path in self.control_paths),
+        )
         if not self.slots or any(not isinstance(slot, SlotContract) for slot in self.slots):
             raise ValueError("layout must declare at least one typed slot")
         if len({slot.name for slot in self.slots}) != len(self.slots):
@@ -102,7 +106,7 @@ class Present:
 
     def __init__(self, value: object) -> None:
         """Freeze the argument at the public boundary."""
-        object.__setattr__(self, "_value", _freeze_json(value))
+        object.__setattr__(self, "_value", _freeze_json(value, wire=True))
 
     @property
     def value(self) -> JsonValue:
@@ -186,7 +190,7 @@ class PositionalArguments:
 
     def write_control(self, path: tuple[SlotPathPart, ...], value: object) -> PositionalArguments:
         """Return a new value when its declared parent path already exists."""
-        path = tuple(path)
+        path = _string_free_tuple(path, label="control path")
         if path not in self.layout.control_paths:
             raise PositionalControlError(PositionalControlFault.UNDECLARED_PATH)
         slot_index = cast("int", path[0])
@@ -201,7 +205,7 @@ class PositionalArguments:
             for part in path[1:-1]:
                 parent = _existing_child(parent, part)
             last = path[-1]
-            _set_existing_child(parent, last, thaw_json(_freeze_json(value)))
+            _set_existing_child(parent, last, thaw_json(_freeze_json(value, wire=True)))
             replacement = Present(root)
         revised = list(self.slots)
         revised[slot_index] = replacement

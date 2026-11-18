@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, NoReturn, cast
 
 from b24api.contracts.dispatch import PORTAL_BATCH_CAP
 from b24api.contracts.json import _freeze_json
@@ -112,6 +112,9 @@ class ScriptedExchange:
             for command in commands
         ):
             raise ValueError("batch fixture requires safe BARE commands without positional slots or headers")
+        for command in commands:
+            if command.classic_batch_obstacle is not None:
+                raise ValueError(f"batch fixture command cannot carry {command.classic_batch_obstacle}")
         keys = tuple(f"c{index:012d}" for index in range(len(commands)))
         queries = tuple(
             encode_php_query(cast("Mapping[str | int, object]", command.to_wire_parameters())) for command in commands
@@ -193,9 +196,25 @@ class ScriptedCall:
 
 
 class ScriptedTransport:
-    """Match a finite frozen exchange table by complete canonical Request value."""
+    """Match a finite frozen exchange table by the exact request each call sends.
 
-    capabilities = TransportCapabilities(positional_json=True, json_array_body=True, routes=frozenset(RouteKind))
+    A call matches an exchange whose request is equal to it (method, route, replay safety, body encoding,
+    scoped headers, embedded-error contract and parameters). ``Request`` equality reads JSON objects as
+    unordered, as the client builds them (a cursor it sets is added where the update puts it), so a test
+    that depends on key order, such as the sort priority of ``order``, asserts it on ``calls``, which keep
+    each request's parameters in the order they were sent. Form-encoded bodies and scoped headers are
+    supported as an HTTP transport supports them. A call no exchange matches is recorded in ``unexpected``
+    and fails its send; the client reports that as a transport failure of the call, and
+    ``assert_exhausted()`` names it ahead of unused exchanges.
+    """
+
+    capabilities = TransportCapabilities(
+        encodings=frozenset(BodyEncoding),
+        scoped_headers=True,
+        positional_json=True,
+        json_array_body=True,
+        routes=frozenset(RouteKind),
+    )
 
     def __init__(self, exchanges: tuple[ScriptedExchange, ...], *, host: str = "fixture.invalid") -> None:
         """Copy fixture entries without reading credentials or opening a socket."""
@@ -207,6 +226,7 @@ class ScriptedTransport:
         self._remaining = list(exchanges)
         self._calls: list[Request] = []
         self._wire_calls: list[ScriptedCall] = []
+        self._unexpected: list[ScriptedCall] = []
 
     @property
     def host(self) -> str:
@@ -224,6 +244,11 @@ class ScriptedTransport:
         return tuple(self._wire_calls)
 
     @property
+    def unexpected(self) -> tuple[ScriptedCall, ...]:
+        """Return every call no remaining exchange matched, in send order."""
+        return tuple(self._unexpected)
+
+    @property
     def remaining(self) -> int:
         """Return the count of unused frozen exchanges."""
         return len(self._remaining)
@@ -233,12 +258,13 @@ class ScriptedTransport:
         if attempt_timeout <= 0 or max_response_bytes < 1:
             raise ValueError("transport budgets must be positive")
         self._calls.append(request)
-        self._wire_calls.append(ScriptedCall(request, None, request.replay_safety))
+        call = ScriptedCall(request, None, request.replay_safety)
+        self._wire_calls.append(call)
         for index, exchange in enumerate(self._remaining):
             # A v3 batch exchange never matches a classic call, even one equal to its envelope descriptor.
             if exchange.v3_wire is None and exchange.request == request:
                 return self._take(index, max_response_bytes)
-        raise AssertionError(f"unexpected scripted request: {request.method}")
+        return self._refuse(call, request.method)
 
     async def send_wire(
         self,
@@ -271,12 +297,17 @@ class ScriptedTransport:
             ScriptedV3Command(command.method, cast("Mapping[str, JsonValue]", command.query))
             for command in body.commands
         )
-        self._wire_calls.append(ScriptedCall(None, wire, request.replay_safety))
+        call = ScriptedCall(None, wire, request.replay_safety)
+        self._wire_calls.append(call)
         for index, exchange in enumerate(self._remaining):
             # Only wire-visible data matches: the ordered commands and the envelope's replay safety.
             if exchange.v3_wire == wire and exchange.request.replay_safety is request.replay_safety:
                 return self._take(index, max_response_bytes)
-        raise AssertionError(f"unexpected scripted request: {request.method}")
+        return self._refuse(call, request.method)
+
+    def _refuse(self, call: ScriptedCall, method: str) -> NoReturn:
+        self._unexpected.append(call)
+        raise AssertionError(f"unexpected scripted request: {method}")
 
     def _take(self, index: int, max_response_bytes: int) -> WireResponse:
         response = self._remaining.pop(index).response
@@ -285,6 +316,16 @@ class ScriptedTransport:
         return response
 
     def assert_exhausted(self) -> None:
-        """Fail when a recipe did not issue every expected fixture request."""
+        """Fail when a call matched no exchange, or when a recipe did not issue every expected fixture request."""
+        problems = []
+        if self._unexpected:
+            methods = ", ".join(_call_method(call) for call in self._unexpected)
+            problems.append(f"{len(self._unexpected)} unexpected scripted request(s): {methods}")
         if self._remaining:
-            raise AssertionError(f"{len(self._remaining)} scripted exchange(s) were not requested")
+            problems.append(f"{len(self._remaining)} scripted exchange(s) were not requested")
+        if problems:
+            raise AssertionError("; ".join(problems))
+
+
+def _call_method(call: ScriptedCall) -> str:
+    return V3_BATCH_METHOD if call.request is None else call.request.method

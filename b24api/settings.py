@@ -1,4 +1,8 @@
-"""Environment-backed credential and transport settings."""
+"""Environment-backed credential and transport settings.
+
+The library reads the process environment only; no file is read implicitly. The ``b24api`` command line
+reads a ``.env`` file in its working directory as well (``b24api.cli``).
+"""
 
 import contextlib
 from collections.abc import Generator
@@ -80,9 +84,9 @@ class Settings(BaseSettings):
     http_timeout: float = Field(default=30.0, gt=0, allow_inf_nan=False)
     max_concurrent_requests: int = Field(default=10, ge=1)
 
+    # No ``env_file``: a library never reads credentials or limits from whatever directory it runs in.
     model_config = SettingsConfigDict(
         env_prefix="bitrix24_api_",
-        env_file=".env",
         extra="ignore",
         hide_input_in_errors=True,
     )
@@ -233,12 +237,11 @@ class Settings(BaseSettings):
             yield name, _REDACTED if name == "webhook_url" else value
 
     def __getstate__(self) -> dict[str, Any]:
-        """Return pickle state without credential-bearing settings."""
-        state = super().__getstate__()
-        values = dict(state["__dict__"])
-        values["webhook_url"] = _REDACTED
-        state["__dict__"] = values
-        return state
+        """Refuse pickling: the webhook is a credential, and a copy without it would be a broken ``Settings``.
+
+        Build ``Settings`` in each process (from its environment, or from the URL passed to it) instead.
+        """
+        raise TypeError("Settings holds a webhook credential and cannot be pickled; build it in each process")
 
 
 def api_settings(**kwargs: Any) -> Settings:  # noqa: ANN401

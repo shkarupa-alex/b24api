@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import asyncio
+import copy
 import dataclasses
 import json
 import math
@@ -50,12 +51,39 @@ def test_settings_redacts_webhook_from_all_public_representations() -> None:
         repr(list(settings)),
         repr(settings.model_dump()),
         settings.model_dump_json(),
-        repr(settings.__getstate__()),
-        repr(pickle.dumps(settings)),
     )
 
     assert all(credential not in surface for surface in surfaces)
     assert credential in str(settings.webhook_url)
+
+
+def test_settings_refuse_pickling_instead_of_yielding_a_copy_without_the_webhook() -> None:
+    credential = "n1x2y3z4q5w6e7r8"
+    settings = Settings(webhook_url=f"https://example.invalid/rest/1/{credential}/")
+
+    with pytest.raises(TypeError, match="cannot be pickled") as refused:
+        pickle.dumps(settings)
+
+    assert credential not in str(refused.value)
+    # A copy in this process keeps the credential, so it is still a working Settings.
+    assert copy.deepcopy(settings).webhook_url == settings.webhook_url
+
+
+def test_the_library_never_reads_a_dotenv_file_from_the_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credential = "n1x2y3z4q5w6e7r8"
+    webhook = f"https://dotenv.invalid/rest/1/{credential}/"
+    (tmp_path / ".env").write_text(
+        f"BITRIX24_API_WEBHOOK_URL={webhook}\nBITRIX24_API_HTTP_TIMEOUT=7\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("BITRIX24_API_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("BITRIX24_API_HTTP_TIMEOUT", raising=False)
+
+    with pytest.raises(ValidationError, match="webhook_url"):
+        Settings()
+    assert Settings(webhook_url=_WEBHOOK).http_timeout == 30.0  # noqa: PLR2004 - the documented default
 
 
 @pytest.mark.parametrize("entrypoint", ["constructor", "api", "mapping", "json", "strings"])

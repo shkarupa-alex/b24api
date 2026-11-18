@@ -26,6 +26,11 @@ for all of it. Any other form is refused, one with a user name or password, a qu
 percent-encoded path, or a surrounding DEL (U+007F) or non-ASCII space (a no-break space, for example)
 included, since the token is its only credential and is registered for redaction as it is sent.
 
+`Settings` reads only the process environment. It never reads a `.env` file, so a library call
+cannot pick up a credential from whatever directory the process runs in; the `b24api` CLI is the only
+reader of `.env` (see [CLI](#cli)). `Settings` cannot be pickled, because it holds the webhook
+credential: build it in each process from the environment.
+
 `Settings` reads two limits as well. `BITRIX24_API_HTTP_TIMEOUT` is each request's retry window in
 seconds (30 by default, finite). `BITRIX24_API_MAX_CONCURRENT_REQUESTS` is how many requests one client
 keeps in flight at once, all its calls, streams and retries together (10 by default). An operation's own
@@ -375,6 +380,24 @@ as `CommandOutcomeUnknown` without a resend. The report counts `ambiguous_physic
 `batch_isolation_requests`. Fail-fast `batch()` finishes resolving the envelope it already sent and
 then raises without reading further input.
 
+A classic (non-REST 3.0) batch sends each command as a PHP query string, which cannot carry every
+JSON value with the meaning a direct call gives it. A command is sent in a classic batch only when its
+query string means what its JSON would mean; otherwise it fails alone with `CapabilityError` before any
+request (as a `CommandFailure` in `batch_outcomes()` and `fan_out_outcomes()`), and the message says
+which value is the problem. These values are refused:
+
+- `None` (a direct call sends `null`, which a filter or update reads as "empty"; the query string drops
+  the key, which changes what the command selects or writes);
+- an empty array or object, which the query string drops the same way;
+- an empty key, a key holding `[`, `]` or NUL, and a top-level key holding `.` or a space, which PHP
+  renames;
+- text holding a reference pattern (`$result[`, `$result_error[`, `$result_total[`, `$result_next[` or
+  `$result_time[`, in any letter case), which the batch handler replaces inside any value.
+
+Send such a command directly (`client.call()`, or `fan_out()` with `DirectDispatch`), or by REST 3.0. A
+`bool` is sent as `1` or `0`, as PHP's `http_build_query` writes it. `Request.classic_batch_obstacle`
+names what would keep a request out of classic batch, or is `None`.
+
 For independently dispatchable commands, use `fan_out()` or `fan_out_outcomes()` with
 `DirectDispatch` or `BatchDispatch`. Delivery order is explicitly `READY` or `INPUT`.
 
@@ -582,7 +605,10 @@ operation silently. Reference traversal can opt into the same selection for each
 terminal report carries a compact `keyset_selection` (`requested_kind`, `selected_kind`, `reason`)
 for every keyset traversal. A `page_stop` callback needs the ordered page stream, so auto reports
 `AUTO`, `SEQUENTIAL`, `PAGE_STOP`; an explicit `SequentialKeysetExecution()` reports
-`EXPLICIT_SEQUENTIAL`. The detailed `keyset_execution` report is present only when the fast path ran.
+`EXPLICIT_SEQUENTIAL`. Fast execution sends classic batch commands, so for a request that classic batch
+cannot carry (see [Logical batch and correlation](#logical-batch-and-correlation)) auto reports `AUTO`,
+`SEQUENTIAL`, `BATCH_UNREPRESENTABLE` and sends its pages directly, while an explicit fast execution
+raises `CapabilityError` before any request. The detailed `keyset_execution` report is present only when the fast path ran.
 
 Use `await client.verify_keyset_capability(...)` as a development/CI/staging guard on a stable
 representative fixture. It performs five strict-bound checks and returns only a `VERIFIED` report;
@@ -1075,7 +1101,9 @@ Strict keyset and cursor traversal retain only monotonic progression state when 
 ## CLI
 
 The wheel installs `b24api`. Stdout contains only result data; list rows are JSONL. Reports and safe
-errors go to stderr. Credentials come only from `Settings` and cannot be passed as CLI arguments.
+errors go to stderr. Credentials come only from `Settings` and cannot be passed as CLI arguments. The
+CLI reads the environment and then a `.env` file in its working directory, if one exists; the
+environment wins.
 
 <!-- tested-console: tests/cli_test.py::test_call_routes_replay_safety_and_keeps_success_data_on_stdout -->
 ```console
@@ -1087,15 +1115,32 @@ b24api list example.item.list --route bare --strategy counted --contract @counte
 
 The `--raw` CLI option selects the response envelope; it does not alter the Python API. Advanced
 list strategies use closed JSON `version: 1` contracts. The entire contract is validated before
-client construction. Run `b24api --help` and `b24api list --help` for the compact option surface.
+client construction. `--params -` and `--contract -` read stdin (not both in one run); input that is
+not UTF-8 or not valid JSON is a usage error. Output to a terminal or pipe that cannot write Unicode
+gets JSON with `\u` escapes instead of failing. Run `b24api --help` and `b24api list --help` for the compact option surface.
 
 Exit codes are `0` success, `2` usage/contract error, `3` unavailable configuration, `4`
 remote/protocol/correctness/incomplete failure, `5` broken output consumer, `6` keyset bounds
-unsupported and `7` keyset verification inconclusive (both from `verify-keyset`), and `130`
-cancellation.
+unsupported and `7` keyset verification inconclusive (both from `verify-keyset`), `130`
+cancellation (Ctrl-C), and `128 + signal` for `SIGTERM` (`143`) or `SIGHUP` (`129`). A signal ends a
+`list` as Ctrl-C does: the stream closes and its report is written to stderr.
 `5` takes priority whenever a write to stdout or stderr finds its reader gone, including a run whose
-data was delivered but whose diagnostic hit a closed stderr. Any other failed write, such as to a full
+data was delivered but whose diagnostic hit a closed stderr, and a run started with stdout or stderr
+already closed. Any other failed write, such as to a full
 disk, exits `4`.
+
+## Testing without a portal
+
+`b24api.testing` holds two offline tools. `ScriptedTransport` plays a fixed table of exchanges
+(`ScriptedExchange.json()`, `.batch()` for a classic batch, `.v3_batch()` for a REST 3.0 envelope) to a
+client built on it, with no socket and no credential. A call matches an exchange only when it sends what
+the exchange names: the same method, route, replay safety, body encoding (JSON or form), scoped headers
+and parameters. Parameters compare as JSON values, so the order of mapping keys does not matter for a
+match; `calls` keeps each request with its keys in the order they were sent, for a test that checks the
+sort priority of `order`. A call nothing matches fails its send, as a transport failure, and is kept in
+`unexpected`; `assert_exhausted()` reports such calls and exchanges never used. `.batch()` refuses a
+command a classic batch would refuse (see [Logical batch and correlation](#logical-batch-and-correlation)).
+`run_transport_conformance()` checks your own transport against the cases the client relies on.
 
 ## Correctness boundaries
 

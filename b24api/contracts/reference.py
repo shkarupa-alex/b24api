@@ -32,7 +32,7 @@ class ParameterUpdate:
         if not isinstance(path, ParameterPath):
             raise TypeError("path must be a ParameterPath")
         object.__setattr__(self, "path", path)
-        object.__setattr__(self, "_value", _freeze_json(value))
+        object.__setattr__(self, "_value", _freeze_json(value, wire=True))
 
     @property
     def value(self) -> JsonValue:
@@ -47,7 +47,8 @@ class Binding[C]:
     summary: str
     updates: tuple[ParameterUpdate, ...]
     correlation: C = field(repr=False)
-    start_cursor: JsonValue | None = field(default=None, repr=False)
+    # Stored frozen (a ``FrozenMapping``, a tuple or a scalar), so a binding is immutable and hashable.
+    start_cursor: FrozenJson | JsonValue = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Bound and redact diagnostics without touching correlation."""
@@ -70,7 +71,7 @@ class Binding[C]:
         object.__setattr__(self, "summary", safe)
         object.__setattr__(self, "updates", updates)
         if self.start_cursor is not None:
-            object.__setattr__(self, "start_cursor", thaw_json(_freeze_json(self.start_cursor)))
+            object.__setattr__(self, "start_cursor", _freeze_json(self.start_cursor, wire=True))
 
 
 @dataclass(frozen=True, slots=True)

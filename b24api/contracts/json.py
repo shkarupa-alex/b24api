@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 import math
-from collections.abc import Iterator, Mapping, Sequence
-from typing import cast
+import sys
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from typing import Any
 
 type JsonScalar = None | bool | int | float | str
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 type FrozenJson = JsonScalar | tuple[FrozenJson, ...] | FrozenMapping
 MAX_JSON_DEPTH = 256
+_PLAIN_SCALARS = frozenset({type(None), str, int, bool})
 
 
 class DecodedJsonObject(dict[str, JsonValue]):
@@ -64,9 +66,14 @@ class FrozenMapping(Mapping[str, FrozenJson]):
 
     __slots__ = ("_key", "_repeated", "_values")
 
-    def __init__(self, values: Mapping[str, FrozenJson], *, repeated: tuple[str, ...] = ()) -> None:
-        """Copy values into canonical immutable storage, with the member names a decoded object repeated."""
-        self._values = dict(values)
+    def __init__(self, values: Mapping[str, object], *, repeated: tuple[str, ...] = ()) -> None:
+        """Freeze a JSON object deeply, with the member names a decoded object repeated (``repeated``)."""
+        if not isinstance(values, Mapping):
+            raise TypeError("FrozenMapping requires a mapping")
+        # Members ``_freeze_json`` has just frozen are kept as they are rather than walked again.
+        self._values: dict[str, FrozenJson] = (
+            values if type(values) is _FrozenMembers else _frozen_members(values, wire=False, active=set(), depth=0)
+        )
         self._key: object | None = None
         self._repeated = repeated
 
@@ -146,46 +153,82 @@ def _plain_scalar(value: JsonScalar) -> JsonScalar:
     return value if type(value) is float else float.__float__(value)
 
 
+def _wire_scalar(value: JsonScalar) -> JsonScalar:
+    """Return a scalar that JSON and bracket encoding can both write, or raise ``ValueError``.
+
+    A string must encode as UTF-8 (a lone surrogate, as ``os.fsdecode`` returns for a non-UTF-8 file name,
+    does not), and an integer must have a decimal form within the interpreter's digit limit.
+    """
+    if isinstance(value, str):
+        if not value.isascii():
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError:
+                raise ValueError("JSON strings must be valid Unicode without lone surrogates") from None
+    elif isinstance(value, int) and not isinstance(value, bool):
+        limit = sys.get_int_max_str_digits()
+        # A decimal digit takes more than three bits, so only a longer integer can exceed the limit.
+        if limit and value.bit_length() > 3 * limit:
+            try:
+                int.__repr__(value)
+            except ValueError:
+                raise ValueError("JSON integers must have at most the interpreter's decimal digit limit") from None
+    return value
+
+
 def _freeze_json(
     value: object,
     *,
+    wire: bool = False,
     active: set[int] | None = None,
     depth: int = 0,
 ) -> FrozenJson:
+    """Freeze a JSON value; ``wire`` also refuses a scalar no request encoding can write."""
     if depth > MAX_JSON_DEPTH:
         raise ValueError("JSON nesting exceeds the supported depth")
     active = active if active is not None else set()
-    kind = type(value)
-    if value is None or kind is str or kind is int or kind is bool:
-        return cast("JsonScalar", value)
-    if isinstance(value, bool | int | str | float):
-        return _plain_scalar(value)
+    if value is None or isinstance(value, bool | int | str | float):
+        plain = value if type(value) in _PLAIN_SCALARS else _plain_scalar(value)
+        return _wire_scalar(plain) if wire else plain
     if isinstance(value, Mapping):
-        identity = id(value)
-        if identity in active:
-            raise ValueError("cyclic JSON mappings are not supported")
-        active.add(identity)
-        try:
-            frozen: dict[str, FrozenJson] = {}
-            for key, item in value.items():
-                if not isinstance(key, str):
-                    raise TypeError("JSON object keys must be strings")
-                frozen[key if type(key) is str else str.__str__(key)] = _freeze_json(
-                    item, active=active, depth=depth + 1
-                )
-            return FrozenMapping(frozen, repeated=repeated_names(value))
-        finally:
-            active.remove(identity)
+        members = _frozen_members(value, wire=wire, active=active, depth=depth)
+        return FrozenMapping(members, repeated=repeated_names(value))
     if isinstance(value, Sequence) and not isinstance(value, bytes | bytearray | str):
         identity = id(value)
         if identity in active:
             raise ValueError("cyclic JSON arrays are not supported")
         active.add(identity)
         try:
-            return tuple(_freeze_json(item, active=active, depth=depth + 1) for item in value)
+            return tuple(_freeze_json(item, wire=wire, active=active, depth=depth + 1) for item in value)
         finally:
             active.remove(identity)
     raise TypeError(f"unsupported JSON value type: {type(value).__name__}")
+
+
+class _FrozenMembers(dict[str, FrozenJson]):
+    """The members of one JSON object, every key a plain string and every value already frozen."""
+
+    __slots__ = ()
+
+
+def _frozen_members(value: Mapping[Any, object], *, wire: bool, active: set[int], depth: int) -> _FrozenMembers:
+    """Freeze the members of one JSON object, its keys as plain strings."""
+    identity = id(value)
+    if identity in active:
+        raise ValueError("cyclic JSON mappings are not supported")
+    active.add(identity)
+    try:
+        frozen = _FrozenMembers()
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("JSON object keys must be strings")
+            plain_key = key if type(key) is str else str.__str__(key)
+            if wire:
+                _wire_scalar(plain_key)
+            frozen[plain_key] = _freeze_json(item, wire=wire, active=active, depth=depth + 1)
+        return frozen
+    finally:
+        active.remove(identity)
 
 
 def _has_empty_container(value: FrozenJson) -> bool:
@@ -209,6 +252,13 @@ def thaw_json(value: FrozenJson) -> JsonValue:
     if isinstance(value, tuple):
         return [thaw_json(item) for item in value]
     return value
+
+
+def _string_free_tuple[T](values: Iterable[T], *, label: str) -> tuple[T, ...]:
+    """Return ``values`` as a tuple, refusing a bare string, which would otherwise split into characters."""
+    if isinstance(values, str | bytes | bytearray):
+        raise TypeError(f"{label} must be a sequence (a tuple or list), not a single string")
+    return tuple(values)
 
 
 def _is_plain_int(value: object) -> bool:

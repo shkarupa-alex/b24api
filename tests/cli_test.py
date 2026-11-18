@@ -32,6 +32,7 @@ from b24api import (
     ResultSelector,
     RouteKind,
     TerminalState,
+    TotalTermination,
     TraversalAssurance,
     cli,
 )
@@ -200,7 +201,7 @@ class _IncompleteStream(_Stream):
 
 
 def _run(monkeypatch: pytest.MonkeyPatch, client: _Client, args: list[str], *, stdin: str = "") -> tuple[int, str, str]:
-    monkeypatch.setattr(cli, "Bitrix24", lambda: client)
+    monkeypatch.setattr(cli, "_open_client", lambda: client)
     stdout = io.StringIO()
     stderr = io.StringIO()
     if args[0] in {"call", "list", "verify-keyset"} and "--route" not in args:
@@ -515,7 +516,8 @@ def test_sequential_default_is_mechanics_only_and_reports_once(monkeypatch: pyte
                 "offset": {"parameter_path": ["start"]},
             },
             "iter_list_counted",
-            OffsetSpec(),
+            # A counted traversal requires the exact total; the CLI asks for it, as iter_list_counted's default does.
+            OffsetSpec(total_termination=TotalTermination.EXACT_QUALIFIED),
         ),
         (
             "keyset",
@@ -634,7 +636,7 @@ def test_invalid_contract_is_rejected_before_client_construction(
         constructed = True
         return _Client()
 
-    monkeypatch.setattr(cli, "Bitrix24", unused_client)
+    monkeypatch.setattr(cli, "_open_client", unused_client)
     stderr = io.StringIO()
     code = cli.main(
         ["list", "test.list", "--route", "bare", "--contract", _contract(tmp_path, {"version": 1, "unknown": True})],
@@ -707,7 +709,7 @@ def test_configuration_failure_maps_to_unavailable(monkeypatch: pytest.MonkeyPat
     def fail() -> NoReturn:
         raise configuration_error("contains a credential")
 
-    monkeypatch.setattr(cli, "Bitrix24", fail)
+    monkeypatch.setattr(cli, "_open_client", fail)
     stderr = io.StringIO()
     code = cli.main(["call", "test.get", "--route", "bare"], stdin=io.StringIO(), stdout=io.StringIO(), stderr=stderr)
     assert code == _UNAVAILABLE
@@ -716,7 +718,7 @@ def test_configuration_failure_maps_to_unavailable(monkeypatch: pytest.MonkeyPat
 
 def test_broken_pipe_closes_stream_and_uses_exit_five(monkeypatch: pytest.MonkeyPatch) -> None:
     client = _Client(rows=[{"ID": 1}])
-    monkeypatch.setattr(cli, "Bitrix24", lambda: client)
+    monkeypatch.setattr(cli, "_open_client", lambda: client)
     stderr = io.StringIO()
 
     code = cli.main(
@@ -749,7 +751,7 @@ def respond(_request):
         sys.stdin.readline()
     return pages.pop(0)
 
-cli.Bitrix24 = lambda: client_for(ResponderTransport(respond))
+cli._open_client = lambda: client_for(ResponderTransport(respond))
 sys.exit(cli.main())
 """
 _LIST = ("list", "test.list", "--route", "bare")
@@ -837,7 +839,7 @@ class _NoDescriptorOutput:
 
 
 def test_closed_injected_output_is_left_to_its_owner(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(cli, "Bitrix24", _Client)
+    monkeypatch.setattr(cli, "_open_client", _Client)
     read_end, write_end = os.pipe()
     os.close(read_end)
     try:
@@ -889,7 +891,7 @@ def test_failing_stderr_sink_maps_to_the_generic_failure(
     client: _Client,
     args: list[str],
 ) -> None:
-    monkeypatch.setattr(cli, "Bitrix24", lambda: client)
+    monkeypatch.setattr(cli, "_open_client", lambda: client)
     code = cli.main([*args, "--route", "bare"], stdin=io.StringIO(), stdout=io.StringIO(), stderr=_FullOutput())
     assert code == _CORRECTNESS
 
@@ -913,7 +915,7 @@ def test_parser_flushes_help_so_a_failing_sink_is_reported(monkeypatch: pytest.M
 
 def test_closed_stdout_outranks_a_failing_stderr(monkeypatch: pytest.MonkeyPatch) -> None:
     client = _Client(rows=[{"ID": 1}])
-    monkeypatch.setattr(cli, "Bitrix24", lambda: client)
+    monkeypatch.setattr(cli, "_open_client", lambda: client)
     code = cli.main(
         ["list", "test.list", "--route", "bare"],
         stdin=io.StringIO(),
@@ -925,9 +927,9 @@ def test_closed_stdout_outranks_a_failing_stderr(monkeypatch: pytest.MonkeyPatch
 
 def test_final_flush_folds_an_undeliverable_stream_into_the_code(monkeypatch: pytest.MonkeyPatch) -> None:
     gone = cast("TextIO", _NoDescriptorOutput())
-    monkeypatch.setattr(cli, "Bitrix24", _InterruptedClient)
+    monkeypatch.setattr(cli, "_open_client", _InterruptedClient)
     assert cli.main(["call", "test.get", "--route", "bare"], stdin=io.StringIO(), stdout=gone) == _OUTPUT_CLOSED
-    monkeypatch.setattr(cli, "Bitrix24", _Client)
+    monkeypatch.setattr(cli, "_open_client", _Client)
     args = ["call", "test.get", "--route", "bare"]
     assert cli.main(args, stdin=io.StringIO(), stdout=io.StringIO(), stderr=_FullOutput()) == _CORRECTNESS
 
@@ -976,7 +978,7 @@ def test_an_injected_stream_its_owner_already_closed_fails_without_raising(
     tmp_path: Path,
     closed_stream: str,
 ) -> None:
-    monkeypatch.setattr(cli, "Bitrix24", _Client)
+    monkeypatch.setattr(cli, "_open_client", _Client)
     with (tmp_path / "closed.txt").open("w", encoding="utf-8") as closed:
         pass
     healthy = io.StringIO()

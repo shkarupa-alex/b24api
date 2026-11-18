@@ -66,9 +66,6 @@ if TYPE_CHECKING:
 
 _MISSING = object()
 _UNSUPPORTED_COMMAND = "physical batch supports BARE JSON requests without scoped headers; use direct dispatch"
-_UNSUPPORTED_EMPTY_CONTAINER = (
-    "classic batch cannot carry an empty array or object, which PHP bracket encoding drops; use direct dispatch"
-)
 _UNSUPPORTED_V3_TRANSPORT = "transport does not support native REST v3 batch envelopes; use direct dispatch"
 
 
@@ -593,7 +590,7 @@ class BatchExecutor:
 
     def _batch_route(self, request: Request) -> RouteKind | None:
         """Return the envelope dialect a request can travel in, or ``None`` when no envelope represents it."""
-        if _classic_representable(request) and not request.has_empty_container:
+        if _classic_representable(request) and request.classic_batch_obstacle is None:
             return RouteKind.BARE
         if _v3_representable(request) and self.executor.supports_v3_batch:
             return RouteKind.API_V3
@@ -611,10 +608,11 @@ class BatchExecutor:
                 eligible.append(command)
                 continue
             # A command is refused before any reservation when no envelope the transport sends represents it.
+            obstacle = command.request.classic_batch_obstacle
             message = (
                 _UNSUPPORTED_V3_TRANSPORT
                 if _v3_representable(command.request)
-                else _UNSUPPORTED_EMPTY_CONTAINER
+                else f"classic batch cannot carry {obstacle}; use direct dispatch"
                 if _classic_representable(command.request)
                 else _UNSUPPORTED_COMMAND
             )

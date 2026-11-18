@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
-from b24api.contracts.json import _is_plain_int
+from b24api.contracts.json import _is_plain_int, _string_free_tuple
 from b24api.contracts.v3_codes import REFUSAL_V3_ERROR_CODES, TRANSIENT_V3_ERROR_CODES
 
 if TYPE_CHECKING:
@@ -17,6 +17,12 @@ if TYPE_CHECKING:
 HTTP_STATUS_MINIMUM = 100
 HTTP_STATUS_MAXIMUM = 599
 PAGE_TRACE_LIMIT_MAXIMUM = 1024
+
+
+def _api_code_set(codes: object, *, label: str) -> frozenset[str]:
+    """Normalize API error codes for case-free comparison; a bare string is one mistaken code set."""
+    listed = _string_free_tuple(cast("Iterable[object]", codes), label=label)
+    return frozenset(str(code).strip().casefold() for code in listed)
 
 
 class ReplayDisposition(StrEnum):
@@ -136,11 +142,7 @@ class AmbiguityPolicy:
         """Validate and freeze the status and code sets."""
         object.__setattr__(self, "ambiguous_unstructured_statuses", frozenset(self.ambiguous_unstructured_statuses))
         object.__setattr__(self, "refusal_http_statuses", frozenset(self.refusal_http_statuses))
-        object.__setattr__(
-            self,
-            "refusal_api_codes",
-            frozenset(str(code).strip().casefold() for code in self.refusal_api_codes),
-        )
+        object.__setattr__(self, "refusal_api_codes", _api_code_set(self.refusal_api_codes, label="refusal_api_codes"))
         if any(
             not _is_plain_int(status) or status < HTTP_STATUS_MINIMUM or status > HTTP_STATUS_MAXIMUM
             for status in (*self.ambiguous_unstructured_statuses, *self.refusal_http_statuses)
@@ -214,9 +216,7 @@ class RetryPolicy:
             raise TypeError("isolate_safe_batch_abort must be a bool")
         object.__setattr__(self, "transient_http_statuses", frozenset(self.transient_http_statuses))
         object.__setattr__(
-            self,
-            "transient_api_codes",
-            frozenset(str(code).strip().casefold() for code in self.transient_api_codes),
+            self, "transient_api_codes", _api_code_set(self.transient_api_codes, label="transient_api_codes")
         )
         if any(
             not _is_plain_int(status) or status < HTTP_STATUS_MINIMUM or status > HTTP_STATUS_MAXIMUM

@@ -212,7 +212,7 @@ def test_request_field_names_render_as_distinct_aliases_in_every_channel(monkeyp
     assert not any(value is not None and "DiagnosticContext" in type(value).__name__ for value in vars(error).values())
 
     cli_transport = ScriptedTransport((ScriptedExchange(request, _wire(400, body)),))
-    monkeypatch.setattr(cli, "Bitrix24", lambda: Bitrix24(SETTINGS, transport=cli_transport))
+    monkeypatch.setattr(cli, "_open_client", lambda: Bitrix24(SETTINGS, transport=cli_transport))
     stderr = io.StringIO()
     code = cli.main(
         [
