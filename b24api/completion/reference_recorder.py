@@ -193,10 +193,15 @@ class ReferenceBindingRecorder:
         self._emit(PageScheduled(**self._fields()))
 
     def settled(self, outcome: CommandSettlement) -> None:
-        """Record the physical command outcome for the scheduled page."""
+        """Record the physical command outcome for the scheduled page; an unknown one marks the binding unknown.
+
+        The mark only ever turns on, as ``mark_unknown`` and ``abandon_reserved`` turn it: a later page that failed
+        conclusively never clears what an earlier unknown one left open.
+        """
         self._emit(PageCommandOutcome(**self._fields(), outcome=outcome))
+        if outcome is CommandSettlement.UNKNOWN:
+            self.unknown = True
         if outcome is not CommandSettlement.SUCCESS:
-            self.unknown = outcome is CommandSettlement.UNKNOWN
             self._current = None
 
     def validated(self, row_count: int) -> None:

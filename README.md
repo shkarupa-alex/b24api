@@ -158,12 +158,18 @@ may already have reached Bitrix:
 | `UNKNOWN` | The caller has not established whether replay is safe. This is the default. | Same conservative behavior as `UNSAFE`, while diagnostics preserve that safety was unknown rather than known unsafe. |
 
 A failure that proves the request did not run is retried whatever its safety: a transport failure
-before dispatch, or a refusal listed in `AmbiguityPolicy`, which by default is an unstructured 423, 425
-or 429 (`refusal_http_statuses`) or a `QUERY_LIMIT_EXCEEDED` / `OPERATION_TIME_LIMIT` /
+before dispatch, or a refusal listed in `AmbiguityPolicy`, which by default is a 423, 425 or 429 whose
+body is a gateway's page (`refusal_http_statuses`: not JSON, or JSON without a top-level `error` and
+without a repeated top-level member) or a `QUERY_LIMIT_EXCEEDED` / `OPERATION_TIME_LIMIT` /
 REST 3.0 `BITRIX_REST_V3_EXCEPTION_RATELIMITEXCEPTION` refusal (`refusal_api_codes`). A code or
-status added only to `RetryPolicy` is retried for `SAFE` work alone. A request that HTTPX could not
-build was never sent: it fails at once with a `TransportError` of phase `not_dispatched`, never as
-ambiguous. An exception from an injected client's event hook, auth flow, transport or response
+status added only to `RetryPolicy` is retried for `SAFE` work alone. An answer that proves nothing
+leaves `UNSAFE` and `UNKNOWN` work ambiguous, and `call()` raises `AmbiguousExecutionError` with that
+answer's failure as its cause: an ambiguous status (408 or any 5xx by default, `ambiguous_unstructured_statuses`),
+structured or not, unless its code is a listed refusal; a 2xx body that cannot be decoded, has no `result`, or
+contradicts itself (both a `result` and an `error`, or a repeated member name where the answer is decided).
+Any other structured error or status outside 2xx is the request's answer and is raised as it is. A request
+that HTTPX could not build was never sent: it fails at once with a `TransportError` of phase `not_dispatched`,
+never as ambiguous, and is not counted as a physical request. An exception from an injected client's event hook, auth flow, transport or response
 stream may follow dispatch. An HTTPX request error (`httpx.RequestError`, such as a connection or read
 error) follows the same phase rule as one from the network. A builtin `TimeoutError` counts as the
 attempt's deadline passing after possible dispatch: `SAFE` work is retried, `UNSAFE` and `UNKNOWN`
@@ -271,14 +277,17 @@ after the server's `Retry-After`:
 
 | Code | Status | Retried |
 |---|---|---|
-| `BITRIX_REST_V3_EXCEPTION_RATELIMITEXCEPTION` | 429 | Any direct request: the limiter refuses before the method runs. In a REST 3.0 batch envelope only `SAFE` commands, as for any structured envelope error. |
+| `BITRIX_REST_V3_EXCEPTION_RATELIMITEXCEPTION` | 429 | Any direct request: the limiter refuses before the method runs. In a REST 3.0 batch envelope only `SAFE` commands: the limiter counts each command, so its refusal of the envelope may follow commands that ran. |
 | `BITRIX_REST_V3_EXCEPTION_LIMITER_QUERYTIMELIMITEXCEPTION` | 503 | `SAFE` requests only: the method may have run. |
 
-Every other REST 3.0 code is a deterministic refusal and is raised at once, including a 429 or 503
-that a module declares for a longer-lived state (`LANDING_AI_SITE_MODERATION_BLOCK_LIMIT`,
-`LANDING_AI_MODULE_UNAVAILABLE`). List more codes in `RetryPolicy.transient_api_codes` (and in
-`AmbiguityPolicy.refusal_api_codes` when the code proves the method did not run). The request
-faults `BITRIX_REST_V3_EXCEPTION_VALIDATION_REQUESTVALIDATIONEXCEPTION` and
+Every other REST 3.0 code is not retried. Outside an ambiguous status (408 or any 5xx by default,
+`ambiguous_unstructured_statuses`) it is the request's answer and is raised at once as `ApiResponseError`,
+a 429 that a module declares for a longer-lived state (`LANDING_AI_SITE_MODERATION_BLOCK_LIMIT`)
+included. At an ambiguous status (`LANDING_AI_MODULE_UNAVAILABLE` with 503) it proves nothing about
+whether the method ran: `SAFE` work raises the `ApiResponseError`, `UNSAFE` and `UNKNOWN` work raise
+`AmbiguousExecutionError` caused by it. List more codes in
+`RetryPolicy.transient_api_codes` (and in `AmbiguityPolicy.refusal_api_codes` when the code proves the
+method did not run). The request faults `BITRIX_REST_V3_EXCEPTION_VALIDATION_REQUESTVALIDATIONEXCEPTION` and
 `BITRIX_REST_V3_EXCEPTION_METHODNOTFOUNDEXCEPTION` in a REST 3.0 error envelope are never retried,
 even when listed.
 
@@ -339,6 +348,8 @@ command between two v3 commands travels in its own envelope between theirs. The 
 advertise JSON-array bodies, as `HttpxTransport` does; otherwise such a command fails with
 `CapabilityError` before any request. Each array element is checked against its own request's
 embedded-error contract, so one failed command neither fails nor resends its successful neighbours.
+An element of a request with no `result_error` contract is its result, whatever it holds: the client
+cannot tell an error element from data without one, so such a command is a `CommandSuccess`.
 
 <!-- tested: tests/v3_batch_test.py::test_a21_wire_four_safe_v3_reads_travel_in_one_envelope_in_input_order -->
 ```python
@@ -354,8 +365,13 @@ async with client.batch_outcomes(v3_commands) as stream:
         handle(outcome)
 ```
 
-REST 3.0 does not roll a batch back. When a whole envelope fails after it may have run, `SAFE`
-commands of a transient failure get one envelope retry within their attempt budget, and commands
+REST 3.0 does not roll a batch back. An envelope refused for its credentials (a 401) is answered whole:
+each command is a `CommandFailure` with that error and is not sent alone, as in a classic batch. Any other
+error on a REST 3.0 envelope, structured, unreadable or contradictory, may come from the command that
+aborted it after earlier ones ran, unless it is a gateway's page (not JSON, or JSON without a top-level `error`
+and without a repeated top-level member) at a listed refusal status, which proves the envelope was refused. A classic
+envelope answered with an ambiguous status (408 or a 5xx) that is not a listed refusal leaves each of its commands unknown, as a REST 3.0 one does. When a whole envelope fails after it may have
+run, `SAFE` commands of a transient failure get one envelope retry within their attempt budget, and commands
 still unresolved are sent individually (`RetryPolicy.isolate_safe_batch_abort`, enabled by default)
 under the same attempt lineage. That isolation waits and is admitted as a retry is (backoff, throttle
 hint, attempts, retry window, deadline), then sends one command at a time, so it stays within the

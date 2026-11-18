@@ -352,16 +352,20 @@ async def test_unstructured_post_dispatch_status_is_ambiguous_for_unknown() -> N
 async def test_malformed_nonempty_2xx_remains_protocol_error_under_broad_ambiguity_policy(
     safety: ReplaySafety,
 ) -> None:
+    # The decoder's failure stays a ProtocolError; a request that is not SAFE carries it as the cause of its
+    # ambiguity, since the server may have run it before the answer was garbled.
     transport = ResponderTransport(lambda _request: WireResponse(200, (), b"not-json"))
     policy = ExecutionPolicy(ambiguity=AmbiguityPolicy(frozenset(range(100, 600))))
 
-    with pytest.raises(ProtocolError) as captured:
+    with pytest.raises((ProtocolError, AmbiguousExecutionError)) as captured:
         await Executor(transport).execute(
             Request("example.list", replay_safety=safety, route=RouteKind.BARE),
             policy=policy,
         )
 
-    assert type(captured.value).__name__ == "ProtocolError"
+    protocol = captured.value if safety is ReplaySafety.SAFE else captured.value.__cause__
+    assert type(protocol).__name__ == "ProtocolError"
+    assert isinstance(captured.value, AmbiguousExecutionError) is (safety is not ReplaySafety.SAFE)
 
 
 @pytest.mark.asyncio

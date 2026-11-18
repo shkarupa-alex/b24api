@@ -491,9 +491,17 @@ def _duplicate(envelope: Envelope) -> None:
 
 
 type _Mutation = Callable[[int, Envelope], object]
+
+
+def _error_answer(_start: int, envelope: Envelope) -> None:
+    """An error answer carries no result: one with both contradicts itself and proves nothing."""
+    envelope.clear()
+    envelope.update({"error": "ACCESS_DENIED", "error_description": "no"})
+
+
 _SURFACE: dict[str, tuple[_Mutation, type[Exception], TerminalState, PageRejectionCode | None]] = {
     "api-error": (
-        lambda _start, envelope: envelope.update({"error": "ACCESS_DENIED", "error_description": "no"}),
+        _error_answer,
         ApiResponseError,
         TerminalState.FAILED,
         None,

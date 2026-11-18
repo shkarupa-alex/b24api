@@ -236,8 +236,8 @@ async def test_an_undecodable_success_after_dispatch_is_unknown_with_its_protoco
     async with client_for(transport, policy=ExecutionPolicy(retry=_NO_DELAY)) as client:
         stream = _outcomes(client, mode)
         (outcome,) = await _drain(stream)
-        # A direct call keeps raising the failure itself.
-        with pytest.raises(ProtocolError) as raised:
+        # A direct call raises the same ambiguity: the outcome is unknown on every path.
+        with pytest.raises(AmbiguousExecutionError) as raised:
             await client.call(_UNSAFE)
 
     ambiguity = _ambiguity(outcome)
@@ -245,15 +245,14 @@ async def test_an_undecodable_success_after_dispatch_is_unknown_with_its_protoco
     assert ambiguity.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
     assert stream.report is not None
     assert stream.report.unknown == 1
-    assert not isinstance(raised.value, AmbiguousExecutionError)
+    assert isinstance(raised.value.__cause__, ProtocolError)
 
-    # Bitrix's own structured error, by contrast, answers the same command conclusively.
+    # Bitrix's own structured server error proves nothing either: the command may have run before it failed.
     structured = json.dumps({"error": "INTERNAL_SERVER_ERROR", "error_description": "x"}).encode()
     transport = ResponderTransport(lambda _request: WireResponse(_HTTP_SERVER_ERROR, _JSON, structured))
     async with client_for(transport, policy=ExecutionPolicy(retry=_NO_DELAY)) as client:
         (answered,) = await _drain(_outcomes(client, mode))
-    assert isinstance(answered, CommandFailure | ReferenceFailure)
-    assert any(isinstance(cause, ApiResponseError) for cause in _causes(answered.error))
+    assert any(isinstance(cause, ApiResponseError) for cause in _causes(_ambiguity(answered)))
 
 
 def _lost(request: Request) -> TransportError:

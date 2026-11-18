@@ -201,8 +201,12 @@ def _report_json(report: OperationReport) -> dict[str, object]:
 
 
 def _safe_error(error: BaseException) -> dict[str, object]:
+    """Render a failure safely, with the library failure that caused it: a spent retry budget names what it retried."""
     if isinstance(error, B24ApiError):
-        return {"kind": "error", **error.to_safe_dict()}
+        safe: dict[str, object] = {"kind": "error", **error.to_safe_dict()}
+        if isinstance(error.__cause__, B24ApiError):
+            safe["cause"] = error.__cause__.to_safe_dict()
+        return safe
     return {"kind": "error", "type": type(error).__name__, "message": "operation failed"}
 
 

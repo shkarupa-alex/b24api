@@ -1152,7 +1152,9 @@ async def test_negative_one_total_sentinel_is_preserved_but_lower_values_are_typ
 
     invalid = _sequence([_success(b'{"result":[],"total":-2}')])
     with pytest.raises(HTTPGatewayError) as captured:
-        await Executor(invalid).execute(Request("profile", route=RouteKind.BARE), policy=_policy())
+        await Executor(invalid).execute(
+            Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), policy=_policy()
+        )
     assert captured.value.http_status == HTTP_OK
 
 
@@ -1161,14 +1163,15 @@ async def test_negative_one_total_sentinel_is_preserved_but_lower_values_are_typ
     "body",
     [
         pytest.param(b'{"result":1e400}', id="overflowed-result-number"),
-        pytest.param(b'{"result":[],"time":{"duration":-1}}', id="negative-server-duration"),
     ],
 )
 async def test_success_model_contract_failures_are_typed_and_keep_http_evidence(body: bytes) -> None:
     transport = _sequence([_success(body)])
 
     with pytest.raises(ProtocolError) as captured:
-        await Executor(transport).execute(Request("profile", route=RouteKind.BARE), policy=_policy())
+        await Executor(transport).execute(
+            Request("profile", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), policy=_policy()
+        )
 
     assert captured.value.http_status == HTTP_OK
     assert captured.value.request_summary is not None

@@ -22,7 +22,7 @@ from b24api.contracts.v3_codes import (
     is_v3_code_shape,
     render_code,
 )
-from b24api.errors import ApiResponseError
+from b24api.errors import AmbiguousExecutionError, ApiResponseError
 from b24api.execution import Executor, WireResponse
 from b24api.redaction import REDACTED, Redactor, secret_values
 from b24api.transport.protocol import ProtocolCodec
@@ -352,7 +352,7 @@ def test_a_lower_cased_form_is_recognized_only_when_the_wire_code_was() -> None:
         # A missing portal module and a moderation cooldown are not over within one retry budget.
         ("LANDING_AI_MODULE_UNAVAILABLE", 503, False, False),
         ("LANDING_AI_SITE_MODERATION_BLOCK_LIMIT", 429, False, False),
-        # A 500 thrown after a side effect, and every deterministic refusal, stay as they were.
+        # A 500 thrown after a side effect, and every answer that names the request's own fault, are not retried.
         ("CRM_FORM_SIDE_EFFECT_FAILED", 500, False, False),
         ("BITRIX_REST_V3_EXCEPTION_ACCESSDENIEDEXCEPTION", 403, False, False),
         ("BITRIX_REST_V3_EXCEPTION_ENTITYNOTFOUNDEXCEPTION", 404, False, False),
@@ -422,9 +422,11 @@ async def test_a_query_time_limit_is_retried_only_for_safe_work(safety: ReplaySa
     if sends == 2:  # noqa: PLR2004
         assert (await Executor(transport).execute(request, policy=_policy())).result == {"ok": 1}
     else:
-        with pytest.raises(ApiResponseError) as caught:
+        # A 503 is an ambiguous status: the work may have run, so work of unknown safety is not replayed.
+        with pytest.raises(AmbiguousExecutionError) as caught:
             await Executor(transport).execute(request, policy=_policy())
-        assert caught.value.wire_code == QUERY_TIME_LIMIT_ERROR_CODE
+        assert isinstance(caught.value.__cause__, ApiResponseError)
+        assert caught.value.__cause__.wire_code == QUERY_TIME_LIMIT_ERROR_CODE
     assert len(transport.requests) == sends
 
 
