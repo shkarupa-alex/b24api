@@ -12,7 +12,6 @@ from b24api.contracts.v3_codes import REFUSAL_V3_ERROR_CODES, TRANSIENT_V3_ERROR
 
 if TYPE_CHECKING:
     from b24api.contracts.request_summary import RequestSummary
-    from b24api.settings import Settings
 
 HTTP_STATUS_MINIMUM = 100
 HTTP_STATUS_MAXIMUM = 599
@@ -272,8 +271,9 @@ class ExecutionPolicy:
     is checked at the operation's scheduling points (admission, permits, its own waits), not while the application
     holds control (a page stop callback, a consumer slow between pulls): the next scheduling point ends the operation.
     ``max_retry_elapsed_per_request`` is each request's retry window: it opens when the first send is granted its
-    permit and bounds every send, retry wait and later permit wait after it. A send has no timeout of its own; it
-    may use what is left of the window. ``max_direct_concurrency`` only narrows the client's own limit,
+    permit and bounds every send, retry wait and later permit wait after it. Each send is also bounded by its
+    transport's own attempt timeout (``Settings.http_timeout`` for the client's HTTPX transport), so a send that
+    hangs leaves the rest of the window to its retries. ``max_direct_concurrency`` only narrows the client's own limit,
     ``Settings.max_concurrent_requests``, which all the client's work shares: a direct dispatch runs at most the
     smallest of the two, ``max_active_references`` and its ``DirectDispatch.concurrency``. It does not limit a
     ``BatchDispatch``, whose physical batches in flight are bounded by its ``concurrency``,
@@ -301,16 +301,6 @@ class ExecutionPolicy:
     binary_digest: bool = False
     page_trace_limit: int = 64
     debug_evidence: bool = False
-
-    @classmethod
-    def from_settings(cls, settings: Settings) -> ExecutionPolicy:
-        """Return the policy a client built from ``settings`` uses when a call passes none.
-
-        It is ``ExecutionPolicy()`` with ``max_retry_elapsed_per_request`` set to
-        ``settings.http_timeout``. A ``policy=`` argument, on the client or on one call, replaces the
-        default wholesale; derive it from this value with ``dataclasses.replace`` to keep the timeout.
-        """
-        return cls(max_retry_elapsed_per_request=float(settings.http_timeout))
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""

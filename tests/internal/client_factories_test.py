@@ -51,9 +51,10 @@ def test_from_webhook_keeps_the_settings_timeout_unless_one_is_given() -> None:
     policy = ExecutionPolicy(max_pages=3)
     custom = Bitrix24.from_webhook(URL, policy=policy)
 
-    expected = float(Settings(webhook_url=URL).http_timeout)
-    assert default._default_policy.max_retry_elapsed_per_request == expected  # noqa: SLF001
-    assert explicit._default_policy.max_retry_elapsed_per_request == TIMEOUT  # noqa: SLF001
+    # The settings timeout bounds each attempt of the owned transport; the default policy is the library's.
+    timeouts = [client._owned_transport and client._owned_transport.timeout for client in (default, explicit)]  # noqa: SLF001
+    assert timeouts == [Settings(webhook_url=URL).http_timeout, TIMEOUT]
+    assert default._default_policy == ExecutionPolicy()  # noqa: SLF001
     assert custom._default_policy is policy  # noqa: SLF001
 
 

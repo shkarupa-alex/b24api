@@ -5,7 +5,14 @@ from collections.abc import AsyncGenerator, AsyncIterable, Iterable
 from typing import TYPE_CHECKING, Self, cast
 
 from b24api._sources import OwnedSource
-from b24api.batch.engine import BatchExecutor, _batch_outcome_row_weight, _BatchInput, _BatchItem, _Chunk
+from b24api.batch.engine import (
+    BatchExecutor,
+    BatchProgress,
+    _batch_outcome_row_weight,
+    _BatchInput,
+    _BatchItem,
+    _Chunk,
+)
 from b24api.batch.outcome import BatchFailure as KernelFailure
 from b24api.batch.outcome import BatchSuccess as KernelSuccess
 from b24api.batch.stream import _next_chunk, _within_row_budget
@@ -166,6 +173,10 @@ class LogicalBatchKernelStream[C]:
             isolated_pulls=False,
         )
         self._emitted = 0
+        # The chunk being sent or delivered, where each of its commands stands, and the indexes delivered so far:
+        # what an end before its last outcome leaves undelivered (``_undelivered``).
+        self._chunk: tuple[tuple[int, ...], BatchProgress] | None = None
+        self._delivered: set[int] = set()
         self._batch_requests = 0
         self._batch_commands = 0
         self.admitted = 0
@@ -206,6 +217,12 @@ class LogicalBatchKernelStream[C]:
         else:
             binding.settled(settlement(outcome.error))
 
+    def _hand_over(self, outcome: CommandOutcome[object]) -> None:
+        """Settle an outcome and count it delivered: the consumer holds it once it is yielded, whatever it does next."""
+        self._settle_outcome(outcome)
+        self._emitted += 1
+        self._delivered.add(outcome.index)
+
     def _finish_outcome(self, outcome: CommandOutcome[object]) -> None:
         binding = self._completion.binding(outcome.index)
         if isinstance(outcome, CommandSuccess):
@@ -216,6 +233,15 @@ class LogicalBatchKernelStream[C]:
         else:
             closure = BindingClosure.FAILURE
         self._completion.terminal(outcome.index, closure)
+
+    def _undelivered(self) -> tuple[int, int]:
+        """Count the commands of the current chunk without a delivered outcome: possibly run, and never sent."""
+        if self._chunk is None:
+            return 0, 0
+        indexes, progress = self._chunk
+        executions = [progress.execution(index) for index in indexes if index not in self._delivered]
+        possibly_run = sum(each is Execution.POSSIBLY_RUN for each in executions)
+        return possibly_run, sum(not each.dispatched for each in executions)
 
     async def __anext__(self) -> CommandOutcome[object]:
         """Return one correlated command outcome."""
@@ -270,12 +296,15 @@ class LogicalBatchKernelStream[C]:
             for command in chunk.commands:
                 self._completion.binding(command.index).scheduled()
             self._batch_commands += len(chunk.commands)
+            progress = BatchProgress()
+            self._chunk, self._delivered = (tuple(command.index for command in chunk.commands), progress), set()
             kernel = await self._batch_executor.execute_chunk(
                 chunk.commands,
                 context=self._context,
                 halt=self._fail_fast,
                 on_envelope=self._count_batch_request,
                 split_held=True,
+                progress=progress,
             )
             kernel = _within_row_budget(kernel, self._context.policy.max_buffered_rows)
             await self._context.set_buffered_rows(sum(_batch_outcome_row_weight(outcome) for outcome in kernel))
@@ -285,17 +314,16 @@ class LogicalBatchKernelStream[C]:
                     index for index, outcome in enumerate(outcomes) if not isinstance(outcome, CommandSuccess)
                 )
                 for successful_outcome in outcomes[:failed_at]:
-                    self._settle_outcome(successful_outcome)
-                    self._emitted += 1
+                    self._hand_over(successful_outcome)
                     yield successful_outcome
                     self._finish_outcome(successful_outcome)
                 raise _BatchWindowError(outcomes[failed_at:])
             for batch_outcome in outcomes:
-                self._settle_outcome(batch_outcome)
-                self._emitted += 1
+                self._hand_over(batch_outcome)
                 yield batch_outcome
                 self._finish_outcome(batch_outcome)
             await self._context.set_buffered_rows(0)
+            self._chunk = None
             if chunk.refusal is not None:
                 raise chunk.refusal
 
@@ -325,6 +353,7 @@ class LogicalBatchKernelStream[C]:
     async def _finalize(self, cause: TerminalCause, failure: str | None, attempt: CleanupAttempt) -> KernelReport:
         state, reason = kernel_terminal(cause, failure)
         snapshot = await self._context.snapshot()
+        possibly_run, not_sent = self._undelivered()
         snapshot_state = (
             SnapshotState.NOT_REQUESTED
             if self._context.policy.consistency.snapshot_requirement is SnapshotRequirement.TRAVERSAL_ONLY
@@ -349,6 +378,8 @@ class LogicalBatchKernelStream[C]:
             ambiguous_physical_attempts=snapshot.ambiguous_physical_attempts,
             batch_isolation_requests=snapshot.batch_isolation_requests,
             terminal_reason=reason,
+            undelivered_possibly_run=possibly_run,
+            undelivered_not_sent=not_sent,
         )
         self._completion.stream_terminal(
             StreamClosure.NATURAL

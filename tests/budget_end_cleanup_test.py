@@ -502,6 +502,8 @@ async def test_a_counted_list_whose_tail_the_deadline_refuses_ends_with_the_budg
 _QUOTA_REFUSAL = WireResponse(
     503, (("content-type", "application/json"),), b'{"error":"QUERY_LIMIT_EXCEEDED","error_description":"x"}'
 )
+# The same refusal with a zero hint holds the portal for nothing, so the retry's own backoff alone decides its wait.
+_QUOTA_REFUSAL_NO_HOLD = WireResponse(503, (*_QUOTA_REFUSAL.headers, ("retry-after", "0")), _QUOTA_REFUSAL.body)
 
 
 @pytest.mark.asyncio
@@ -523,7 +525,7 @@ async def test_a_counted_tail_page_stopped_for_its_request_alone_is_an_incomplet
     # time: a failed page of the traversal, not the operation's budget.
     def respond(request: Request) -> object:
         if request.method == "batch":
-            return _QUOTA_REFUSAL
+            return _QUOTA_REFUSAL_NO_HOLD
         return _counted_rows(request.method, {"start": str(request.copy_parameters().get("start", 0))})
 
     async with client_for(ResponderTransport(respond), policy=policy) as client:

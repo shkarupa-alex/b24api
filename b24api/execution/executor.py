@@ -37,7 +37,7 @@ from b24api.errors import (
     TransportError,
 )
 from b24api.execution.boundary import send_transport, send_wire_envelope
-from b24api.execution.context import CancellationMark, ExecutionContext, mark_cancellation
+from b24api.execution.context import ExecutionContext, mark_cancellation
 from b24api.execution.facts import (
     Execution,
     Verdict,
@@ -48,9 +48,19 @@ from b24api.execution.facts import (
     send_verdict,
 )
 from b24api.execution.rate import DeadlineBudget, RateCoordinator, WorkClass
-from b24api.execution.throttle import _retry_after_seconds, _retry_delay, _throttle_reason
+from b24api.execution.throttle import (
+    Limit,
+    _retry_after_seconds,
+    _retry_delay,
+    _throttle_reason,
+    backoff_delay,
+    hints_load,
+    limit_of,
+    operating_reset_delay,
+)
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
 from b24api.transport.base import (
+    TransportCapabilities,
     WireRequest,
     WireTransport,
     preflight_transport,
@@ -255,8 +265,17 @@ class _SendPlan(Enum):
     SEND = "send"
     #: A SAFE send whose own wait outlasts the round's: left out of this round and planned again in the next.
     CARRY = "carry"
-    #: Not sent again: the window cannot carry its own wait for its safety.
+    #: Not sent again: the window cannot carry its own wait for its safety, the backoff with its hold.
     REFUSE = "refuse"
+    #: Not sent again: its own hold alone outlasts the window for its safety, whatever the backoff. When the failure
+    #: it followed is the server's answer about its load (``hints_load``), that answer says why, so the send ends
+    #: with it, its code and its evidence, instead of the budget's refusal (``ends_held_out``).
+    HELD_OUT = "held_out"
+
+    @property
+    def refused(self) -> bool:
+        """Return whether the send is not sent again."""
+        return self in {_SendPlan.REFUSE, _SendPlan.HELD_OUT}
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,10 +283,12 @@ class _RoundPlan:
     """A round's wait, and what it does with each of its sends: a retry or replay round, or a batch's first send.
 
     Each send is weighed against the round's one backoff and its own methods' hold, and admitted when that wait
-    fits the window for its safety. With an admitted send that may not be repeated, the round waits the longest
-    admitted wait that such a send can still afford (at most half the window), so each of them is sent; a SAFE
-    send whose own wait is longer is carried to a later round instead of taking their replay away. With no such
-    send, the round waits the longest wait among its SAFE sends. A round that carries a send always sends one.
+    fits the window for its safety; one that does not fit is refused, held out when its hold alone does not fit
+    (``_SendPlan.HELD_OUT``). A whole round is refused whole when one of its sends does not fit. The round waits as
+    little as it can: as long as its admitted sends that may not be repeated need, so each of them is sent, and at
+    least until one admitted send can go. Every admitted send whose own wait is no longer is sent; a longer one,
+    which may always be repeated, is carried to a later round (or a first send to a later envelope) instead of
+    holding the others back. A round that carries a send always sends one.
     """
 
     pause: _Pause
@@ -283,6 +304,15 @@ class _RoundPlan:
         return tuple(index for index, own in enumerate(self.plans) if own is plan)
 
 
+def ends_held_out(plan: _SendPlan, followed: B24ApiError) -> bool:
+    """Return whether a send not sent again ends with the failure it ``followed`` rather than the budget's refusal.
+
+    It does when its own hold alone outlasts its window (``_SendPlan.HELD_OUT``) and that failure is the server's
+    answer about its load: a lone request, a classic batch command and a REST v3 group end alike.
+    """
+    return plan is _SendPlan.HELD_OUT and hints_load(followed)
+
+
 def _retry_refusal(replay: _RoundPlan | None) -> str:
     """Return why the budget refused a retry: no attempt was left (no plan), or the window does not carry it."""
     return "per-request attempt budget exhausted" if replay is None else "retry delay would exceed elapsed budget"
@@ -291,27 +321,33 @@ def _retry_refusal(replay: _RoundPlan | None) -> str:
 def _plan_round(own: tuple[_Pause, ...], safeties: tuple[ReplaySafety, ...], *, whole: bool) -> _RoundPlan:
     """Plan a round from each send's own pause (see ``_RoundPlan``)."""
     first = own[0]
+    refusals = tuple(
+        _SendPlan.HELD_OUT if not dataclasses.replace(each, backoff=0.0).admits(safety) else _SendPlan.REFUSE
+        for each, safety in zip(own, safeties, strict=True)
+    )
     if whole:
         pause = dataclasses.replace(first, held=max(each.held for each in own))
-        plan = _SendPlan.SEND if all(pause.admits(safety) for safety in safeties) else _SendPlan.REFUSE
-        return _RoundPlan(pause, tuple(plan for _ in own))
+        if all(pause.admits(safety) for safety in safeties):
+            return _RoundPlan(pause, tuple(_SendPlan.SEND for _ in own))
+        return _RoundPlan(pause, refusals)
     fits = tuple(each.admits(safety) for each, safety in zip(own, safeties, strict=True))
-    unrepeatable = any(fit and safety is not ReplaySafety.SAFE for fit, safety in zip(fits, safeties, strict=True))
-    # With a send that may not be repeated, the round waits only as long as such a send can afford.
-    held = max(
+    admitted = tuple(each.held for each, fit in zip(own, fits, strict=True) if fit)
+    # The longest hold of an admitted send that may not be repeated: it is sent in this round, never carried.
+    needed = max(
         (
             each.held
-            for each, fit in zip(own, fits, strict=True)
-            if fit and (not unrepeatable or each.admits(ReplaySafety.UNSAFE))
+            for each, fit, safety in zip(own, fits, safeties, strict=True)
+            if fit and safety is not ReplaySafety.SAFE
         ),
         default=0.0,
     )
+    held = max(needed, min(admitted, default=0.0))
     pause = dataclasses.replace(first, held=held)
     return _RoundPlan(
         pause,
         tuple(
-            _SendPlan.REFUSE if not fit else _SendPlan.SEND if each.delay <= pause.delay else _SendPlan.CARRY
-            for each, fit in zip(own, fits, strict=True)
+            refusal if not fit else _SendPlan.SEND if each.delay <= pause.delay else _SendPlan.CARRY
+            for each, fit, refusal in zip(own, fits, refusals, strict=True)
         ),
     )
 
@@ -346,6 +382,9 @@ class _RequestAttempts:
     # wait: the engine, which sees only the failure of its round, tells this refusal from any other stop before a
     # send by it, and plans that round's SAFE commands again. ``start_round`` clears it.
     refusal: BudgetExceededError | None = None
+    # When the latest send left: a limit refusal of a send that left after the latest pause for that limit began
+    # lengthens the next pause (``RateCoordinator.limit_streak``).
+    sent_at: float = 0.0
 
     def open_window(self, clock: Clock) -> float:
         """Open the retry window when the first send is granted its permit, and return when it opened."""
@@ -504,7 +543,7 @@ class Executor:
         context = context or self.context(policy)
         attempts = _attempts or _RequestAttempts()
         try:
-            wire, response = await self._execute_wire_attempts(
+            _wire, response = await self._execute_wire_attempts(
                 request,
                 context=context,
                 work_class=work_class,
@@ -513,18 +552,6 @@ class Executor:
                 shared=attempts,
             )
             response = _decoded(response)
-            try:
-                _raise_embedded_result_error(
-                    request,
-                    response.result,
-                    http_status=wire.status_code,
-                    retry_codes=context.policy.retry.transient_api_codes,
-                    redactor=self.codec.redactor,
-                )
-            except B24ApiError as error:
-                # The request's own contract found the answer's error: the send ends as any failed send does.
-                self._conclude(request, error, policy=context.policy, shared=attempts)
-                raise
         except BaseException as error:
             # Each send's failure was classified where it ended; a failure that ends the request after them adds
             # nothing (a stop before a further send, or a cancellation): what they left open is the lineage's, the
@@ -611,15 +638,14 @@ class Executor:
 
             response_error, response = self._classify_response(request, wire, context=context, mode=mode)
             if response_error is None:
+                # A classic batch envelope's own name is none of the methods it is admitted under, so its answer
+                # is no answer of theirs: their commands' entries are (``observe_command``).
+                self.observe_answer(context, wire, response, methods=methods & {request.method}, sent_at=shared.sent_at)
                 # An answer that arrives after the budget is still the answer: it is returned, never discarded.
                 cancellation.raise_if_requested()
                 return wire, response
-            code = response_error.normalized_code if isinstance(response_error, ApiResponseError) else None
-            if code == "operation_time_limit":
-                # The methods the coordinator admits: a classic batch envelope's own name is not one of them.
-                for method in sorted(methods):
-                    await context.coordinator.observe_api_throttle(method, code)
-            await self._observe_throttle_hint(wire, response_error, context=context)
+            # The methods the coordinator admits: a classic batch envelope's own name is not one of them.
+            await self.observe_refusal(context, response_error, methods=methods, sent_at=shared.sent_at, wire=wire)
             cancellation.raise_if_requested()
             # A late failure meets the ambiguity rules first; the budget stops only a retry it would ask for.
             await self._prepare_retry(request, response_error, context=context, shared=shared, methods=methods)
@@ -668,6 +694,7 @@ class Executor:
         except B24ApiError as error:
             attempts.chain_stop(error)
             raise
+        attempts.sent_at = self._clock()
         return remaining
 
     @staticmethod
@@ -706,9 +733,14 @@ class Executor:
         context: ExecutionContext,
         remaining: float,
     ) -> WireResponse:
-        """Send one admitted, counted attempt within what is left of the retry window."""
+        """Send one admitted, counted attempt within what is left of the retry window.
+
+        A transport that bounds its attempts itself (``TransportCapabilities.bounds_attempts``) ends this one by
+        ``remaining`` and says how far it got. Any other is cut here when the window closes, which proves nothing
+        about how far it got.
+        """
         try:
-            async with asyncio.timeout(remaining):
+            async with asyncio.timeout(_executor_deadline(self._wire_transport, remaining)):
                 return await send_transport(
                     self.transport,
                     self._wire_transport,
@@ -759,7 +791,14 @@ class Executor:
                 # The transport turned a cancellation into this failure: the envelope ends cancelled.
                 return _dispatched_attempt("cancelled", error=asyncio.CancelledError())
             return _dispatched_attempt("error", error=error)
-        return await self._classify_envelope(envelope, wire, context=context, cancellation=cancellation)
+        # A refusal of the envelope as a whole cannot be attributed to one command: it holds every method the
+        # envelope is admitted under.
+        response_error, response = self._classify_response(
+            None, wire, context=context, mode=_BodyMode.JSON, summary=envelope.summary
+        )
+        if response_error is not None:
+            await self.observe_refusal(context, response_error, methods=methods, sent_at=attempts.sent_at, wire=wire)
+        return _envelope_answered(wire, response_error, response, cancelled=cancellation.requested())
 
     async def _send_envelope(
         self,
@@ -782,25 +821,28 @@ class Executor:
             send = _send_envelope_attempt(wire_transport, envelope, context=context, remaining=remaining)
             return await self._dispatch(context, attempts, send)
 
-    async def _classify_envelope(
-        self,
-        envelope: WireRequest,
-        wire: WireResponse,
-        *,
-        context: ExecutionContext,
-        cancellation: CancellationMark,
-    ) -> PhysicalAttemptOutcome:
-        """Classify one envelope response with the shared primitives, observing any host throttle hint."""
-        response_error, response = self._classify_response(
-            None, wire, context=context, mode=_BodyMode.JSON, summary=envelope.summary
-        )
-        if response_error is not None:
-            await self._observe_throttle_hint(wire, response_error, context=context)
-        if cancellation.requested():
-            return _dispatched_attempt("cancelled", wire=wire, error=asyncio.CancelledError())
-        if response_error is not None:
-            return _dispatched_attempt("error", wire=wire, error=response_error)
-        return _dispatched_attempt("response", wire=wire, response=response)
+    def _read_answer(
+        self, request: Request | None, wire: WireResponse, *, context: ExecutionContext, summary: RequestSummary | None
+    ) -> B24ApiError | Response | Mapping[str, object] | None:
+        """Read a 2xx JSON answer once (``_read_success``), then the request's own embedded-error contract on it.
+
+        The contract may find an error in the answer: the send fails as any failed send does, before its retry and
+        the load limit it names are decided.
+        """
+        read = _read_success(wire, summary=summary)
+        if request is None or not isinstance(read, Response):
+            return read
+        try:
+            _raise_embedded_result_error(
+                request,
+                read.result,
+                http_status=wire.status_code,
+                retry_codes=context.policy.retry.transient_api_codes,
+                redactor=self.codec.redactor,
+            )
+        except B24ApiError as error:
+            return error
+        return read
 
     def _classify_response(
         self,
@@ -823,7 +865,7 @@ class Executor:
             return None, None
         body: bytes | Mapping[str, object] | None = wire.body
         if success:
-            read = _read_success(wire, summary=request_summary)
+            read = self._read_answer(request, wire, context=context, summary=request_summary)
             if isinstance(read, B24ApiError):
                 return read, None
             if isinstance(read, Response):
@@ -858,14 +900,79 @@ class Executor:
             )
         return response_error, None
 
-    async def _observe_throttle_hint(
-        self, wire: WireResponse, error: B24ApiError, *, context: ExecutionContext
+    def observe_answer(
+        self,
+        context: ExecutionContext,
+        wire: WireResponse | None,
+        response: Response | None,
+        *,
+        methods: frozenset[str],
+        sent_at: float,
     ) -> None:
-        """Pause the portal host for the cooldown a failed answer hints, if it hints one."""
-        hint = _retry_after_seconds(wire)
+        """Record what an answer that is no limit refusal says about the load: of ``methods``, its own methods.
+
+        It ends the host's limit streak and theirs, and records when a method's operating time resets, from the
+        ``time`` block of its answer.
+        """
+        coordinator = context.coordinator
+        coordinator.observe_answer(methods, sent_at=sent_at)
+        timing = None if response is None else response.time
+        if timing is None or timing.operating_reset_at is None:
+            return
+        date = None if wire is None else wire.header_map.get("date")
+        for method in methods:
+            coordinator.observe_reset(method, operating_reset_delay(timing.operating_reset_at, date))
+
+    async def observe_refusal(
+        self,
+        context: ExecutionContext,
+        error: B24ApiError,
+        *,
+        methods: frozenset[str],
+        sent_at: float,
+        wire: WireResponse | None = None,
+    ) -> None:
+        """Pause what a failed answer's load limit holds: the host, or each of ``methods``; any other, nothing.
+
+        A method's operating-time refusal holds that method alone: for the server's hint, else until its operating
+        time resets, as its latest answer said, else for the retry backoff of its limit streak. A request-rate
+        refusal holds the host for the server's hint, else for the backoff of the host's limit streak, so the sends
+        that share the host slow down together. A hint on another failure holds the host only when its status is
+        about the load (429 or 503, ``hints_load``). The host's hold is added to the operation's cooldown.
+        """
+        coordinator = context.coordinator
+        limit = limit_of(error)
+        hint = _retry_after_seconds(wire) if wire is not None and hints_load(error) else None
+        if limit is Limit.METHOD:
+            for method in sorted(methods):
+                delay = hint if hint is not None else coordinator.method_reset(method)
+                if delay is None:
+                    delay = backoff_delay(context.policy, coordinator.limit_streak(method, sent_at=sent_at))
+                coordinator.hold_method(method, delay)
+            return
+        if limit is Limit.HOST and hint is None:
+            hint = backoff_delay(context.policy, coordinator.limit_streak(None, sent_at=sent_at))
         if hint is not None:
-            cooldown = await context.coordinator.observe_throttle(hint, reason=_throttle_reason(error))
+            cooldown = await coordinator.observe_throttle(hint, reason=_throttle_reason(error))
             await context.record_cooldown(cooldown)
+
+    async def observe_command(
+        self,
+        context: ExecutionContext,
+        method: str,
+        answer: Response | B24ApiError | None,
+        *,
+        sent_at: float,
+    ) -> None:
+        """Record what one command's own entry says about the load: its failure, or its success (with its timing).
+
+        An entry carries no hint of its own.
+        """
+        if isinstance(answer, B24ApiError) and limit_of(answer) is not None:
+            await self.observe_refusal(context, answer, methods=frozenset({method}), sent_at=sent_at)
+        else:
+            response = answer if isinstance(answer, Response) else None
+            self.observe_answer(context, None, response, methods=frozenset({method}), sent_at=sent_at)
 
     def plan_replay(
         self,
@@ -899,34 +1006,32 @@ class Executor:
             else _retry_delay(context.policy, retry_number=attempts.used, random_source=self._random)
         )
         now = self._clock()
-        own = tuple(_Pause(backoff, context.coordinator.admission_delay(methods), window, now) for _, methods in sends)
+        holds = context.coordinator.admission_delays(tuple(methods for _, methods in sends))
+        own = tuple(_Pause(backoff, held, window, now) for held in holds)
         return _plan_round(own, tuple(safety for safety, _ in sends), whole=whole)
 
     def plan_first_send(self, context: ExecutionContext, *, methods: tuple[frozenset[str], ...]) -> _RoundPlan | None:
-        """Plan which commands an envelope's first send leaves out for their own methods' hold; ``None``: none.
+        """Plan which commands an envelope's first send leaves for a later envelope; ``None``: it goes whole.
 
-        An envelope is admitted under every method it carries, so one command's method hold holds back all the others.
-        Each command is weighed as a replay round weighs its send (``_Pause.admits``), with no backoff: by how much
-        longer its own methods are held than the host, which every command waits for alike, against what its send may
-        wait for, the retry window it opens and what the operation has left after the host hold, whichever is shorter.
-        A first send repeats nothing and its window opens at its permit, after the hold, so each is weighed as a send
-        that may be repeated, whatever its safety. Leaving a command out is worth it only to let the others go: when
-        every command can wait, or none can, the envelope goes whole to its permit, which waits within the operation's
-        budget or refuses at once a hold that outlasts it, as for a lone request. Otherwise ``_plan_round`` refuses
-        each command that cannot wait, the others being sent once the longest hold among them ends (the coordinator
-        enforces it at the permit). A fail-fast envelope is never planned here: it goes whole to its permit. With no
-        time left, it raises the deadline's refusal of the permit (``ExecutionContext.time_left``), recorded.
+        An envelope is admitted under every method it carries, so one command's method hold would hold back all the
+        others. Each command is planned as a replay round plans its send (``_plan_round``), with no backoff: by how
+        much longer its own methods are held than the host, which every command waits for alike. A first send
+        repeats nothing, so each is weighed as a send that may be repeated, whatever its safety, and against what
+        the operation has left after the host's hold: its retry window opens at its permit, after the hold. So the
+        least held commands go now, a command held longer goes in a later envelope once its hold ends, and only one
+        whose hold outlasts what the operation has left is refused. When every command goes now, or none can, the
+        envelope goes whole to its permit, which waits within the operation's budget or refuses at once a hold that
+        outlasts it, as for a lone request. A fail-fast envelope is never planned here: it goes whole to its permit.
+        With no time left, it raises the deadline's refusal of the permit (``ExecutionContext.time_left``), recorded.
         """
         now = self._clock()
-        host = context.coordinator.admission_delay(frozenset())
-        # A window opening now cannot close before the operation's deadline unless it is shorter: no time left is
-        # the deadline's refusal, recorded.
-        window = min(context.time_left(_PERMIT_REFUSAL, retry_started=now), context.time_left(_PERMIT_REFUSAL) - host)
-        pauses = tuple(_Pause(0.0, context.coordinator.admission_delay(each) - host, window, now) for each in methods)
-        fits = tuple(pause.admits(ReplaySafety.SAFE) for pause in pauses)
-        if all(fits) or not any(fits):
+        host, *holds = context.coordinator.admission_delays((frozenset(), *methods))
+        window = context.time_left(_PERMIT_REFUSAL) - host
+        pauses = tuple(_Pause(0.0, held - host, window, now) for held in holds)
+        plan = _plan_round(pauses, tuple(ReplaySafety.SAFE for _ in pauses), whole=False)
+        if all(each is _SendPlan.SEND for each in plan.plans) or all(each.refused for each in plan.plans):
             return None
-        return _plan_round(pauses, tuple(ReplaySafety.SAFE for _ in pauses), whole=False)
+        return plan
 
     async def replay_after(self, context: ExecutionContext, *, attempts: _RequestAttempts, pause: _Pause) -> None:
         """Wait out a pause ``plan_replay`` planned before the replay round it admits."""
@@ -952,6 +1057,10 @@ class Executor:
         except BudgetExceededError as refusal:
             shared.chain_stop(refusal)
             raise
+        if replay is not None and ends_held_out(replay.plans[0], error):
+            # The server holds the request's methods or its host longer than its window can wait, whatever its own
+            # backoff: the request ends with the refusal that says so, its code and its evidence.
+            raise error
         if replay is None or replay.plans != (_SendPlan.SEND,):
             stop = BudgetExceededError(_retry_refusal(replay))
             shared.chain_stop(stop)
@@ -1002,12 +1111,23 @@ def _ambiguity_message(error: B24ApiError) -> str:
     return "Request may have executed; its answer does not prove whether it ran"
 
 
+def _executor_deadline(wire_transport: WireTransport | None, remaining: float) -> float | None:
+    """Return the deadline the executor sets around an attempt: none when its transport bounds its attempts itself.
+
+    Such a transport (``TransportCapabilities.bounds_attempts``) ends the attempt by ``remaining`` and says how far
+    it got. A deadline set here would fire first and prove nothing about how far it got.
+    """
+    capabilities = None if wire_transport is None else wire_transport.capabilities
+    bounded = isinstance(capabilities, TransportCapabilities) and capabilities.bounds_attempts
+    return None if bounded else remaining
+
+
 async def _send_envelope_attempt(
     wire_transport: WireTransport, envelope: WireRequest, *, context: ExecutionContext, remaining: float
 ) -> WireResponse:
-    """Send one admitted, counted envelope within what is left of the retry window."""
+    """Send one admitted, counted envelope within what is left of the retry window, bounded as a lone attempt is."""
     try:
-        async with asyncio.timeout(remaining):
+        async with asyncio.timeout(_executor_deadline(wire_transport, remaining)):
             return await send_wire_envelope(
                 wire_transport,
                 envelope,
@@ -1042,6 +1162,17 @@ def _dispatched_attempt(
     error: BaseException | None = None,
 ) -> PhysicalAttemptOutcome:
     return PhysicalAttemptOutcome(kind, wire, response, error, dispatch_started=True)
+
+
+def _envelope_answered(
+    wire: WireResponse, error: B24ApiError | None, response: Response | None, *, cancelled: bool
+) -> PhysicalAttemptOutcome:
+    """An envelope's answer: cancelled while it was read, its failure, or its decoded success."""
+    if cancelled:
+        return _dispatched_attempt("cancelled", wire=wire, error=asyncio.CancelledError())
+    if error is not None:
+        return _dispatched_attempt("error", wire=wire, error=error)
+    return _dispatched_attempt("response", wire=wire, response=response)
 
 
 def _is_retryable(

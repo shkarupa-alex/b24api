@@ -319,6 +319,11 @@ class OperationReport:
     # the individual requests sent to attribute SAFE commands such an envelope left unresolved.
     ambiguous_physical_attempts: int = field(default=0, kw_only=True)
     batch_isolation_requests: int = field(default=0, kw_only=True)
+    # Of the admitted batch commands whose outcome was never delivered (``admitted - emitted``), those a send may
+    # have run (in flight when the operation ended, or sent without an answer) and those never sent. The rest were
+    # answered before the end, and their answers were not delivered.
+    undelivered_possibly_run: int = field(default=0, kw_only=True)
+    undelivered_not_sent: int = field(default=0, kw_only=True)
 
     def __post_init__(self) -> None:
         """Validate bounded terminal evidence."""
@@ -347,6 +352,8 @@ class OperationReport:
             self.active_references_high_water,
             self.ambiguous_physical_attempts,
             self.batch_isolation_requests,
+            self.undelivered_possibly_run,
+            self.undelivered_not_sent,
         )
         if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in counters):
             raise ValueError("report counters must be non-negative integers")

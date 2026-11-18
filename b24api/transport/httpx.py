@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import weakref
 from typing import TYPE_CHECKING, cast
 
@@ -39,6 +40,8 @@ if TYPE_CHECKING:
 
 
 _TOKENS = TokenVault()
+# The bound of each phase of one attempt (``HttpxTransport``), as ``Settings.http_timeout`` defaults it.
+DEFAULT_ATTEMPT_TIMEOUT = 30.0
 
 
 def _token_for(handle: str) -> str:
@@ -90,10 +93,20 @@ class HttpxTransport:
         positional_json=True,
         routes=frozenset(RouteKind),
         json_array_body=True,
+        bounds_attempts=True,
     )
 
-    def __init__(self, webhook_url: str, *, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self, webhook_url: str, *, client: httpx.AsyncClient | None = None, timeout: float = DEFAULT_ATTEMPT_TIMEOUT
+    ) -> None:
         """Initialize instance state.
+
+        ``timeout`` bounds each phase of one attempt, as HTTPX's timeout does: connecting (TCP and TLS), waiting
+        for a pooled connection, writing the request and each read of the answer. The whole attempt is also
+        bounded by what is left of its request's retry window (``attempt_timeout``), here, where the phase it
+        reached is known (``TransportCapabilities.bounds_attempts``). An attempt that times out before anything
+        was sent, by either bound, is proven not sent and is retried whatever its safety; a timeout after it may
+        have been sent proves nothing.
 
         Every refusal is raised after this frame's copies of the webhook are cleared, so a traceback rendered
         with its frames' locals shows no part of the URL.
@@ -101,6 +114,9 @@ class HttpxTransport:
         if not isinstance(webhook_url, str):
             webhook_url = ""
             raise TypeError("webhook URL must be a string")
+        if isinstance(timeout, bool) or not isinstance(timeout, int | float) or not 0 < timeout < math.inf:
+            webhook_url = ""
+            raise ValueError("timeout must be a finite positive number of seconds")
         # The one parse Settings uses too; the webhook's ``repr`` leaves the token out.
         parsed = parse_webhook(webhook_url)
         webhook_url = ""
@@ -125,6 +141,7 @@ class HttpxTransport:
         self._webhook_finalizer = weakref.finalize(self, _TOKENS.drop, self._webhook_handle)
         self._client = resolved_client
         self._owns_client = client is None
+        self._timeout = float(timeout)
         self._closed = False
         self._address = webhook.address
         self._shield_finalizer = shield_finalizer
@@ -136,6 +153,11 @@ class HttpxTransport:
     def host(self) -> str:
         """Return the normalized portal host without credentials."""
         return self._address.host
+
+    @property
+    def timeout(self) -> float:
+        """Return the bound of each phase of one attempt, in seconds."""
+        return self._timeout
 
     async def send(
         self,
@@ -228,24 +250,29 @@ class HttpxTransport:
         outcome: WireResponse | BaseException
         try:
             with HTTPX_LOG_SHIELD.request(webhook=webhook) as ownership:
-                try:
-                    # HTTPX refuses some values only while building, a header it cannot encode for example. The
-                    # method URL carries the token, so no local of this frame holds it.
-                    http_request = self._build_request(request, headers, _method_url(webhook, request))
-                    ownership.claim(http_request)
-                    http_request.extensions["trace"] = tracker
-                    timeouts = dict.fromkeys(("connect", "read", "write", "pool"), attempt_timeout)
-                    http_request.extensions["timeout"] = timeouts
-                    response = await self._client.send(
-                        http_request, stream=True, auth=ownership.guard(self._client.auth)
-                    )
-                except asyncio.CancelledError as error:
-                    outcome = asyncio.CancelledError(*error.args)
-                except Exception as error:  # noqa: BLE001 - every escape is classified, never chained
-                    outcome = _client_failure(error, tracker.phase, request.summary, built=http_request is not None)
-                else:
-                    outcome = await _read_response(response, tracker, max_response_bytes, request.summary)
-                    del response
+                deadline = asyncio.timeout(attempt_timeout)
+                async with deadline:
+                    try:
+                        # HTTPX refuses some values only while building, a header it cannot encode for example. The
+                        # method URL carries the token, so no local of this frame holds it.
+                        http_request = self._build_request(request, headers, _method_url(webhook, request))
+                        ownership.claim(http_request)
+                        http_request.extensions["trace"] = tracker
+                        timeouts = dict.fromkeys(("connect", "read", "write", "pool"), self._timeout)
+                        http_request.extensions["timeout"] = timeouts
+                        response = await self._client.send(
+                            http_request, stream=True, auth=ownership.guard(self._client.auth)
+                        )
+                    except asyncio.CancelledError as error:
+                        outcome = asyncio.CancelledError(*error.args)
+                    except Exception as error:  # noqa: BLE001 - every escape is classified, never chained
+                        outcome = _client_failure(error, tracker.phase, request.summary, built=http_request is not None)
+                    else:
+                        outcome = await _read_response(response, tracker, max_response_bytes, request.summary)
+                        del response
+                if deadline.expired() and isinstance(outcome, asyncio.CancelledError):
+                    # This attempt's own deadline cut it, where the tracker knows how far it got.
+                    outcome = _attempt_timed_out(tracker.phase, request.summary)
         except BaseException as escaped:
             # What no handler classifies (an interrupt, an exit, this coroutine's close) leaves as it is, but without
             # the frames it was raised through, HTTPX's and this one, whose locals hold the credential-bearing
@@ -397,6 +424,13 @@ def _httpx_default_accept_encoding() -> str:
     """Return the value HTTPX puts on a client given none; it grows ``br``/``zstd`` once those codecs are installed."""
     # Read from the pinned HTTPX, like the shield's ``_send_handling_auth`` attribution.
     return httpx._client.ACCEPT_ENCODING  # noqa: SLF001 - tell HTTPX's default from a configured value
+
+
+def _attempt_timed_out(phase: FailurePhase, summary: RequestSummary) -> TransportError:
+    """Classify an attempt its own deadline ended: proven not sent before dispatch, possibly sent after."""
+    if phase in {FailurePhase.NOT_DISPATCHED, FailurePhase.CONNECTION_ESTABLISHED}:
+        return TransportError("Transport attempt timed out before dispatch", phase=phase, request_summary=summary)
+    return TransportError("Transport attempt timed out after possible dispatch", phase=phase, request_summary=summary)
 
 
 def _at_least_dispatch_started(phase: FailurePhase) -> FailurePhase:

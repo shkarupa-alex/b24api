@@ -100,11 +100,21 @@ class _Permit:
         self._released = True
 
 
+@dataclass(slots=True)
+class _Streak:
+    """Consecutive limit refusals of one scope (the host, or a method), and when the latest pause for them began."""
+
+    count: int
+    since: float
+
+
 class RateCoordinator:
     """Cooldown-aware fair permit scheduler shared by every execution class.
 
-    Every state change is synchronous code between awaits, so the event loop serializes it and no
-    lock is needed; a mutator must never await in the middle of an update.
+    Retries and first sends take turns: a retry waits for every other permit at most, since its retry window
+    runs while it queues, and first sends share the other turns, interactive and traversal work twice as
+    often as batches. Every state change is synchronous code between awaits, so the event loop serializes it
+    and no lock is needed; a mutator must never await in the middle of an update.
     """
 
     _cycle = (
@@ -113,27 +123,25 @@ class RateCoordinator:
         WorkClass.BATCH,
         WorkClass.INTERACTIVE_DIRECT,
         WorkClass.TRAVERSAL_DIRECT,
-        WorkClass.RETRY,
     )
 
     def __init__(
-        self,
-        *,
-        max_concurrency: int = 10,
-        clock: Clock = time.monotonic,
-        operation_time_limit_delay: float = 120.0,
+        self, *, max_concurrency: int = 10, clock: Clock = time.monotonic, sleep: Sleeper = asyncio.sleep
     ) -> None:
-        """Initialize instance state."""
+        """Initialize instance state; ``sleep`` waits out a hold on ``clock``'s time, as the executor's does."""
         if isinstance(max_concurrency, bool) or max_concurrency < 1:
             raise ValueError("max_concurrency must be positive")
-        if not math.isfinite(operation_time_limit_delay) or operation_time_limit_delay < 0:
-            raise ValueError("operation_time_limit_delay must be finite and non-negative")
         self._max_concurrency = max_concurrency
         self._clock = clock
+        self._sleep = sleep
         self._queues: dict[WorkClass, deque[_Waiter]] = {work_class: deque() for work_class in WorkClass}
         self._method_until: dict[str, float] = {}
+        # The monotonic moment each method's operating time resets, as its latest answer gave it.
+        self._method_reset: dict[str, float] = {}
+        # Limit refusals in a row, by scope: ``None`` for the host, a method name for that method.
+        self._streaks: dict[str | None, _Streak] = {}
         self._host: str | None = None
-        self._operation_time_limit_delay = operation_time_limit_delay
+        self._retry_turn = False
         self._cycle_index = 0
         self._active = 0
         self._state = CoordinatorState.OPEN
@@ -189,42 +197,84 @@ class RateCoordinator:
             raise
         return _Permit(self)
 
-    async def observe_operation_time_limit(self, method: str, *, delay: float | None = None) -> float:
-        """Pause only the method that reported OPERATION_TIME_LIMIT."""
+    def hold_method(self, method: str, delay: float) -> None:
+        """Hold every permit for ``method`` for ``delay`` seconds (capped at an hour), or longer if already held."""
         if not isinstance(method, str) or not method:
             raise ValueError("method must be a non-empty string")
-        seconds = self._operation_time_limit_delay if delay is None else delay
-        if not math.isfinite(seconds) or seconds < 0:
+        if not math.isfinite(delay) or delay < 0:
             raise ValueError("method cooldown must be finite and non-negative")
-        seconds = min(seconds, _RETRY_AFTER_CAP_SECONDS)
         if self._state is CoordinatorState.CLOSED:
-            return 0.0
+            return
         self._prune_methods()
         if method not in self._method_until and len(self._method_until) >= _METHOD_LIMIT_CAP:
             raise RatePolicyCapacityError("method cooldown table is full")
-        deadline = self._clock() + seconds
+        deadline = self._clock() + min(delay, _RETRY_AFTER_CAP_SECONDS)
         self._method_until[method] = max(deadline, self._method_until.get(method, deadline))
         self._schedule_wake()
         self._grant()
-        return max(0.0, self._method_until[method] - self._clock())
 
-    async def observe_api_throttle(self, method: str, code: str, *, delay: float | None = None) -> float:
-        """Record a method-scoped throttle signal without dispatching a retry."""
-        if not isinstance(code, str) or not code:
-            raise ValueError("code must be a non-empty string")
-        if code.casefold() != "operation_time_limit":
-            return 0.0
-        return await self.observe_operation_time_limit(method, delay=delay)
+    def method_reset(self, method: str) -> float | None:
+        """Return how long until ``method``'s operating time resets, as its latest answer said; ``None``: unknown."""
+        until = self._method_reset.get(method)
+        if until is None:
+            return None
+        left = until - self._clock()
+        return left if left > 0 else None
+
+    def observe_reset(self, method: str, delay: float) -> None:
+        """Record that ``method``'s operating time resets in ``delay`` seconds (capped at an hour)."""
+        if not math.isfinite(delay) or delay < 0 or self._state is CoordinatorState.CLOSED:
+            return
+        now = self._clock()
+        self._method_reset = {name: until for name, until in self._method_reset.items() if until > now}
+        if method in self._method_reset or len(self._method_reset) < _METHOD_LIMIT_CAP:
+            self._method_reset[method] = now + min(delay, _RETRY_AFTER_CAP_SECONDS)
+
+    def limit_streak(self, scope: str | None, *, sent_at: float) -> int:
+        """Count a limit refusal of ``scope`` (``None``: the host) for a send that left at ``sent_at``.
+
+        A send that left after the latest pause of its scope began was refused again after that pause: the
+        streak grows. One that left before it, or as it began, belongs to the burst that pause answers: the
+        streak stays.
+        """
+        streak = self._streaks.get(scope)
+        if streak is not None and sent_at <= streak.since:
+            return streak.count
+        if streak is None and scope is not None and len(self._streaks) >= _METHOD_LIMIT_CAP:
+            del self._streaks[next(name for name in self._streaks if name is not None)]
+        count = 1 if streak is None else streak.count + 1
+        self._streaks[scope] = _Streak(count, self._clock())
+        return count
+
+    def observe_answer(self, methods: frozenset[str], *, sent_at: float) -> None:
+        """End the limit streaks of the host and ``methods`` that a send left after the latest pause of ended."""
+        for scope in (None, *methods):
+            streak = self._streaks.get(scope)
+            if streak is not None and sent_at > streak.since:
+                del self._streaks[scope]
 
     def admission_delay(self, methods: frozenset[str]) -> float:
         """Return how long the host cooldown and the cooldowns of ``methods`` still hold a permit for them."""
+        return self.admission_delays((methods,))[0]
+
+    def admission_delays(self, scopes: tuple[frozenset[str], ...]) -> tuple[float, ...]:
+        """Return ``admission_delay`` of each of ``scopes``, all measured at one reading of the clock.
+
+        Sends held until the same instant are held equally long: a plan that compares their holds compares the
+        deadlines they wait for, not readings of the clock taken one after another.
+        """
         if self._state is CoordinatorState.CLOSED:
-            return 0.0
+            return tuple(0.0 for _ in scopes)
         now = self._clock()
-        holds = [self._method_until.get(method, now) for method in methods]
-        if self._state is CoordinatorState.COOLDOWN and self._cooldown_until is not None:
-            holds.append(self._cooldown_until)
-        return max(0.0, max((until - now for until in holds), default=0.0))
+        host = (
+            self._cooldown_until
+            if self._state is CoordinatorState.COOLDOWN and self._cooldown_until is not None
+            else now
+        )
+        return tuple(
+            max(0.0, max((self._method_until.get(method, now) for method in methods), default=now) - now, host - now)
+            for methods in scopes
+        )
 
     def bind_host(self, host: str) -> None:
         """Refuse to share a coordinator between distinct portal hosts."""
@@ -235,19 +285,25 @@ class RateCoordinator:
         self._host = host
 
     async def observe_throttle(self, delay: float, *, reason: str) -> float:
-        """Merge a throttle hint by the latest bounded monotonic deadline."""
+        """Hold the host for ``delay`` seconds (capped at an hour), merged by the latest deadline.
+
+        Returns how far it extended the hold: the seconds the host is held that it was not held before, so the
+        holds a burst of refusals asks for at once add up to the time the host was held, never more.
+        """
         if not math.isfinite(delay) or delay < 0:
             raise ValueError("cooldown delay must be a finite non-negative number")
         delay = min(delay, _RETRY_AFTER_CAP_SECONDS)
         if self._state is CoordinatorState.CLOSED:
             return 0.0
-        candidate = self._clock() + delay
+        now = self._clock()
+        held = now if self._cooldown_until is None else max(now, self._cooldown_until)
+        candidate = now + delay
         if self._cooldown_until is None or candidate > self._cooldown_until:
             self._cooldown_until = candidate
             self._cooldown_reason = reason
         self._state = CoordinatorState.COOLDOWN
         self._schedule_wake()
-        return max(0.0, self._cooldown_until - self._clock())
+        return max(0.0, candidate - held)
 
     async def close(self) -> None:
         """Reject queued and future admission, then cancel and await the cooldown wake task."""
@@ -295,22 +351,34 @@ class RateCoordinator:
     def _grant(self) -> None:
         if self._state is not CoordinatorState.OPEN:
             return
-        empty_visits = 0
-        while self._active < self._max_concurrency and empty_visits < len(self._cycle):
-            work_class = self._cycle[self._cycle_index]
-            self._cycle_index = (self._cycle_index + 1) % len(self._cycle)
-            queue = self._queues[work_class]
-            eligible = next(
-                (waiter for waiter in queue if not waiter.future.done() and self._methods_ready(waiter.methods)),
-                None,
-            )
-            if eligible is None:
-                empty_visits += 1
-                continue
-            empty_visits = 0
-            queue.remove(eligible)
+        while self._active < self._max_concurrency:
+            retry = self._eligible(WorkClass.RETRY)
+            first = None if retry is not None and self._retry_turn else self._next_first_send()
+            chosen = first or retry
+            if chosen is None:
+                return
+            self._retry_turn = chosen is first
+            work_class, waiter = chosen
+            self._queues[work_class].remove(waiter)
             self._active += 1
-            eligible.future.set_result(None)
+            waiter.future.set_result(None)
+
+    def _next_first_send(self) -> tuple[WorkClass, _Waiter] | None:
+        """Return the next eligible first send in the cycle's order, moving the cycle past it."""
+        for offset in range(len(self._cycle)):
+            position = (self._cycle_index + offset) % len(self._cycle)
+            eligible = self._eligible(self._cycle[position])
+            if eligible is not None:
+                self._cycle_index = (position + 1) % len(self._cycle)
+                return eligible
+        return None
+
+    def _eligible(self, work_class: WorkClass) -> tuple[WorkClass, _Waiter] | None:
+        waiter = next(
+            (each for each in self._queues[work_class] if not each.future.done() and self._methods_ready(each.methods)),
+            None,
+        )
+        return None if waiter is None else (work_class, waiter)
 
     def _methods_ready(self, methods: frozenset[str]) -> bool:
         now = self._clock()
@@ -351,4 +419,4 @@ class RateCoordinator:
                 self._refresh_cooldown()
                 self._grant()
                 continue
-            await asyncio.sleep(remaining)
+            await self._sleep(remaining)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 import asyncio
 import contextlib
+import dataclasses
 import gc
 import weakref
 from pathlib import Path
@@ -13,7 +14,7 @@ import pytest
 
 import b24api
 from b24api import execution as execution_module
-from b24api.contracts import Command
+from b24api.contracts import Command, CommandFailure
 from b24api.contracts.policy import ExecutionPolicy, RetryPolicy
 from b24api.contracts.request import ReplaySafety, Request, RouteKind
 from b24api.errors import (
@@ -37,17 +38,21 @@ from b24api.execution import (
     rearm_cancellation,
 )
 from b24api.execution.context import LatchState, OperationLatch, is_interrupt, settle
+from b24api.execution.facts import Execution, execution
 from b24api.execution.rate import (
     CoordinatorBudgetError,
     DeadlineBudget,
     RatePolicyCapacityError,
 )
+from b24api.testing import ScriptedTransport
+from b24api.transport import TransportCapabilities
 from b24api.transport import httpx as httpx_transport_module
 from tests.scripting import Blocker, ResponderTransport, client_for, replies
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Generator, Iterable
 
+    from b24api.transport import WireRequest
     from tests.scripting import ClientFactory, Responder
 
 EXPECTED_RETRIED_CALLS = 2
@@ -612,7 +617,9 @@ async def test_structured_throttle_uses_shared_cooldown_and_safe_replay() -> Non
 
 
 @pytest.mark.asyncio
-async def test_coordinator_merges_cooldowns_and_does_not_let_retries_starve_interactive() -> None:
+async def test_coordinator_merges_cooldowns_and_alternates_retries_with_first_sends() -> None:
+    # A retry's window runs while it queues, so it waits for one other permit at most; first sends still get every
+    # other turn, so retries never starve them.
     coordinator = RateCoordinator(max_concurrency=1)
     first = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"profile"}))
 
@@ -622,12 +629,13 @@ async def test_coordinator_merges_cooldowns_and_does_not_let_retries_starve_inte
     await asyncio.sleep(0)
     await first.release()
 
+    retry_permit = await asyncio.wait_for(retry_one, timeout=1)
+    assert not interactive.done()
+    assert not retry_two.done()
+    await retry_permit.release()
     interactive_permit = await asyncio.wait_for(interactive, timeout=1)
-    assert not retry_one.done()
     assert not retry_two.done()
     await interactive_permit.release()
-    retry_permit = await asyncio.wait_for(retry_one, timeout=1)
-    await retry_permit.release()
     second_retry_permit = await asyncio.wait_for(retry_two, timeout=1)
     await second_retry_permit.release()
 
@@ -703,8 +711,8 @@ async def test_permit_wait_is_bounded_without_counting_or_dispatching_an_attempt
 
 @pytest.mark.asyncio
 async def test_method_limit_blocks_only_affected_method_and_whole_batch() -> None:
-    coordinator = RateCoordinator(max_concurrency=1, operation_time_limit_delay=0.03)
-    await coordinator.observe_operation_time_limit("crm.item.list")
+    coordinator = RateCoordinator(max_concurrency=1)
+    coordinator.hold_method("crm.item.list", 0.03)
     blocked = asyncio.create_task(
         coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"crm.item.list"})),
     )
@@ -731,8 +739,8 @@ async def test_method_limit_blocks_only_affected_method_and_whole_batch() -> Non
 
 @pytest.mark.asyncio
 async def test_method_limit_admission_budget_and_closed_error_are_typed() -> None:
-    coordinator = RateCoordinator(operation_time_limit_delay=1)
-    await coordinator.observe_operation_time_limit("profile")
+    coordinator = RateCoordinator()
+    coordinator.hold_method("profile", 1.0)
     with pytest.raises(CoordinatorBudgetError):
         await coordinator.acquire(
             WorkClass.INTERACTIVE_DIRECT,
@@ -759,7 +767,9 @@ async def test_unsafe_operation_time_limit_waits_for_the_method_and_replays() ->
             WireResponse(200, (), b'{"result":true}'),
         ],
     )
-    coordinator = RateCoordinator(operation_time_limit_delay=0.1)
+    coordinator = RateCoordinator()
+    # The method's latest answer said its operating time resets in 0.1 seconds: the time limit holds it that long.
+    coordinator.observe_reset("crm.item.add", 0.1)
     loop = asyncio.get_running_loop()
     started = loop.time()
     response = await Executor(transport, coordinator=coordinator).execute(
@@ -780,20 +790,21 @@ _SAFE_PROFILE = Request("profile", route=RouteKind.BARE, replay_safety=ReplaySaf
 
 
 @pytest.mark.asyncio
-async def test_safe_operation_time_limit_past_the_budget_fails_at_once_with_its_cause() -> None:
+async def test_safe_operation_time_limit_past_the_budget_fails_at_once_with_its_own_code() -> None:
     transport = _sequence([_OPERATION_TIME_LIMIT, WireResponse(200, (), b'{"result":true}')])
     coordinator = RateCoordinator()
+    coordinator.observe_reset("profile", 120.0)
     loop = asyncio.get_running_loop()
     started = loop.time()
-    with pytest.raises(BudgetExceededError) as captured:
+    with pytest.raises(ApiResponseError) as captured:
         await Executor(transport, coordinator=coordinator).execute(
             _SAFE_PROFILE, policy=ExecutionPolicy(max_retry_elapsed_per_request=2.0)
         )
-    # The default 120-second method cooldown cannot fit a 2-second budget, so nothing waits.
+    # The method's operating time resets in 120 seconds, which a 2-second budget cannot wait: nothing waits, and
+    # the request ends with the server's refusal.
     assert loop.time() - started < 1.0
     assert len(transport.requests) == 1
-    assert isinstance(captured.value.__cause__, ApiResponseError)
-    assert captured.value.__cause__.normalized_code == "operation_time_limit"
+    assert captured.value.normalized_code == "operation_time_limit"
     await coordinator.close()
 
 
@@ -801,7 +812,8 @@ async def test_safe_operation_time_limit_past_the_budget_fails_at_once_with_its_
 async def test_safe_operation_time_limit_within_the_budget_retries_after_the_cooldown() -> None:
     cooldown = 0.2
     transport = _sequence([_OPERATION_TIME_LIMIT, WireResponse(200, (), b'{"result":true}')])
-    coordinator = RateCoordinator(operation_time_limit_delay=cooldown)
+    coordinator = RateCoordinator()
+    coordinator.observe_reset("profile", cooldown)
     loop = asyncio.get_running_loop()
     started = loop.time()
     response = await Executor(transport, coordinator=coordinator).execute(
@@ -816,41 +828,44 @@ async def test_safe_operation_time_limit_within_the_budget_retries_after_the_coo
 @pytest.mark.asyncio
 async def test_safe_traversal_page_operation_time_limit_keeps_its_typed_cause(scripted_client: ClientFactory) -> None:
 
-    transport = _sequence([_OPERATION_TIME_LIMIT])
+    # The server asks for two minutes, which a 2-second window cannot wait: the page ends with its refusal.
+    refusal = dataclasses.replace(_OPERATION_TIME_LIMIT, headers=(("retry-after", "120"),))
+    transport = _sequence([refusal])
     stream = scripted_client(transport).iter_list(
         Request("crm.item.list", route=RouteKind.BARE, replay_safety=ReplaySafety.SAFE),
         page_size=50,
         policy=ExecutionPolicy(max_retry_elapsed_per_request=2.0),
     )
-    with pytest.raises(BudgetExceededError) as captured:
+    with pytest.raises(ApiResponseError) as captured:
         _ = [row async for row in stream]
     assert len(transport.requests) == 1
-    assert isinstance(captured.value.__cause__, ApiResponseError)
-    assert captured.value.__cause__.normalized_code == "operation_time_limit"
+    assert captured.value.normalized_code == "operation_time_limit"
     assert stream.report is not None
     assert not stream.report.exhausted
 
 
 @pytest.mark.asyncio
-async def test_method_limit_repeated_signal_extends_deadline_and_capacity_is_explicit() -> None:
-    now = 100.0
-    default_delay = 120.0
+async def test_method_hold_repeated_extends_its_deadline_and_capacity_is_explicit() -> None:
+    now, hold = 100.0, 120.0
 
     def clock() -> float:
         return now
 
     coordinator = RateCoordinator(clock=clock)
-    assert await coordinator.observe_api_throttle("profile", "OPERATION_TIME_LIMIT") == default_delay
+    coordinator.hold_method("profile", hold)
     now += 30.0
-    assert await coordinator.observe_api_throttle("profile", "OPERATION_TIME_LIMIT") == default_delay
-    assert await coordinator.observe_api_throttle("profile", "SOME_OTHER_ERROR") == 0.0
+    coordinator.hold_method("profile", hold)
+    assert coordinator.admission_delay(frozenset({"profile"})) == hold
+    # A shorter hold never shortens a longer one.
+    coordinator.hold_method("profile", 1.0)
+    assert coordinator.admission_delay(frozenset({"profile"})) == hold
     for index in range(1_023):
-        await coordinator.observe_api_throttle(f"method.{index}", "OPERATION_TIME_LIMIT")
+        coordinator.hold_method(f"method.{index}", hold)
     with pytest.raises(RatePolicyCapacityError):
-        await coordinator.observe_api_throttle("overflow", "OPERATION_TIME_LIMIT")
+        coordinator.hold_method("overflow", hold)
     now += 121.0
     assert (await coordinator.snapshot()).method_cooldowns == 0
-    await coordinator.observe_api_throttle("overflow", "OPERATION_TIME_LIMIT")
+    coordinator.hold_method("overflow", hold)
     await coordinator.close()
 
 
@@ -881,6 +896,143 @@ async def test_socket_connect_and_post_dispatch_failures_have_distinct_phases() 
         assert not_dispatched.value.phase is FailurePhase.NOT_DISPATCHED
     finally:
         await dead_transport.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("safety", [ReplaySafety.UNSAFE, ReplaySafety.SAFE])
+async def test_an_attempt_timed_out_in_the_tls_handshake_is_not_sent_and_is_retried_whatever_its_safety(
+    safety: ReplaySafety,
+) -> None:
+    # The server accepts TCP and never answers the TLS handshake. Each attempt times out after the client's attempt
+    # timeout (Settings.http_timeout), however long the window of the policy passed beside it: no byte of the request
+    # left, so a write is retried as a read is, until its attempts run out, and nothing is unknown.
+    connections: list[asyncio.StreamWriter] = []
+
+    async def silent(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        connections.append(writer)
+
+    server = await asyncio.start_server(silent, "127.0.0.1", 0)
+    socket = server.sockets[0]
+    assert socket is not None
+    host, port = socket.getsockname()[:2]
+    settings = b24api.Settings(webhook_url=f"https://{host}:{port}/rest/1/token/", http_timeout=0.2)
+    policy = ExecutionPolicy(max_attempts_per_request=3, retry=RetryPolicy(initial_delay=0, jitter=0))
+    started = asyncio.get_running_loop().time()
+    try:
+        async with b24api.Bitrix24(settings, policy=policy) as client:
+            with pytest.raises(BudgetExceededError, match="attempt budget exhausted") as raised:
+                await client.call(Request("crm.deal.add", {"fields": {"TITLE": "x"}}, safety, route=RouteKind.BARE))
+    finally:
+        for writer in connections:
+            writer.close()
+        server.close()
+        await server.wait_closed()
+
+    assert len(connections) == policy.max_attempts_per_request
+    assert asyncio.get_running_loop().time() - started < policy.max_retry_elapsed_per_request / 10
+    cause = raised.value.__cause__
+    assert isinstance(cause, TransportError)
+    # TCP connected, the TLS handshake never completed: nothing of the request left, so it is no unknown outcome.
+    assert cause.phase is FailurePhase.CONNECTION_ESTABLISHED
+    assert cause.possible_acceptance is False
+    assert execution(raised.value) is Execution.ANSWERED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("safety", [ReplaySafety.UNSAFE, ReplaySafety.SAFE])
+@pytest.mark.parametrize("sent_as", ["call", "batch", "rest-v3-batch"])
+async def test_an_attempt_the_retry_window_cuts_in_the_tls_handshake_is_still_proven_not_sent(
+    safety: ReplaySafety, sent_as: str
+) -> None:
+    # As above, but the retry window closes long before the attempt timeout: the window's end cuts the attempt in
+    # the TLS handshake, where the transport knows that nothing of the request left. It is no unknown outcome, for a
+    # lone call as for a batch envelope's command.
+    connections: list[asyncio.StreamWriter] = []
+
+    async def silent(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        connections.append(writer)
+
+    server = await asyncio.start_server(silent, "127.0.0.1", 0)
+    socket = server.sockets[0]
+    assert socket is not None
+    host, port = socket.getsockname()[:2]
+    settings = b24api.Settings(webhook_url=f"https://{host}:{port}/rest/1/token/", http_timeout=5.0)
+    policy = ExecutionPolicy(max_retry_elapsed_per_request=0.3, retry=RetryPolicy(initial_delay=0, jitter=0))
+    route = RouteKind.API_V3 if sent_as == "rest-v3-batch" else RouteKind.BARE
+    request = Request("crm.deal.add", {"fields": {"TITLE": "x"}}, safety, route=route)
+    try:
+        async with b24api.Bitrix24(settings, policy=policy) as client:
+            if sent_as != "call":
+                # Two commands, so they go in one envelope rather than as a lone call.
+                outcomes = [each async for each in client.batch_outcomes([Command(request, 0), Command(request, 1)])]
+                assert all(isinstance(outcome, CommandFailure) for outcome in outcomes)
+                first = outcomes[0]
+                assert isinstance(first, CommandFailure)
+                refusal: BaseException = first.error
+            else:
+                with pytest.raises(BudgetExceededError) as raised:
+                    await client.call(request)
+                refusal = raised.value
+    finally:
+        for writer in connections:
+            writer.close()
+        server.close()
+        await server.wait_closed()
+
+    assert len(connections) == 1
+    assert isinstance(refusal, BudgetExceededError)
+    assert "retry time budget exhausted" in str(refusal)
+    cause = refusal.__cause__
+    assert isinstance(cause, TransportError)
+    assert cause.phase is FailurePhase.CONNECTION_ESTABLISHED
+    assert cause.possible_acceptance is False
+    assert execution(refusal) is Execution.ANSWERED
+
+
+class _SelfBoundedTransport(ScriptedTransport):
+    """Bounds its attempts itself, a little after their timeout, and proves that nothing of the request left."""
+
+    capabilities = dataclasses.replace(ScriptedTransport.capabilities, bounds_attempts=True)
+
+    def __init__(self) -> None:
+        super().__init__(())
+
+    async def send_wire(self, wire: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        del max_response_bytes
+        await asyncio.sleep(attempt_timeout + 0.05)
+        raise TransportError(
+            "Transport attempt timed out before dispatch",
+            phase=FailurePhase.CONNECTION_ESTABLISHED,
+            request_summary=wire.summary,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", [RouteKind.BARE, RouteKind.API_V3])
+@pytest.mark.parametrize("commands", [1, 2], ids=["call", "envelope"])
+async def test_the_executor_leaves_the_attempt_bound_to_a_transport_that_declares_it(
+    route: RouteKind, commands: int
+) -> None:
+    # The transport ends its attempt itself and says how far it got: the executor sets no deadline of its own that
+    # would cut it first and leave the request possibly run, for a lone call as for an envelope.
+    request = Request("crm.deal.add", {"fields": {"TITLE": "x"}}, ReplaySafety.UNSAFE, route=route)
+    policy = ExecutionPolicy(max_retry_elapsed_per_request=0.1, retry=RetryPolicy(initial_delay=0, jitter=0))
+    async with client_for(_SelfBoundedTransport(), policy=policy) as client:
+        outcomes = [each async for each in client.batch_outcomes([Command(request, i) for i in range(commands)])]
+
+    for outcome in outcomes:
+        assert isinstance(outcome, CommandFailure)
+        cause = outcome.error.__cause__
+        assert isinstance(cause, TransportError)
+        assert cause.phase is FailurePhase.CONNECTION_ESTABLISHED
+        assert execution(outcome.error) is Execution.ANSWERED
+
+
+def test_only_a_transport_that_declares_it_bounds_its_own_attempts() -> None:
+    assert TransportCapabilities().bounds_attempts is False
+    assert HttpxTransport.capabilities.bounds_attempts is True
+    with pytest.raises(TypeError, match="bounds_attempts"):
+        TransportCapabilities(bounds_attempts=1)  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio

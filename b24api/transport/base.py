@@ -72,6 +72,10 @@ class TransportCapabilities:
     # A top-level JSON array body (the native REST v3 batch envelope) is sent only to a transport that
     # declares it: ``send_wire`` must serialize ``WireRequest.array_body`` instead of named parameters.
     json_array_body: bool = field(default=False, kw_only=True)
+    # A transport that ends each attempt by its ``attempt_timeout`` itself, and classifies that timeout by how far
+    # the attempt got (proven not sent before dispatch), declares it: the executor then sets no deadline of its own
+    # around the attempt, whose expiry could not tell a request never sent from one that may have run.
+    bounds_attempts: bool = field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
         """Validate and freeze advertised capabilities."""
@@ -89,6 +93,8 @@ class TransportCapabilities:
             raise TypeError("positional_json must be a bool")
         if not isinstance(self.json_array_body, bool):
             raise TypeError("json_array_body must be a bool")
+        if not isinstance(self.bounds_attempts, bool):
+            raise TypeError("bounds_attempts must be a bool")
 
 
 @dataclass(frozen=True, slots=True, init=False)
