@@ -381,8 +381,8 @@ outcome.
   is never secondary. Only an `Exception` is a failure (`InputSourceError`, `BatchFailed`,
   `ReferenceFailed` or a failure outcome, whose error carries it by one rule, `outcome_error`): every catch
   site that decides a failure catches `Exception`. Any other `BaseException` but an interrupt or a
-  cancellation is no failure and nothing classifies, wraps or ranks it; it propagates as Python propagates
-  it. One piece of state carries every such escape (`is_escape`: an interrupt, or any other
+  cancellation is no failure: no catch site classifies it as one, wraps or ranks it; it propagates as Python
+  propagates it. The report still records that it ended the operation, in a form that is not promised. One piece of state carries every such escape (`is_escape`: an interrupt, or any other
   `BaseException` but a cancellation and a `GeneratorExit`): each operation has one `OperationLatch`, the
   isolated runner's, which its pull and cleanup tasks publish through `OPERATION_LATCH` so the tasks they
   start inherit it (an inline kernel uses the latch of the runner it serves). Every library site that
@@ -402,9 +402,16 @@ outcome.
   other escape stays undelivered until an end raises it. The end raises the interrupt, or else the first
   undelivered escape, once, as from a `finally`, ahead of whatever else would leave
   (`OperationRunner._raise_latched`, `OperationLatch.close`): the read whose end it is, or the close when no
-  read got it. A read a concurrent close ended never raises it (that close took it): the read ends as the
-  close's cancellation of it would. Only the owner's end raises it: an inline kernel's ends as it would
-  otherwise. A reference binding that ends in one ends its task in it and puts `_EndedEvent` in its queue
+  read got it. A read a concurrent close ended raises no other escape (that close took it): the read ends as
+  the close's cancellation of it would, in its reader's own cancellation when its task was cancelled too. The
+  interrupt, which every end raises, it raises too once the end is published, in place of that cancellation
+  (as from a `finally`) when the end is published within its reader's grace; a reader whose grace ran out
+  first raises its cancellation, and the close the interrupt. A close whose coroutine is closed while it runs
+  the end (`GeneratorExit`), or a read's closed in its pull (`OperationRunner._abandon_read`), can raise nothing: a task of the runner's own finishes the end
+  (`OperationRunner._end_handed_over`) and hands what it raises to the event loop, as an end between reads
+  does (`OperationLatch.close_to_loop`): the interrupt leaves `asyncio.run` unless a read that close ended
+  waits for the end and raises it, and any other escape goes to the loop's exception handler. Only the
+  owner's end raises it: an inline kernel's ends as it would otherwise. A reference binding that ends in one ends its task in it and puts `_EndedEvent` in its queue
   (`ReferenceScheduler._end_binding`), only so that a read reaches the binding's place instead of waiting for
   an end that never comes; it raises the task's end there (`_finish_task`). That put, as any terminal event's,
   never waits: under INPUT each binding's queue is its own and unbounded; under READY the shared queue holds
@@ -510,10 +517,22 @@ outcome.
   as pending only a cancellation requested after it began, so a call made in the cleanup of a
   cancelled task is sent, while a later cancellation still ends it, even when a foreign transport
   suppressed it into a response or a failure. An isolated pull that absorbs its reader's
-  cancellation by failing in cleanup hands the cancellation back to the reader's next await. A
-  stream's close and cleanup defer a cancellation only for the operation's cleanup window (what is
-  left of `max_elapsed`, at least the cleanup grace); cleanup still running then finishes in the
-  background and the report records it as failed.
+  cancellation by failing in cleanup hands the cancellation back to the reader's next await (on
+  Python 3.13 and later armed at once; on 3.12, which cannot disarm a cancellation `uncancel` takes
+  back, decided at that await, so a task that returns first ends with what it returned). A stream's
+  close and cleanup, and the client's close, defer a cancellation only for the cancellation grace
+  (`CANCEL_GRACE_SECONDS`, one second from when the first cleanup defers that cancellation, so the
+  closes one cancellation unwinds share one grace; an `async with` exit whose body the cancellation ended
+  holds it from the start). The grace belongs to the `CancelledError` that passes through the exits: so does the
+  cancellation a cancelled pull ends in, and a second cancellation that arrives while a grace runs ends with
+  it. A cancellation a close replays behind the exception that leaves instead is a new delivery (asyncio gives
+  a replay no identity a later exit could match), so each exit it reaches defers it for a grace of its own;
+  cleanup still running then
+  finishes in the background, the report records it as a cleanup failure behind the cancellation,
+  and the cancellation, which caused the overrun, is what the close raises. Every wait for an end is
+  such a wait, whoever runs that end: a cancelled read's wait for its pull, a read or close that
+  joins another caller's close, and an exit that joins it. A close that joins an end nobody cancelled
+  also waits for the cleanup that end left running, as a close after it does.
 - Caller code a stream's read or cleanup runs (a page-stop callback, an async command, binding or
   reference source, an injected transport, or a task one of them starts) cannot close that stream
   or its client while the read or cleanup is in progress, nor at all on a reference-scheduler

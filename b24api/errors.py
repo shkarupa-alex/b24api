@@ -476,7 +476,9 @@ class CleanupOverrunError(BudgetExceededError):
     outlasts that window raises this from ``aclose()`` or the ``async with`` exit when nothing else ended the
     operation, and is reported as a ``cleanup_failure``. It refused no work: unlike any other
     ``BudgetExceededError``, it never records the operation's refusal, and a caller's cancellation outranks it
-    (the ``CancelledError`` propagates, the overrun is recorded behind it).
+    (the ``CancelledError`` propagates, the overrun is recorded behind it). A cancelled close stops waiting after
+    the cancellation grace (``CANCEL_GRACE_SECONDS``): that overrun is the cancellation's doing, so the close always
+    raises the cancellation and only the report records the overrun.
     """
 
 
@@ -598,6 +600,20 @@ class InputSourceError(B24ApiError):
     default_origin = ErrorOrigin.CAPABILITY
 
 
+class StreamClosedError(B24ApiError):
+    """A stream was closed, by another task or by its client, while this read of it was in progress.
+
+    The read ends without an item: the close ended the stream first. It carries the stream's report as ``.report``.
+    A read that starts after the stream ended raises ``StopAsyncIteration`` instead, as any read of an ended stream.
+    """
+
+    default_origin = ErrorOrigin.CAPABILITY
+
+    def __init__(self, message: str = "stream was closed while this read was in progress") -> None:
+        """Name the close that ended the read."""
+        super().__init__(message)
+
+
 class BatchFailed[C](B24ApiError):  # noqa: N818 - normative public name
     """Bounded fail-fast batch window plus its final report."""
 
@@ -646,6 +662,7 @@ __all__ = (
     "ResponseTooLargeError",
     "ResultShapeError",
     "ResultTooLargeError",
+    "StreamClosedError",
     "TransportError",
     "ValidationIssue",
 )

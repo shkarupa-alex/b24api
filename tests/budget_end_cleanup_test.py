@@ -948,13 +948,12 @@ async def test_a_close_before_the_first_pull_is_bounded_by_the_cleanup_window(fa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("family", "public"),
-    [("iter_reference_outcomes", InputSourceError), ("fan_out_outcomes", InputSourceError), ("fan_out", BatchFailed)],
-)
-async def test_a_close_after_the_source_failed_in_the_read_ahead_raises_a_public_error(
-    family: str, public: type[Exception]
+@pytest.mark.parametrize("family", ["iter_reference_outcomes", "fan_out_outcomes", "fan_out"])
+async def test_a_close_after_the_source_failed_in_the_read_ahead_ends_the_stream_before_that_failure(
+    family: str,
 ) -> None:
+    # The reader leaves after its first item; the source failed in the read-ahead, after that item. The close ends
+    # the stream before the reader reached the failure, as before an unread binding's: no failure of the close.
     failed = asyncio.Event()
 
     async def items() -> AsyncIterator[Any]:
@@ -970,17 +969,12 @@ async def test_a_close_after_the_source_failed_in_the_read_ahead_raises_a_public
             )
         else:
             stream = getattr(client, family)(items(), dispatch=dispatch)
-        with pytest.raises(public) as caught:
-            await _break_once(stream, failed)
+        await _break_once(stream, failed)
 
-    assert not type(caught.value).__name__.startswith("_")
     report = stream.report
     assert report is not None
     assert report.state is TerminalState.EARLY_CLOSED
-    # The report names the public failure too, never the private one that carried it. Nothing ended the stream
-    # before the close that raised it, so the close is what failed.
-    assert report.terminal_reason == "stream cleanup failed"
-    assert [violation.message for violation in report.violations] == ["stream cleanup failed (InputSourceError)"]
+    assert report.violations == ()
 
 
 @pytest.mark.parametrize("secondary", [False, True])
@@ -999,7 +993,7 @@ async def _break_once(stream: OperationStream[Any], failed: asyncio.Event) -> No
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("family", ["iter_reference_outcomes", "iter_reference_source_outcomes"])
-async def test_a_read_the_client_closes_raises_its_source_failure_as_a_public_error(family: str) -> None:
+async def test_a_read_the_client_closes_raises_its_sources_earlier_failure_as_a_public_error(family: str) -> None:
     failed = asyncio.Event()
 
     async def items() -> AsyncIterator[Any]:
@@ -1023,13 +1017,14 @@ async def test_a_read_the_client_closes_raises_its_source_failure_as_a_public_er
             await reached(failed)
             await reached(blocker.started)
 
-    # Closing the client closed the stream under the read; the close ended in the source's failure, so the client's
-    # close raises it, as for a stream with no read in flight, and so does the read the close ended.
-    with pytest.raises(InputSourceError) as closed:
-        await close_the_client_under_the_read()
+    # Closing the client closed the stream under the read, which waited for the binding admitted before the source
+    # failed: that failure came first, so it is the read's, and the client's close returns quietly.
+    await close_the_client_under_the_read()
     with pytest.raises(InputSourceError) as caught:
         await asyncio.wait_for(reads[0], timeout=HANG_BOUND)
-    assert caught.value is closed.value
+    report = getattr(caught.value, "report", None)
+    assert report is not None
+    assert report.state is TerminalState.FAILED
     assert not type(caught.value).__name__.startswith("_")
     # It chains straight from the source's own exception, with no private carrier between them.
     assert type(caught.value.__cause__) is RuntimeError

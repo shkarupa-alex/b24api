@@ -209,7 +209,9 @@ class OwnedSource[T](AsyncIterator[T]):
             return await self._run_step(anext(iterator, EXHAUSTED))
         if self._inline:
             return _next_or_exhausted(iterator)
-        return await _finish_in_thread(functools.partial(self._run_in_context, _next_or_exhausted, iterator))
+        return await _finish_in_thread(
+            functools.partial(self._run_in_context, WORK_OWNERS.get(), _next_or_exhausted, iterator)
+        )
 
     async def aclose(self) -> CleanupResult:
         """Close the caller iterator once; every call returns the same outcome and none raises."""
@@ -224,7 +226,7 @@ class OwnedSource[T](AsyncIterator[T]):
                 if isinstance(iterator, AsyncClosable):
                     await self._run_step(iterator.aclose())
             elif isinstance(iterator, SyncClosable):
-                await _finish_in_thread(functools.partial(self._run_in_context, iterator.close))
+                await _finish_in_thread(functools.partial(self._run_in_context, WORK_OWNERS.get(), iterator.close))
         except Exception as error:
             # The caller's close failing is its source failing, mapped as a failed pull is.
             if self._failure is None:
@@ -240,9 +242,15 @@ class OwnedSource[T](AsyncIterator[T]):
         self._context.run(WORK_OWNERS.set, WORK_OWNERS.get())
         return await _in_context(step, self._context)
 
-    def _run_in_context[R](self, call: Callable[..., R], *args: object) -> R:
-        """Run ``call`` in the source's context in a worker thread, after any call still running there returns."""
+    def _run_in_context[R](self, owners: tuple[object, ...], call: Callable[..., R], *args: object) -> R:
+        """Run ``call`` in the source's context in a worker thread, after any call still running there returns.
+
+        The context is given ``owners``, the work marker (``WORK_OWNERS``) of the task driving the step, as an
+        asynchronous source's step is (``_run_step``): a close the source requests of its own stream from its worker
+        thread (handing it to the event loop) is refused, never left waiting for the very step that requested it.
+        """
         with self._context_lock:
+            self._context.run(WORK_OWNERS.set, owners)
             return self._context.run(call, *args)
 
 

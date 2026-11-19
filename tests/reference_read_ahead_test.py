@@ -39,6 +39,7 @@ from b24api.contracts import (
     ReferenceFailure,
     ReferenceItem,
 )
+from b24api.errors import BudgetExceededError
 from tests.scripting import HANG_BOUND, BatchPortal, VirtualClock, client_for, on_loop
 
 if TYPE_CHECKING:
@@ -98,10 +99,12 @@ async def _traverse(  # noqa: PLR0913 - one scenario's knobs
     turns: int = WIRE_TURNS,
     page_stop: PageStopPolicy | None = None,
     consumed: Counter[int] | None = None,
+    budget_end: bool = False,
 ) -> tuple[list[ReferenceOutcome[int]], OperationReport, BatchPortal]:
     """Drain one reference traversal over ``parents`` bindings; fail rather than hang past ``HANG_BOUND``.
 
-    ``consumed`` counts each binding's rows as the consumer receives them.
+    ``consumed`` counts each binding's rows as the consumer receives them. With ``budget_end`` the stream must end
+    with the operation's budget (``BudgetExceededError``), and what it delivered before is returned.
     """
     portal = _portal(pages, turns)
     bindings = on_loop(
@@ -116,11 +119,17 @@ async def _traverse(  # noqa: PLR0913 - one scenario's knobs
             page_stop=page_stop,
         )
         events: list[ReferenceOutcome[int]] = []
-        async with asyncio.timeout(HANG_BOUND), stream:
-            async for event in stream:
-                events.append(event)
-                if consumed is not None and isinstance(event, ReferenceItem):
-                    consumed[event.binding_index] += 1
+        try:
+            async with asyncio.timeout(HANG_BOUND), stream:
+                async for event in stream:
+                    events.append(event)
+                    if consumed is not None and isinstance(event, ReferenceItem):
+                        consumed[event.binding_index] += 1
+        except BudgetExceededError:
+            if not budget_end:
+                raise
+        else:
+            assert not budget_end, "the stream did not end with the operation's budget"
     report = stream.report
     assert report is not None
     return events, report, portal
@@ -221,16 +230,15 @@ async def test_input_completes_within_a_request_budget_ready_needs_little_more_t
 async def test_pages_read_ahead_never_outrun_the_page_budget(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
     """Reading ahead spends logical pages before the consumer reaches them, never past ``max_pages``.
 
-    Each binding the budget stops fails with its rows so far, still in binding order: its next page
-    exceeds the budget, or a counted tail the rest of the budget cannot hold is refused.
+    The page the budget refuses ends the operation, as a refused request does: the rows delivered before it are
+    each binding's own, still in binding order.
     """
     VirtualClock().install(monkeypatch)
     policy = ExecutionPolicy(max_buffered_rows=POOL, max_pages=100)
-    events, report, portal = await _traverse(DeliveryOrder.INPUT, TRAVERSALS[name], policy=policy)
+    events, report, portal = await _traverse(DeliveryOrder.INPUT, TRAVERSALS[name], policy=policy, budget_end=True)
 
-    assert sum(portal.waves) == report.logical_pages == policy.max_pages
-    failures = [event for event in events if isinstance(event, ReferenceFailure)]
-    assert failures
+    assert sum(portal.waves) == report.logical_pages <= policy.max_pages
+    assert report.state is TerminalState.INCOMPLETE
     order = [event.correlation for event in events]
     assert order == sorted(order)
     rows = _rows(events)

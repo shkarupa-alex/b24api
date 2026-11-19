@@ -970,7 +970,11 @@ assert page.report.partial
 ```
 
 Helpers do not pull an extra row just to prove exhaustion. Reaching a requested limit is therefore
-`EARLY_CLOSED`, never a false `COMPLETED`. Cancellation and cleanup preserve the primary exception
+`EARLY_CLOSED`, never a false `COMPLETED`. When the stream fails, the error a helper raises carries the
+items it read before the failure as `partial_values`. A client serves the event loop it was first used
+in. A call, a stream's first read or the client's close from another loop raises `RuntimeError` before it
+reads a source or sends a request, and the client stays open: create one client per event loop, and close it there. A started stream stays the
+client's until it ends, so a stream the application drops is still closed with its client. Cancellation and cleanup preserve the primary exception
 and publish the same final report where the Python exception type permits it.
 
 ## Resource boundaries
@@ -1004,6 +1008,8 @@ the stream. Nothing interrupts the application when the budget runs out meanwhil
 point ends the operation, even when all that is left is to read the end of the source. Once that end
 was read, a deadline that passes while the application holds control ends nothing. A deadline that ends the
 operation leaves the report `incomplete`, with `BudgetExceededError` as its terminal reason and a `budget_exhausted` violation.
+The operation's page budget (`max_pages`) ends it the same way once it refuses a page, as `max_requests`
+does once it refuses a send: the source is not read further.
 The stream raises a plain `BudgetExceededError`, except that a fail-fast stream whose stop failed a
 command or a binding raises its wrapper (`BatchFailed` or `ReferenceFailed`, whose report carries that
 reason). A stop at a source pull or at the end-of-source check fails none by itself, but `batch()` and
@@ -1033,9 +1039,20 @@ ended it, the close raises `b24api.errors.CleanupOverrunError`, a `BudgetExceede
 no work, and the report is the one a close that raised any other error gets, with no
 `budget_exhausted`: after `break` or an early `aclose()`, `early_closed` with the terminal reason
 "stream cleanup failed"; on a stream read to its end, `failed`. Either way its `cleanup_failure`
-violation names `CleanupOverrunError`. A cancellation is
-that error only when it came first: a consumer cancelled before the budget or a failure ended the
-stream receives its `CancelledError`, with a `cancelled` report, even when the close then overruns.
+violation names `CleanupOverrunError`. A cancelled read, close or `async with` exit (an exit whose body a
+cancellation ended, Ctrl-C included, counts as cancelled) waits for cleanup only one second, not for
+what is left of `max_elapsed`, and one cancellation is deferred for one second in all, however many exits
+it unwinds (the stream's, then the client's), and a second cancellation
+during that second ends with it. An exit that must raise another exception in its place (the body's own, or
+a failed read or close) replays the cancellation at the task's next `await`: the replay is a new delivery,
+and each exit it then reaches waits at most one second more. Cleanup still running then
+goes on in the background, and the close raises the cancellation, which caused that overrun, with the
+overrun recorded behind it ("stream cleanup also failed (CleanupOverrunError)"); `client.aclose()` does the
+same, and so do `collect()` and `first()`, which close as an `async with` exit does. A close nobody cancelled
+waits for its cleanup, so `finally: await stream.aclose()` after a cancelled read waits for all of it: close
+with `async with stream` to keep the grace. A cancellation outranks the budget's error or a failure only when it came first: a consumer
+cancelled before the budget or a failure ended the stream receives its `CancelledError`, with a
+`cancelled` report, even when the close then overruns.
 One cancelled after them, while the cleanup waits, receives the budget's error (or the failure), with
 an `incomplete` (or `failed`) report, and the cancellation is delivered at its next `await`. A stream
 closed before its first pull closes its source the same way. A synchronous source is pulled and closed in worker threads, in
@@ -1078,10 +1095,11 @@ is, whether your transport raised it in your read or between your reads (in the 
 or your source's pull or close did; the source is closed once; nothing hangs waiting for an end it took
 the place of; and it is never lost silently: when no read got it (you closed the stream between reads, or
 the close cancelled the send or the pull that raised it), the close raises it, once. A read the close ends
-in another task raises `CancelledError`. One delivered to a read or a close never reaches the event loop's
+in another task raises `b24api.errors.StreamClosedError`. One delivered to a read or a close never reaches the event loop's
 exception handler and is never left in a task whose exception nobody retrieves; one the library could no
-longer deliver to a read or a close (raised by work that outlived the stream's cleanup window, or a second
-one behind what the close already raises) is reported to the loop's exception handler, once, with the
+longer deliver to a read or a close (raised by work that outlived the stream's cleanup window, a second
+one behind what the close already raises, or one a close or a read could not raise because its coroutine was
+closed while it ran the stream's end) is reported to the loop's exception handler, once, with the
 stream's report as `report`. So is one of a stream nothing ever ends (left open when `asyncio.run` shuts
 down, or dropped): as asyncio reports a task's exception nobody retrieved, it is reported once the
 stream's work is collected, on a closed loop too. What the report says about it, and how it ranks behind
@@ -1101,17 +1119,25 @@ there is no report, only when nothing closes it: you never close the stream nor 
 `asyncio.run` was already shutting down (your main coroutine had returned) when the interrupt was raised.
 The interrupt leaves `asyncio.run` in every case. An
 interrupt raised after the operation ended (by a close or a send still running past the cleanup window) is
-never dropped either: it leaves the event loop the same way, unless the stream already raised one. A stream
+never dropped either: it leaves the event loop the same way, unless the stream already raised one. So does
+one that ends a close or a read whose coroutine was closed while it ran the stream's end, unless a read that
+close ended raises it. A stream
 raises one interrupt at most; a second one is reported to the loop's exception handler, like any escape the
 stream could no longer deliver, so it never stops the loop again while you unwind from the first. A library
 error carries this in its report (`error.report`), not as a note; your own exception raised inside
 `async with stream` stays what is raised and carries one note, the report's `cleanup_failure` violation
 word for word. Once the
 stream ends, its source is closed, even when the stream's own tasks outlast the cleanup window. A close from
-another task while a read is in flight is an early close: the read it ends raises `CancelledError`, or
-the close's failure when the close failed (an interrupt included), which the close raises too. A
-stream its reader's cancellation ended reports `cancelled` with the terminal reason "iteration
-cancelled", whatever its source had reached. `report.emitted` counts the items the reader got.
+another task while a read is in flight is an early close: the read it ends raises `StreamClosedError`,
+which carries the report as `.report`, or the close's failure when the close failed (an interrupt
+included), which the close raises too. A reader whose own task is cancelled gets its `CancelledError`,
+unless an interrupt ends the stream within the one second its read waits for the close: then it gets the
+interrupt, which the close raises too.
+A close from another task while a failed read cleans up returns quietly; the read raises its failure. A
+close ends the stream before failures no read reached, a source's failure in the read-ahead included:
+it returns, and the report is `early_closed`. A stream its reader's cancellation ended reports
+`cancelled` with the terminal reason "iteration cancelled", whatever its source had reached.
+`report.emitted` counts the items the reader got.
 
 Sequential, counted, and multi-reference exact traversal retain at most `max_identity_keys`
 observed identities per operation in memory (100,000 by default). All active reference bindings

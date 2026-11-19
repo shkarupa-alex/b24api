@@ -3,9 +3,8 @@
 # ruff: noqa: SLF001 - class-owned alternate construction
 
 from __future__ import annotations
-import asyncio
+import functools
 import warnings
-import weakref
 from typing import TYPE_CHECKING, Self, cast
 
 from b24api._client_traversal import _TraversalFacade
@@ -33,8 +32,15 @@ from b24api.execution import (
     await_cleanup_resistant,
     rearm_cancellation,
 )
-from b24api.execution.cleanup import OwnedStream, close_owned_resources
-from b24api.execution.context import Settled, spawn_settled
+from b24api.execution.cleanup import OwnedStream, StreamRegistry, close_owned_resources
+from b24api.execution.context import (
+    CANCEL_GRACE_SECONDS,
+    Settled,
+    outside_operation_work,
+    own_cancellation,
+    spawn_settled,
+)
+from b24api.execution.lifecycle import close_on_exit
 from b24api.redaction import Redactor, secret_values
 from b24api.references.facade import reference_stream
 from b24api.references.fanout import CommandSource as FanOutCommandSource
@@ -46,6 +52,7 @@ from b24api.transport.protocol import ProtocolCodec
 from b24api.traversal.keyset_verifier import verify_keyset_capability as _verify_keyset_capability
 
 if TYPE_CHECKING:
+    import asyncio
     from collections.abc import AsyncIterable, Iterable
     from types import TracebackType
 
@@ -120,7 +127,7 @@ class Bitrix24(_TraversalFacade):
         self._closed = False
         self._unknown_request_audit = unknown_request_audit
         self._close_task: asyncio.Task[Settled[None]] | None = None
-        self._streams: weakref.WeakSet[OwnedStream] = weakref.WeakSet()
+        self._streams = StreamRegistry()
 
     @classmethod
     def from_webhook(
@@ -165,7 +172,7 @@ class Bitrix24(_TraversalFacade):
         instance._closed = False
         instance._unknown_request_audit = unknown_request_audit
         instance._close_task = None
-        instance._streams = weakref.WeakSet()
+        instance._streams = StreamRegistry()
         return instance
 
     @property
@@ -184,38 +191,53 @@ class Bitrix24(_TraversalFacade):
         primary: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Close owned work; a failed or cancelled close never replaces a primary body exception.
+        """Close owned work as a stream's ``async with`` does (``close_on_exit``): the body's exception stays primary.
 
+        A cancellation the close absorbed lands on the next await; a failed close is noted on the body's exception.
         Anything else the close raises, an escape (``is_escape``: an interrupt, or any other ``BaseException`` that is
-        no failure), replaces it as from a ``finally``, with the body's exception as its context.
+        no failure), replaces it, as from a ``finally``, with the body's exception as its context.
         """
-        try:
-            await self.aclose()
-        except (Exception, asyncio.CancelledError) as cleanup_error:
-            if primary is not None:
-                raise primary.with_traceback(traceback) from cleanup_error
-            raise
+        del traceback
+        # A body its task's cancellation ended (Ctrl-C under ``asyncio.run``) exits through a cancelled close.
+        cancelled = own_cancellation(primary)
+        await close_on_exit(
+            functools.partial(self._close, cancelled=cancelled),
+            primary,
+            note=lambda failure: f"client close also failed ({type(failure).__name__})",
+        )
 
     async def aclose(self) -> None:
         """Close active streams, the owned rate coordinator and the owned transport idempotently.
 
-        A close requested from inside the pull or cleanup of one of this client's streams is refused,
-        leaving the client open, because closing that stream would wait for the code that requested it.
+        A close from an event loop other than the one the client's work started on raises ``RuntimeError`` and leaves
+        the client open: its streams and connections belong to that loop. A close requested from inside the work of
+        one of this client's streams is refused, leaving the client open,
+        because closing that stream would wait for the code that requested it. That is decided once, before anything
+        changes: the close then runs outside the caller's work, so no stream it closes judges it again later. A
+        cancelled close raises its cancellation once the close ends or the cancellation grace does, whichever comes
+        first; a close still running then goes on in the background, and a later ``aclose()`` waits for it.
         """
+        await self._close(cancelled=None)
+
+    async def _close(self, *, cancelled: asyncio.CancelledError | None) -> None:
+        """Close as ``aclose`` does; ``cancelled``: the cancellation its caller holds already, whose grace runs now."""
         if self._close_task is not None and self._close_task.done():
             return
-        if any(stream.inside_own_work for stream in tuple(self._streams)):
+        self._executor.coordinator.check_loop()
+        if any(stream.inside_own_work for stream in self._streams.snapshot()):
             raise RuntimeError("client cannot be closed from inside the pull or cleanup of one of its streams")
         if self._close_task is None:
             self._closed = True
             self._close_task = spawn_settled(
-                close_owned_resources(tuple(self._streams), self._owned_transport, self._owned_coordinator),
+                close_owned_resources(self._streams.snapshot(), self._owned_transport, self._owned_coordinator),
+                context=outside_operation_work(),
             )
-        cleanup = await await_cleanup_resistant(self._close_task)
-        if cleanup.error is not None:
+        cleanup = await await_cleanup_resistant(self._close_task, grace=CANCEL_GRACE_SECONDS, cancelled=cancelled)
+        if cleanup.error is not None and cleanup.unfinished is None:
             rearm_cancellation(cleanup.cancellation)
             raise cleanup.error
         if cleanup.cancellation is not None:
+            # A close the grace stopped waiting for overran it because of this cancellation, which leaves instead.
             raise cleanup.cancellation
 
     async def call(self, request: RequestLike, *, policy: ExecutionPolicy | None = None) -> JsonValue:

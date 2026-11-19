@@ -33,11 +33,19 @@ from b24api import (
     TerminalState,
 )
 from b24api.contracts import Command, ContinuePage, PageBoundary, ReferenceSource
-from b24api.errors import BatchFailed, BudgetExceededError, InputSourceError, ReferenceFailed, TransportError
+from b24api.errors import (
+    BatchFailed,
+    ClientClosedError,
+    InputSourceError,
+    ReferenceFailed,
+    StreamClosedError,
+    TransportError,
+)
+from b24api.execution.context import CANCEL_GRACE_SECONDS
 from tests.scripting import HOST, ResponderTransport
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
+    from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator
 
     from b24api.contracts.stream import OperationStream
 
@@ -46,6 +54,8 @@ if TYPE_CHECKING:
 HANG_LIMIT = 10.0
 ROWS = (1, 2, 3, 4, 5, 6)
 PATHS = ("page_stop", "reference_page_stop", "binding_source", "reference_sources", "batch", "fan_out", "transport")
+# The grace a cancelled close waits, as documented: one second.
+_DOCUMENTED_GRACE = 1.0
 _REFUSALS = {
     "stream": "a stream cannot be closed from inside its own pull or cleanup",
     "client": "client cannot be closed from inside the pull or cleanup of one of its streams",
@@ -291,30 +301,39 @@ class _StubbornStop:
         return ContinuePage.CONTINUE
 
 
-def test_a_cancelled_close_stops_waiting_for_a_stuck_pull_at_the_operation_deadline() -> None:
-    # The operation budget bounds how long a close defers its caller's cancellation: the close of a
-    # pull stuck in caller code that swallows cancellation ends at the deadline with the cleanup
-    # reported as failed, and the cleanup it left behind still finishes once the pull lets go.
+def test_a_cancelled_close_stops_waiting_for_a_stuck_pull_after_the_cancel_grace() -> None:
+    # The cancellation grace, not the operation budget, bounds how long a close defers its caller's
+    # cancellation: the close of a pull stuck in caller code that swallows cancellation raises the
+    # cancellation after the grace, although most of the hour-long budget is left. The cancellation came
+    # first, so the overrun is a secondary violation on the early close, and the cleanup it left behind
+    # still finishes once the pull lets go.
     async def scenario() -> None:
         portal = _Portal()
         stop = _StubbornStop()
-        client = _client(portal, ExecutionPolicy(max_elapsed=3.0))
+        client = _client(portal, ExecutionPolicy(max_elapsed=3600.0))
+        loop = asyncio.get_running_loop()
         stream = client.iter_list(_listing(), page_size=2, page_stop=stop)
         reader = asyncio.create_task(_drain(stream))
         try:
             await stop.entered.wait()
             closer = asyncio.create_task(stream.aclose())
             await asyncio.sleep(0)
+            cancelled_at = loop.time()
             closer.cancel()
             (closed,) = await asyncio.gather(closer, return_exceptions=True)
+            waited = loop.time() - cancelled_at
         finally:
             stop.release.set()
-        assert isinstance(closed, BudgetExceededError), closed
+        assert type(closed) is asyncio.CancelledError, closed
+        assert CANCEL_GRACE_SECONDS == _DOCUMENTED_GRACE
+        assert _DOCUMENTED_GRACE <= waited < _DOCUMENTED_GRACE + 1.0, waited
         report = stream.report
         assert report is not None
         assert report.state is TerminalState.EARLY_CLOSED
-        assert report.terminal_reason == "stream cleanup failed"
-        assert "cleanup_failure" in [violation.code for violation in report.violations]
+        assert report.terminal_reason == "stream closed before exhaustion"
+        assert [(violation.code, violation.message) for violation in report.violations] == [
+            ("cleanup_failure", "stream cleanup also failed (CleanupOverrunError)")
+        ]
         await asyncio.gather(reader, return_exceptions=True)
         # The cleanup left in the background ends too: nothing but this scenario is left running.
         while others := asyncio.all_tasks() - {asyncio.current_task()}:
@@ -324,6 +343,11 @@ def test_a_cancelled_close_stops_waiting_for_a_stuck_pull_at_the_operation_deadl
         await client.aclose()
 
     _bounded(scenario)
+
+
+async def _collect_into(rows: list[Any], stream: OperationStream[Any]) -> None:
+    async for row in stream:
+        rows.append(row)  # noqa: PERF401 - the rows read before the read that fails are kept
 
 
 async def _drain(stream: OperationStream[Any]) -> None:
@@ -399,6 +423,48 @@ def test_a_detached_task_started_by_caller_code_cannot_close_the_stream_while_a_
     _bounded(scenario)
 
 
+@pytest.mark.parametrize("turns", range(4))
+def test_a_task_started_by_a_page_stop_cannot_close_the_stream_whatever_turn_it_tries_in(turns: int) -> None:
+    # The handoff from a pull to its reader is the stream's own work as the pull is: a close from a task the page stop
+    # started is refused while the stream reads, in whichever turn of the loop it comes, and the reader reads on.
+    async def scenario() -> None:
+        outcome: list[str] = []
+        stream: OperationStream[Any] | None = None
+
+        async def close_later() -> None:
+            for _turn in range(turns):
+                await asyncio.sleep(0)
+            assert stream is not None
+            try:
+                await stream.aclose()
+            except RuntimeError as error:
+                outcome.append(str(error))
+            else:
+                outcome.append("closed")
+
+        class _StartCloser:
+            def __init__(self) -> None:
+                self.closer: asyncio.Task[None] | None = None
+
+            async def on_page(self, boundary: PageBoundary) -> ContinuePage:
+                del boundary
+                if self.closer is None:
+                    self.closer = asyncio.create_task(close_later())
+                return ContinuePage.CONTINUE
+
+        stop = _StartCloser()
+        async with _client(_Portal()) as client:
+            stream = client.iter_list(_listing(), page_size=2, page_stop=stop)
+            rows = [row async for row in stream]
+            assert stop.closer is not None
+            await stop.closer
+            assert len(outcome) == 1
+            assert outcome[0].startswith(_REFUSALS["stream"])
+            assert len(rows) == len(ROWS)
+
+    _bounded(scenario)
+
+
 def test_a_task_outliving_a_finished_stream_does_not_keep_it_alive() -> None:
     # A task started during a pull keeps the pull's context; the marker in it must not pin the stream.
     async def scenario() -> None:
@@ -428,7 +494,11 @@ def test_a_detached_task_in_a_fresh_context_closes_the_stream() -> None:
         stop = _Detached(context=contextvars.Context())
         async with _client(_Portal()) as client:
             stream = stop.stream = client.iter_list(_listing(), page_size=2, page_stop=stop)
-            rows = [row async for row in stream]
+            rows: list[Any] = []
+            # The close lands while a read is in flight: that read raises the stream's closing, not a cancellation
+            # of a task nobody cancelled.
+            with pytest.raises(StreamClosedError):
+                await _collect_into(rows, stream)
             assert stop.closer is not None
             await stop.closer
             assert len(rows) < len(ROWS)
@@ -467,17 +537,20 @@ def test_a_fan_out_source_cannot_close_its_stream_between_reads() -> None:
         tried = asyncio.Event()
         opened: list[OperationStream[Any]] = []
 
-        async def attempt() -> None:
-            if not idle.is_set() or tried.is_set():
-                return
+        async def commands() -> AsyncIterator[Command[int]]:
+            # The source waits for the reader to go idle, so its close attempt comes between reads, however many
+            # loop turns a read takes.
+            yield Command(Request("x.get", {"id": 0}, ReplaySafety.SAFE, route=RouteKind.BARE), 0)
+            await idle.wait()
             try:
                 await opened[0].aclose()
             except RuntimeError as refusal:
                 refusals.append(refusal)
             tried.set()
+            yield Command(Request("x.get", {"id": 1}, ReplaySafety.SAFE, route=RouteKind.BARE), 1)
 
         async with _client(_Portal()) as client:
-            stream = client.fan_out(_commands(attempt), dispatch=BatchDispatch(batch_size=1))
+            stream = client.fan_out(commands(), dispatch=BatchDispatch(batch_size=1))
             opened.append(stream)
             await anext(stream)
             idle.set()
@@ -561,3 +634,155 @@ def test_a_source_closing_from_its_own_finally_is_refused_during_the_stream_clea
         await client.aclose()
 
     _bounded(scenario)
+
+
+@pytest.mark.parametrize("target", tuple(_REFUSALS))
+def test_a_close_from_a_binding_page_stop_is_refused_through_every_handoff_of_several_bindings(target: str) -> None:
+    # With several bindings one binding's page stop runs while the reader is being handed another binding's item.
+    # The stream's own work goes on through that handoff, so every close from it is refused, never waited for and
+    # never carried out.
+    async def scenario() -> None:
+        portal = _Portal()
+        client = _client(portal)
+        outcomes: list[str] = []
+        opened: list[OperationStream[Any]] = []
+
+        async def attempt() -> None:
+            try:
+                await (opened[0].aclose() if target == "stream" else client.aclose())
+            except RuntimeError as refusal:
+                outcomes.append(str(refusal))
+            else:
+                outcomes.append("closed")
+
+        stream = client.iter_references(
+            _listing(),
+            [_binding(index) for index in range(3)],
+            traversal=SequentialTraversal(page_size=2),
+            dispatch=DirectDispatch(concurrency=2),
+            page_stop=_PageStop(attempt),
+        )
+        opened.append(stream)
+        rows = [row async for row in stream]
+        assert rows
+        assert outcomes
+        assert all(_REFUSALS[target] in outcome for outcome in outcomes), outcomes
+        report = stream.report
+        assert report is not None
+        assert report.state is TerminalState.COMPLETED
+        await client.aclose()
+
+    _bounded(scenario)
+
+
+@pytest.mark.parametrize("target", tuple(_REFUSALS))
+def test_a_synchronous_source_closing_its_stream_from_its_worker_thread_is_refused(target: str) -> None:
+    # A synchronous binding source runs in a worker thread; a close it hands to the event loop from there would wait
+    # for the very step that waits for it, so it is refused as the same close from an asynchronous source is.
+    async def scenario() -> None:
+        portal = _Portal()
+        client = _client(portal)
+        loop = asyncio.get_running_loop()
+        refusals: list[RuntimeError] = []
+        opened: list[OperationStream[Any]] = []
+
+        def bindings() -> Iterator[Binding[int]]:
+            for index in range(2):
+                if not refusals:
+                    closing = opened[0].aclose() if target == "stream" else client.aclose()
+                    try:
+                        asyncio.run_coroutine_threadsafe(closing, loop).result(HANG_LIMIT)
+                    except RuntimeError as refusal:
+                        refusals.append(refusal)
+                yield _binding(index)
+
+        stream = client.iter_references(
+            _listing(), bindings(), traversal=SequentialTraversal(page_size=2), dispatch=DirectDispatch(concurrency=1)
+        )
+        opened.append(stream)
+        rows = [row async for row in stream]
+        assert rows
+        assert [_REFUSALS[target] in str(refusal) for refusal in refusals] == [True]
+        await client.aclose()
+
+    _bounded(scenario)
+
+
+@pytest.mark.parametrize("target", tuple(_REFUSALS))
+def test_a_synchronous_source_closing_its_stream_from_its_own_close_is_refused(target: str) -> None:
+    # A synchronous source's close (its generator's ``finally``) runs in a worker thread too: a close it hands to the
+    # event loop from there would wait for the cleanup that waits for it, so it is refused as from its pulls.
+    async def scenario() -> None:
+        client = _client(_Portal())
+        loop = asyncio.get_running_loop()
+        refusals: list[RuntimeError] = []
+        opened: list[OperationStream[Any]] = []
+
+        def bindings() -> Iterator[Binding[int]]:
+            try:
+                for index in range(3):
+                    yield _binding(index)
+            finally:
+                closing = opened[0].aclose() if target == "stream" else client.aclose()
+                try:
+                    asyncio.run_coroutine_threadsafe(closing, loop).result(HANG_LIMIT)
+                except RuntimeError as refusal:
+                    refusals.append(refusal)
+
+        stream = client.iter_references(
+            _listing(), bindings(), traversal=SequentialTraversal(page_size=2), dispatch=DirectDispatch(concurrency=1)
+        )
+        opened.append(stream)
+        await anext(stream)
+        await stream.aclose()
+        assert [_REFUSALS[target] in str(refusal) for refusal in refusals] == [True]
+        await client.aclose()
+
+    _bounded(scenario)
+
+
+def test_a_client_close_that_passed_its_check_is_not_refused_by_a_read_starting_before_it_runs() -> None:
+    # A task started inside a pull inherits the pull's marker; between reads its client close is allowed. A read
+    # starting right after that check must not turn the close, already decided, into a refusal of the stream it
+    # closes: the close runs outside any stream's work, ends the stream, and the read raises its closing.
+    async def scenario() -> None:
+        idle = asyncio.Event()
+        stop = _DetachedClientClose(wait=idle)
+        client = _client(_Portal())
+        stop.client = client
+        stream = client.iter_list(_listing(), page_size=2, page_stop=stop)
+        for _row in range(3):
+            await anext(stream)
+        idle.set()
+        reader = asyncio.ensure_future(anext(stream))
+        assert stop.closer is not None
+        await stop.closer
+        (read,) = await asyncio.gather(reader, return_exceptions=True)
+        assert isinstance(read, StreamClosedError | StopAsyncIteration), read
+        report = stream.report
+        assert report is not None
+        assert report.state is TerminalState.EARLY_CLOSED
+        with pytest.raises(ClientClosedError):
+            await client.call(_listing())
+
+    _bounded(scenario)
+
+
+class _DetachedClientClose:
+    """A page-stop callback that starts, once, a task closing the client when the test lets it."""
+
+    def __init__(self, *, wait: asyncio.Event) -> None:
+        self.wait = wait
+        self.client: Bitrix24 | None = None
+        self.closer: asyncio.Task[None] | None = None
+
+    async def on_page(self, boundary: PageBoundary) -> ContinuePage:
+        del boundary
+        if self.closer is None:
+            self.closer = asyncio.create_task(self._close())
+        return ContinuePage.CONTINUE
+
+    async def _close(self) -> None:
+        await self.wait.wait()
+        assert self.client is not None
+        await self.client.aclose()

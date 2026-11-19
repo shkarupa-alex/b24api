@@ -19,6 +19,7 @@ from b24api.contracts.report import (
 from b24api.errors import IncompleteTraversalError
 from b24api.execution.failure import (
     CANCELLED_REASON,
+    EARLY_CLOSE_REASON,
     finalize_failure,
     with_cleanup_failure_behind,
     with_interrupt,
@@ -120,6 +121,8 @@ class MappedOperationStream[S, T]:
         self._keyset_selection = keyset_selection
         self._source_violations = source_violations
         self._deregister = deregister
+        # Called as the first read starts the stream's work: its owner keeps a started stream until it ends.
+        self._started: Callable[[], None] | None = None
         # The report this stream built, which the runner publishes (an interrupt's shape on it, ``with_interrupt``).
         self._report: OperationReport | None = None
         self._early_closed = False
@@ -137,7 +140,7 @@ class MappedOperationStream[S, T]:
                 failure_report=self._failure_report,
                 cleanup=self._source.aclose,
                 propagate=self._propagate,
-                cleanup_budget=self._cleanup_window,
+                source_cleanup_failure=lambda: self._source.cleanup_failure,
                 delivered=self._delivered,
                 interrupted=with_interrupt,
             ),
@@ -153,6 +156,10 @@ class MappedOperationStream[S, T]:
     def inside_own_work(self) -> bool:
         """Whether the current task runs inside this stream's own pull or cleanup, where a close is refused."""
         return self._runner.inside_own_work
+
+    def when_started(self, hook: Callable[[], None]) -> None:
+        """Call ``hook`` once, as the first read starts this stream's work (its first item is pulled)."""
+        self._started = hook
 
     def __aiter__(self) -> Self:
         """Return this single-use stream."""
@@ -190,6 +197,8 @@ class MappedOperationStream[S, T]:
         return await self._runner.collect(limit=limit)
 
     async def _items(self) -> AsyncIterator[T]:
+        if self._started is not None:
+            self._started()
         while True:
             try:
                 source_item = await anext(self._source)
@@ -246,9 +255,6 @@ class MappedOperationStream[S, T]:
         self._report = self._gate().publish_failure(facts, cleanup)
         self._terminated()
         return self._report
-
-    def _cleanup_window(self) -> float:
-        return self._source.operation_context.cleanup_window()
 
     def _propagate(self, error: BaseException, report: OperationReport) -> BaseException:
         return self._error_mapper(error, report) if self._error_mapper is not None else error
@@ -307,6 +313,10 @@ class MappedOperationStream[S, T]:
         source = self._source_report()
         if reason is not None:
             source = replace(source, terminal_reason=reason)
+        elif forced_state is TerminalState.EARLY_CLOSED and not source.terminal_reason:
+            # The source recorded no end (closed before its first read, or its cleanup cut at the grace): the close
+            # ended it.
+            source = replace(source, terminal_reason=EARLY_CLOSE_REASON)
         gate.attach_report(self._facts(source, forced_state=forced_state))
         self._report = gate.finish()
         self._terminated()
@@ -329,8 +339,15 @@ class MappedOperationStream[S, T]:
         return with_cleanup_attempt(report, cause, attempt)
 
     def _terminated(self) -> None:
-        if self._deregister is not None:
-            self._deregister(self)
+        """Leave the client once the stream's work is over: at its report, or when cleanup left running ends."""
+        deregister = self._deregister
+        if deregister is None:
+            return
+        running = self._runner.background_cleanup
+        if running is None:
+            deregister(self)
+        else:
+            running.add_done_callback(lambda _cleanup: deregister(self))
 
 
 def _read_source_counter(reader: Callable[[], int] | None) -> int:

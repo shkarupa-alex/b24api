@@ -16,7 +16,14 @@ from b24api.contracts.request import ReplaySafety, Request, ResultSelector, Trav
 from b24api.contracts.response import result_snapshot
 from b24api.contracts.violation import retain_violations
 from b24api.errors import BudgetExceededError, CapabilityError, CleanupOverrunError
-from b24api.execution.context import is_escape, is_interrupt, latch_escape, spawn_settled
+from b24api.execution.context import (
+    cancelled_here,
+    is_escape,
+    is_interrupt,
+    latch_escape,
+    own_failure,
+    spawn_settled,
+)
 from b24api.execution.facts import dropped_result
 from b24api.references.counted_io import SharedCountedWaveIO
 from b24api.references.dispatch import (
@@ -275,8 +282,12 @@ class ReferenceScheduler:
             (producer, *admission.tasks.values()),
             remaining=self.context.cleanup_window(),
         )
+        # The producer only reads the source: a failure it ended in is the source's (or the reading's), which the
+        # close ends the stream before the reader reached, as an unread binding's failure; none of this cleanup.
+        source_failure = own_failure(producer)
         for task_error in task_errors:
-            _keep_cleanup_failure(cleanup_errors, task_error, primary_error)
+            if task_error is not source_failure:
+                _keep_cleanup_failure(cleanup_errors, task_error, primary_error)
         if pending:
             cleanup_errors.append(CleanupOverrunError("reference task cleanup exceeded operation time budget"))
 
@@ -391,10 +402,29 @@ class ReferenceScheduler:
         return self._caps.get(index, self.page_cap if self.default_program is not None else 0)
 
     async def _run_reference(self, work: _Work, output: asyncio.Queue[_Event]) -> None:
-        """Own one reference transaction from its first page to its terminal event."""
+        """Own one reference transaction from its first page to its terminal event, published on every way out.
+
+        The consumer waits for each binding's terminal event, so the event is the run's structure, not a convention of
+        its paths: a run that leaves without one (``_publish_missing_terminal``) still publishes it, unless the
+        operation is stopping its bindings or an escape ends it, when nobody waits for it.
+        """
         program = self._program(work)
         run = _ReferenceRun(work, output, self.completion.binding(work.index), _producer_key(work.index), program)
-        await asyncio.sleep(0)
+        left: BaseException | None = None
+        try:
+            await asyncio.sleep(0)
+            await self._run_pages(run)
+        except BaseException as error:
+            left = error
+            raise
+        finally:
+            await self._publish_missing_terminal(run, left)
+        if run.deferred_cleanup_error is not None:
+            raise run.deferred_cleanup_error
+
+    async def _run_pages(self, run: _ReferenceRun) -> None:
+        """Drive the binding's pages, end it by what its run raised, then release what it held."""
+        program, work = run.program, run.work
         pages = None if program.fast is not None else self._driven_pages(run)
         try:
             if program.fast is not None:
@@ -412,8 +442,26 @@ class ReferenceScheduler:
                 self._fast_active.discard(work.index)
                 if run.reservation is not None:
                     await self.buffer.abort(run.reservation)
-        if run.deferred_cleanup_error is not None:
-            raise run.deferred_cleanup_error
+
+    async def _publish_missing_terminal(self, run: _ReferenceRun, left: BaseException | None) -> None:
+        """Publish the terminal event of a run that left without one: a failure carrying what it left with.
+
+        Only a run that returned, failed or was cancelled by something it awaited can still publish. Nobody waits for
+        the event of a run whose operation is closing or whose own task is cancelled (the operation's stop, the loop's
+        shutdown). An escape is no binding's end (the operation's end raises it), and a coroutine being closed
+        (``GeneratorExit``: a dropped loop's) must not await.
+        """
+        if run.ended or isinstance(left, GeneratorExit) or is_escape(left):
+            return
+        if self.producer_state.closing or cancelled_here():
+            return
+        error: Exception
+        if isinstance(left, Exception):
+            error = left
+        else:
+            error = CapabilityError("reference binding ended without an outcome")
+            error.__cause__ = left
+        await self.publish_terminal(run, self._failure_event(run, error))
 
     async def _end_binding(self, run: _ReferenceRun, error: BaseException) -> None:
         """End a binding by what its run raised: its terminal event, unless that is no way a binding ends.
@@ -424,6 +472,13 @@ class ReferenceScheduler:
         ends the operation; any other escape is raised by a read that finishes the task where the binding's end
         comes (``_EndedEvent``, ``_finish_task``), or else by the operation's end.
         """
+        if isinstance(error, asyncio.CancelledError) and not cancelled_here():
+            # Only a cancellation of the binding's own task stops it (the operation's ``_stop_work``, or the loop's
+            # shutdown): one its task was not asked for is a foreign cancellation of something it awaited, so the
+            # binding fails with it.
+            carried = CapabilityError("reference binding was cancelled while its operation was running")
+            carried.__cause__ = error
+            error = carried
         if isinstance(error, Exception):
             # The binding fails with what its failed page reports, and its command's replay disposition, if any: a
             # failure's page reports a failure.
@@ -498,6 +553,7 @@ class ReferenceScheduler:
         It stops counting as a producer first, so no wave waits for it while the event waits for room,
         and the ordered pool stops keeping room for its next page.
         """
+        run.ended = True
         self.producer_state.retire(run.producer_key)
         await run.output.put(event)
 
@@ -773,13 +829,17 @@ class ReferenceScheduler:
         """Build the terminal failure event with the partial progress the reference reached."""
         if run.failure is not None:
             return run.failure  # a fast keyset binding prepared its own evidence before re-raising
+        driver = getattr(run, "driver", None)
+        if driver is None:
+            # A run that left before its pages were built has no progress to report.
+            return _FailureEvent(run.work, error, None, run.page_state, run.partial_rows, ())
         return _FailureEvent(
             run.work,
             error,
-            run.driver.cursor_state,
+            driver.cursor_state,
             run.page_state,
             run.partial_rows,
-            tuple(run.driver.violations[run.violation_offset :]),
+            tuple(driver.violations[run.violation_offset :]),
             self._pending_page_records(run),
         )
 

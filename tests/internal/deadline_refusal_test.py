@@ -68,7 +68,6 @@ UNREFUSED_READERS = Counter(
         # The coalescing wait stops at the deadline and sends the chunk it holds, which its permit admits or refuses.
         ("references/dispatch.py", "_BatchPageDispatcher._run", "coalescing_time_left"): 1,
         # Cleanup steps: they wait at least the grace and refuse no work.
-        ("completion/operation_stream.py", "MappedOperationStream._cleanup_window", "cleanup_window"): 1,
         (CONTEXT, "AsyncIteratorController.aclose", "cleanup_window"): 1,
         ("references/dispatch.py", "_BatchPageDispatcher.aclose", "cleanup_window"): 1,
         ("references/scheduler.py", "ReferenceScheduler._stop_work", "cleanup_window"): 1,
@@ -90,9 +89,11 @@ TIMEOUTS = Counter(
         ("transport/httpx.py", "HttpxTransport._send_wire_impl", "timeout"): 1,
         # The batch dispatcher's coalescing wait, handed ``coalescing_time_left``: it ends in a send.
         ("references/dispatch.py", "_wait_first", "wait"): 1,
-        # Cleanup waits, bounded by ``cleanup_window`` or a deadline handed in: they refuse no work.
+        # Cleanup waits, bounded by ``cleanup_window`` or a grace handed in: they refuse no work.
         (CONTEXT, "AsyncIteratorController.aclose", "wait"): 1,
         (CONTEXT, "await_cleanup_resistant", "wait"): 1,
+        # A cancelled read's wait for its pull, bounded by the cancellation grace: it refuses no work.
+        ("execution/lifecycle.py", "OperationRunner._await_pull", "wait"): 1,
         ("references/dispatch.py", "_BatchPageDispatcher.aclose", "wait"): 1,
         ("references/support.py", "_wait_for_cleanup_tasks", "wait"): 1,
         # The scripted transport's bound on extension code, a test double outside any operation's budget.
@@ -112,12 +113,6 @@ CONSTRUCTIONS = Counter(
         (CONTEXT, f"{LEDGER}._refuse", "BudgetExceededError(RETRY_WINDOW_EXHAUSTED)"): 1,
         # Count budgets: the attempt, page, row and identity ceilings, which time does not move.
         (CONTEXT, f"{LEDGER}.reserve_attempt", "BudgetExceededError('per-request attempt budget exhausted')"): 1,
-        (
-            CONTEXT,
-            f"{LEDGER}.reserve_pages",
-            "BudgetExceededError('logical page budget cannot fit the requested wave')",
-        ): 1,
-        (CONTEXT, f"{LEDGER}._check_page_budget", "BudgetExceededError('logical page budget exhausted')"): 1,
         (CONTEXT, f"{LEDGER}._check_page_budget", "BudgetExceededError('per-reference page budget exhausted')"): 1,
         (CONTEXT, f"{LEDGER}._hold_buffered_rows", "BudgetExceededError('buffered row budget exhausted')"): 1,
         (
@@ -207,7 +202,11 @@ CONSTRUCTIONS = Counter(
         ("batch/v3.py", "_V3Resolution._pause", "BudgetExceededError(_retry_refusal(plan))"): 1,
         # Cleanup overruns: a cleanup step outlasted its window; it refused no work and records no refusal.
         (CONTEXT, "AsyncIteratorController.aclose", "CleanupOverrunError(self._cleanup_error)"): 1,
-        (CONTEXT, "await_cleanup_resistant", "CleanupOverrunError('cleanup exceeded the operation time budget')"): 1,
+        (
+            CONTEXT,
+            "await_cleanup_resistant",
+            "CleanupOverrunError('cleanup outlasted the grace a cancellation is deferred for')",
+        ): 1,
         (
             "references/dispatch.py",
             "_BatchPageDispatcher.aclose",
@@ -347,14 +346,15 @@ def test_every_budget_error_constructed_is_listed() -> None:
 
 
 # Who builds the operation's refusal, the one error that ends the operation (``ExecutionContext.ended_by``): the
-# deadline (``_refuse``, for ``time_left`` and ``deadline``), the request budget at a send and at a source pull, and the
-# recorded refusal raised again. A replay round stops its commands with the refusal or a copy, which keeps the mark.
+# deadline (``_refuse``, for ``time_left`` and ``deadline``), the request budget at a send, the page budget at a page,
+# and the recorded refusal raised again (a source pull among them). A replay round stops its commands with the
+# refusal or a copy, which keeps the mark.
 REFUSALS = Counter(
     {
         (CONTEXT, f"{LEDGER}._refuse", "operation_refusal"): 1,
         (CONTEXT, f"{LEDGER}.admit_request", "operation_refusal"): 1,
         (CONTEXT, f"{LEDGER}.raise_if_refused", "operation_refusal"): 1,
-        (CONTEXT, "AsyncIteratorController.get", "operation_refusal"): 1,
+        (CONTEXT, f"{LEDGER}._page_budget_refusal", "operation_refusal"): 1,
     }
 )
 

@@ -37,6 +37,8 @@ class _ReferenceRun:
     failure: _FailureEvent | None = None
     # A page-stream cleanup failure that a binding failure outranked: raised after that failure is emitted.
     deferred_cleanup_error: BaseException | None = None
+    # Set once the binding's terminal event is published: its task publishes one on every way it leaves.
+    ended: bool = False
 
     def admit_page(self) -> None:
         """Release the dispatcher's admission slot once the page is in the row buffer."""

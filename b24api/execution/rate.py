@@ -22,6 +22,7 @@ _HTTP_STATUS_MAXIMUM = 599
 _RETRY_AFTER_CAP_SECONDS = 3_600.0
 _METHOD_LIMIT_CAP = 1_024
 _WAKE_TASK_NAME = "b24api-rate-wake"
+FOREIGN_LOOP = "a Bitrix24 client serves the one event loop it was first used in; create a client per event loop"
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +168,9 @@ class RateCoordinator:
         self._cooldown_until: float | None = None
         self._cooldown_reason: str | None = None
         self._wake_task: asyncio.Task[None] | None = None
+        # The loop the coordinator first admitted work on: its futures and wake task belong to it, so it serves no
+        # other (a wake task left on a closed loop would leave every later waiter queued forever).
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     @property
     def max_concurrency(self) -> int:
@@ -188,6 +192,7 @@ class RateCoordinator:
         loop = asyncio.get_running_loop()
         if self._state is CoordinatorState.CLOSED:
             raise ClientClosedError("rate coordinator is closed")
+        self.bind_loop()
         self._refresh_cooldown()
         if budget is not None and self._clock() >= budget.deadline:
             raise CoordinatorBudgetError("coordinator admission budget exhausted")
@@ -227,6 +232,24 @@ class RateCoordinator:
             if isinstance(error, TimeoutError):
                 raise CoordinatorBudgetError("coordinator admission budget exhausted") from error
             raise
+
+    def bind_loop(self) -> None:
+        """Serve the running event loop if it is the first one work started on; refuse any other (``check_loop``).
+
+        Every operation binds it as it starts (``ExecutionContext.start``), before it does any work, and every
+        admission does again.
+        """
+        self.check_loop()
+        if self._loop is None:
+            self._loop = asyncio.get_running_loop()
+
+    def check_loop(self) -> None:
+        """Refuse the running event loop with ``RuntimeError`` (``FOREIGN_LOOP``) if work started on another one.
+
+        A client's close checks it without binding the loop: a client no work used closes in any loop.
+        """
+        if self._loop is not None and self._loop is not asyncio.get_running_loop():
+            raise RuntimeError(FOREIGN_LOOP)
 
     def hold_method(self, method: str, delay: float) -> None:
         """Hold every permit for ``method`` for ``delay`` seconds (capped at an hour), or longer if already held."""

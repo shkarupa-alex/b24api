@@ -1841,7 +1841,7 @@ async def test_a_spent_request_budget_refuses_a_send_before_it_queues_for_a_cool
 
     assert len(transport.requests) == 1
     assert time.now == 0.0
-    assert context.requests_refused
+    assert context.refusal == "physical request budget exhausted"
 
 
 # A request refused while time is left fails alone and ends no operation: a tolerant stream goes on past it and

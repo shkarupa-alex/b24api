@@ -37,7 +37,15 @@ from b24api.execution import (
     WorkClass,
     rearm_cancellation,
 )
-from b24api.execution.context import LatchState, OperationLatch, is_interrupt, settle
+from b24api.execution.context import (
+    AsyncIteratorController,
+    CleanupResult,
+    ExecutionContext,
+    LatchState,
+    OperationLatch,
+    is_interrupt,
+    settle,
+)
 from b24api.execution.facts import Execution, execution
 from b24api.execution.rate import (
     CoordinatorBudgetError,
@@ -1778,6 +1786,41 @@ def test_a_latch_wakes_its_owner_only_while_the_operation_runs() -> None:
     asyncio.run(main())
 
 
+def test_a_latch_whose_end_nobody_can_raise_hands_it_to_the_event_loop_once() -> None:
+    # An end whose claimant can raise nothing closes its latch to the loop: its interrupt is raised from a callback,
+    # once, unless a read raises it (the latch still returns it to that read) or it is out already; any other escape
+    # is reported to the loop's exception handler, never raised.
+    handed: list[tuple[object, ...]] = []
+    handled: list[object] = []
+
+    async def main() -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _loop, context: handled.append(context.get("exception")))
+        call_soon = loop.call_soon
+        loop.call_soon = lambda _callback, *args, **_kwargs: handed.append(args)  # type: ignore[assignment,method-assign]
+        try:
+            plain, interrupt = _Escape("plain"), SystemExit("interrupt")
+            escaping = OperationLatch()
+            escaping.end()
+            escaping.record(plain)
+            escaping.close_to_loop(raised_by_read=True)
+            read = OperationLatch()
+            read.end()
+            read.record(interrupt)
+            read.close_to_loop(raised_by_read=True)
+            assert read.close() is interrupt
+            twice = OperationLatch()
+            twice.end()
+            twice.record(interrupt)
+            twice.close_to_loop()
+            twice.close_to_loop()
+        finally:
+            loop.call_soon = call_soon  # type: ignore[method-assign]
+        assert (handed, handled) == ([(interrupt,)], [plain])
+
+    asyncio.run(main())
+
+
 class _Escape(BaseException):
     """A ``BaseException`` that is neither an interrupt nor a cancellation."""
 
@@ -1876,3 +1919,44 @@ async def test_a_held_coordinator_wakes_at_the_first_hold_that_ends_not_the_last
     await coordinator.close()
 
     assert waits[0] == pytest.approx(0.1)
+
+
+class _EndsOnRelease:
+    """An owned source that ends (``StopAsyncIteration``) once ``release`` is set."""
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+
+    async def __anext__(self) -> int:
+        await self.release.wait()
+        raise StopAsyncIteration
+
+    async def aclose(self) -> CleanupResult:
+        return CleanupResult(None, None)
+
+
+# Loop turns from the source's end to past the pull's handing it over.
+PULL_TURNS = 8
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("turns", range(PULL_TURNS))
+async def test_a_pull_cancelled_as_its_source_ends_raises_the_cancellation_not_the_end(turns: int) -> None:
+    # The source ends, and the pull's waiter is cancelled ``turns`` turns later: before or after the source's end is
+    # handed over. A source's end is no failure it ended in on its own, so it never stands in for a cancellation
+    # that reached the pull first: the pull raises it, unless it had ended already.
+    source = _EndsOnRelease()
+    controller = AsyncIteratorController(source, input_error="input", cleanup_error="cleanup")
+    context = ExecutionContext(ExecutionPolicy(), RateCoordinator())
+    getter = asyncio.ensure_future(controller.get(context))
+    for _turn in range(PULL_TURNS):
+        await asyncio.sleep(0)
+    source.release.set()
+    for _turn in range(turns):
+        await asyncio.sleep(0)
+    cancelled = getter.cancel()
+    await asyncio.wait((getter,))
+    if cancelled:
+        assert getter.cancelled()
+    else:
+        assert isinstance(getter.exception(), StopAsyncIteration)

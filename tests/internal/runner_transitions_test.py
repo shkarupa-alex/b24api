@@ -23,6 +23,7 @@ from b24api.batch.stream import batch_outcome_stream
 from b24api.contracts import Command
 from b24api.contracts.policy import ExecutionPolicy, IdentityCoercion, KernelState
 from b24api.contracts.request import IdentitySpec
+from b24api.errors import StreamClosedError
 from b24api.execution import Executor, WireResponse
 from b24api.execution.context import latch_escape
 from b24api.execution.lifecycle import CleanupAttempt, LifecycleHooks, OperationRunner, TerminalCause, kernel_terminal
@@ -488,7 +489,8 @@ async def test_close_during_an_isolated_read_cancels_it_and_terminates_once(clie
     assert await _outcome(closer) is None
     assert await _outcome(second_closer) is None
     read_error = await _outcome(reader)
-    assert isinstance(read_error, asyncio.CancelledError)
+    # The reader's task was not cancelled: the close ended its read, which says so.
+    assert isinstance(read_error, StreamClosedError)
     harness.assert_published_once(read_error)
     with pytest.raises(StopAsyncIteration):
         await anext(harness.stream)
@@ -805,7 +807,7 @@ class _BetweenReads:
     The work goes on, in the very step that latched the interrupt, with the steps the test adds (``after_latch``).
     """
 
-    def __init__(self, cleanup_budget: Callable[[], float] | None = None) -> None:
+    def __init__(self) -> None:
         self.interrupt = KeyboardInterrupt("between reads")
         self.go = asyncio.Event()
         # Set just before the interrupt is latched: a read waiting for it resumes ahead of the end's own task.
@@ -820,9 +822,7 @@ class _BetweenReads:
         self.latched_in_cleanup: list[BaseException] = []
         self.runner: OperationRunner[int, KernelReport] = OperationRunner(
             self._body(),
-            LifecycleHooks(
-                finalize=self._finalize, failure_report=_fallback, cleanup=self._cleanup, cleanup_budget=cleanup_budget
-            ),
+            LifecycleHooks(finalize=self._finalize, failure_report=_fallback, cleanup=self._cleanup),
             works_between_reads=True,
         )
         self.work: list[asyncio.Future[None]] = []
@@ -868,7 +868,7 @@ def _fallback(_cause: TerminalCause, reason: str, _attempt: CleanupAttempt) -> K
     return KernelReport(state=KernelState.FAILED, terminal_reason=reason)
 
 
-def _ending(runner: OperationRunner[int, KernelReport]) -> asyncio.Future[Settled[None]]:
+def _ending(runner: OperationRunner[int, KernelReport]) -> asyncio.Future[Settled[object]]:
     ending = runner._ending  # noqa: SLF001 - the task the interrupt started for the operation's end
     assert ending is not None
     return ending
@@ -931,11 +931,11 @@ def test_a_read_that_resumes_ahead_of_the_ends_task_runs_the_end_once() -> None:
     assert getattr(error, "report", None) is report
 
 
-def test_a_read_running_the_end_between_reads_waits_for_its_cleanup_past_the_operations_deadline() -> None:
-    # The end of an operation an interrupt ended between reads has no deadline of its own: the operation's budget is
-    # spent, and the read that runs the end is cancelled while the cleanup waits. The read still waits for the
-    # cleanup, however long it takes, then raises its cancellation, recorded as cleanup's; nothing overran.
-    operation = _BetweenReads(cleanup_budget=lambda: 0.0)
+def test_a_cancelled_read_running_the_end_between_reads_waits_for_its_cleanup_within_the_grace() -> None:
+    # The read that runs the end of an operation an interrupt ended between reads is cancelled while the cleanup
+    # waits. A cleanup that ends within the cancellation grace is waited for, then the read raises its
+    # cancellation, recorded as cleanup's; nothing overran.
+    operation = _BetweenReads()
     readers: list[asyncio.Task[Any]] = []
 
     async def main() -> None:

@@ -1,7 +1,6 @@
 """Executor boundary: replay decision matrix, foreign transport failures and the response ceiling."""
 
 from __future__ import annotations
-import asyncio
 import json
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
@@ -1083,8 +1082,11 @@ class _ForeignBaseException(BaseException):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("signal", [asyncio.CancelledError, _ForeignBaseException])
-async def test_cancellation_and_base_exceptions_are_never_converted(signal: type[BaseException]) -> None:
+async def test_base_exceptions_are_never_converted() -> None:
+    # A cancellation is never converted either when its task was cancelled; one nobody requested ends the send it
+    # reached as a transport failure (tests/lifecycle_close_test.py covers both).
+    signal = _ForeignBaseException
+
     def behavior(_request: Request) -> WireResponse:
         raise signal("stop")
 
