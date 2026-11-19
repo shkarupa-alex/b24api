@@ -213,9 +213,11 @@ outcome.
   immutable counters are built only for a snapshot or the terminal report.
 - A request's retry window (`max_retry_elapsed_per_request`) opens when its first send is granted
   a coordinator permit; queueing before that is bounded by the operation's `max_elapsed`, and a known
-  coordinator hold that outlasts the budget left fails at once. Each attempt is bounded by the shorter
-  of the window left and its transport's own timeout (`HttpxTransport(timeout=...)`, which
-  `Settings.http_timeout` sets for the client's own transport): the transport knows the phase an attempt
+  coordinator hold that outlasts the budget left fails at once. Each attempt is bounded by the window
+  left, and each of its phases (connecting, TLS, the pool, writing, each read) by its transport's own
+  timeout (`HttpxTransport(timeout=...)`, which `Settings.http_timeout` sets for the client's own
+  transport), so an attempt that keeps making progress may outlast that timeout within the window: the
+  transport knows the phase an attempt
   timed out in, so one cut before it was sent (connecting, TLS, the pool) is proven not sent and retried
   whatever its safety. A transport that declares `TransportCapabilities.bounds_attempts` ends each
   attempt by the window left itself, so the window's end is classified by phase too; the executor cuts
@@ -233,9 +235,14 @@ outcome.
   `OPERATION_TIME_LIMIT` holds its method (`hold_method`) for the hint, else until the operating time
   that method's latest answer gave resets (`observe_reset`, from `time.operating_reset_at`, a classic
   command's `result_time` included), else for the method's streak backoff. A hint holds the host only
-  on an answer about the load (`hints_load`: a 429, a 503 or a limit's code). The coordinator alternates
-  retries with first sends, so a retry, whose window runs while it queues, waits for at most one other
-  permit. A retry waits the longer of its own backoff and the coordinator's hold on its methods. A
+  on an answer about the load (`hints_load`: a 429, a 503 or a limit's code). A permit is handed on as it
+  is released, before its request has read the answer; a waiter it was granted to checks the holds again
+  as it wakes (`RateCoordinator.acquire`), and one held since gives the permit back and waits in the place
+  its arrival gave it, ahead of every later arrival: a send never leaves while a hold on it runs. One that wakes to a closed coordinator is
+  refused as a queued one is (`ClientClosedError`). Whoever first sees a method's hold ended (that re-check, a
+  `snapshot`, a new hold) drops it and grants the free permits at once, as the wake task would have. The coordinator alternates
+  retries with first sends, so a retry, whose window runs while it queues, waits behind the retries queued
+  before it and at most one first send per retry granted. A retry waits the longer of its own backoff and the coordinator's hold on its methods. A
   retry that may not be repeated is planned only with more than twice its wait left, and starts only
   with at least as much window left as it actually waited since then (more than the planned wait
   when the wait overran), so a wait never takes more of the window than the send after it gets; a
@@ -247,9 +254,12 @@ outcome.
   of a physical batch; each round's caller decides it: the executor for a direct request, the REST
   3.0 resolution for its envelopes (one safety class each, admitted or refused whole), and the
   classic batch engine for a classic envelope, which the executor then sends once per call. The
-  engine plans each command on its own safety and its own method's hold as known when planning: a
-  round waits as long as its `UNSAFE` and `UNKNOWN` commands need and at least until one command can
-  go, carries a `SAFE` command held longer to a later round (an attempt is spent per send of the envelope, when `_RequestAttempts`
+  engine plans each command on its own safety and its own method's hold as known when planning: the
+  rounds share the envelope's attempts, so a round waits for its longest admitted hold when every
+  admitted command can wait that long and sends them all; otherwise it waits for the longest hold its
+  `UNSAFE` and `UNKNOWN` commands can afford, sends every command held no longer, and carries the `SAFE`
+  commands held longer to the next round, together
+  (an attempt is spent per send of the envelope, when `_RequestAttempts`
   records it once its transport returned or failed: a round that is sent spends one, a round stopped
   before its send, at its permit, its admission or its transport, spends none, and a carried command
   spends none of its own;

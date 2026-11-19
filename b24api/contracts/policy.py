@@ -271,9 +271,10 @@ class ExecutionPolicy:
     is checked at the operation's scheduling points (admission, permits, its own waits), not while the application
     holds control (a page stop callback, a consumer slow between pulls): the next scheduling point ends the operation.
     ``max_retry_elapsed_per_request`` is each request's retry window: it opens when the first send is granted its
-    permit and bounds every send, retry wait and later permit wait after it. Each send is also bounded by its
-    transport's own attempt timeout (``Settings.http_timeout`` for the client's HTTPX transport), so a send that
-    hangs leaves the rest of the window to its retries. ``max_direct_concurrency`` only narrows the client's own limit,
+    permit and bounds every send, retry wait and later permit wait after it. Each phase of a send (connecting, TLS,
+    the pool, writing, each read) is also bounded by its transport's own attempt timeout (``Settings.http_timeout``
+    for the client's HTTPX transport), so a send that hangs leaves the rest of the window to its retries.
+    ``max_direct_concurrency`` only narrows the client's own limit,
     ``Settings.max_concurrent_requests``, which all the client's work shares: a direct dispatch runs at most the
     smallest of the two, ``max_active_references`` and its ``DirectDispatch.concurrency``. It does not limit a
     ``BatchDispatch``, whose physical batches in flight are bounded by its ``concurrency``,

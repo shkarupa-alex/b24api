@@ -19,9 +19,10 @@ from b24api.batch.engine import BatchExecutor
 from b24api.batch.outcome import BatchFailure, BatchSuccess
 from b24api.contracts import ResultErrorSpec, ResultSelector
 from b24api.contracts.policy import ExecutionPolicy, RetryPolicy
-from b24api.errors import ApiResponseError, B24ApiError, BudgetExceededError
+from b24api.errors import ApiResponseError, B24ApiError, BudgetExceededError, HTTPGatewayError
 from b24api.execution import Executor, RateCoordinator, WireResponse
-from b24api.execution.executor import _SendPlan
+from b24api.execution.executor import _Pause, _plan_round, _SendPlan
+from b24api.execution.facts import Execution, execution
 from b24api.testing import ScriptedTransport
 from tests.scripting import ResponderTransport, replies
 
@@ -308,6 +309,48 @@ async def test_a_classic_batch_command_keeps_its_result_time_and_its_method_rese
     assert reset == pytest.approx(300, abs=2)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timing", [None, "late", [1]])
+async def test_a_classic_batch_answer_whose_timing_cannot_be_read_keeps_its_answers(timing: object) -> None:
+    # The commands' timing is diagnostic: a ``result_time`` member that is not a map of it is left out, and each
+    # command keeps the answer its entry gave.
+    def respond(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {"result": {"result": dict.fromkeys(commands, 1), "result_error": [], "result_time": timing}}
+
+    executor = Executor(ResponderTransport(respond), coordinator=RateCoordinator())
+    outcomes = await BatchExecutor(executor).execute_requests(
+        (Request.bare("crm.item.add", {"i": 0}, ReplaySafety.UNSAFE), _get()), context=executor.context(_POLICY)
+    )
+    await executor.coordinator.close()
+
+    assert all(isinstance(outcome, BatchSuccess) for outcome in outcomes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "entry",
+    ["late", {"duration": -1.0, "start": 1.0, "finish": 0.0}, {"start": 10**400}, {"operating_reset_at": "soon"}],
+    ids=["not-a-map", "negative", "too-large", "bad-reset"],
+)
+async def test_a_classic_command_whose_own_timing_cannot_be_read_keeps_its_answer(entry: object) -> None:
+    # One command's own ``result_time`` entry cannot be read (whatever its decoder raises): it is left out, and both
+    # commands keep the answers their entries gave.
+    def respond(request: Request) -> object:
+        first, second = _keys(request)
+        timing = {first: entry, second: {"start": 1.0, "finish": 2.0, "duration": 1.0}}
+        return {"result": {"result": {first: 1, second: 1}, "result_error": [], "result_time": timing}}
+
+    executor = Executor(ResponderTransport(respond), coordinator=RateCoordinator())
+    outcomes = await BatchExecutor(executor).execute_requests(
+        (Request.bare("crm.item.add", {"i": 0}, ReplaySafety.UNSAFE), _get()), context=executor.context(_POLICY)
+    )
+    await executor.coordinator.close()
+
+    assert all(isinstance(outcome, BatchSuccess) for outcome in outcomes)
+
+
 def _keys(request: Request) -> list[str]:
     """The keys of the commands a classic batch envelope carries."""
     commands = request.copy_parameters()["cmd"]
@@ -433,6 +476,32 @@ async def test_a_command_held_beyond_what_the_operation_has_left_is_refused_unse
     assert isinstance(get, BatchSuccess)
     assert isinstance(update, BatchFailure)
     assert isinstance(update.error, BudgetExceededError)
+
+
+@pytest.mark.asyncio
+async def test_a_chunk_whose_every_command_its_first_send_refuses_counts_no_envelope() -> None:
+    # The operation has no time left: the first send's plan refuses each command before any permit, so no envelope
+    # starts and none counts against the request budget.
+    time = _Time()
+    transport = ResponderTransport(lambda _request: {"result": 1})
+    executor = _executor(transport, time)
+    context = executor.context(ExecutionPolicy(max_elapsed=1.0))
+    await context.start()
+    time.now += 5.0
+    envelopes = 0
+
+    def counted() -> None:
+        nonlocal envelopes
+        envelopes += 1
+
+    outcomes = await BatchExecutor(executor).execute_chunk(
+        _commands("crm.deal.get", "crm.deal.list"), context=context, halt=False, split_held=True, on_envelope=counted
+    )
+    await executor.coordinator.close()
+
+    assert envelopes == 0
+    assert transport.requests == []
+    assert all(isinstance(outcome, BatchFailure) for outcome in outcomes)
 
 
 class _Portal(ScriptedTransport):
@@ -573,6 +642,48 @@ async def test_an_entry_that_fails_with_no_load_limit_ends_its_methods_streak() 
     assert held == pytest.approx(0.05)
 
 
+class _EntryTimeLimits(ScriptedTransport):
+    """Answer every command of each envelope, classic or REST 3.0, with its own entry's time limit; note each send."""
+
+    def __init__(self, time: _Time) -> None:
+        super().__init__(())
+        self.time = time
+        self.sent: list[float] = []
+
+    async def send_wire(self, wire: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        del attempt_timeout, max_response_bytes
+        self.sent.append(self.time.now)
+        if wire.array_body is not None:
+            elements = [{"error": {"code": "OPERATION_TIME_LIMIT"}} for _ in wire.array_body.commands]
+            return WireResponse(200, _JSON, json.dumps({"result": elements}).encode())
+        commands = wire.parameters["cmd"]
+        assert isinstance(commands, dict)
+        errors = {key: {"error": "OPERATION_TIME_LIMIT", "error_description": "x"} for key in commands}
+        return WireResponse(200, _JSON, json.dumps({"result": {"result": [], "result_error": errors}}).encode())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", [RouteKind.BARE, RouteKind.API_V3], ids=["classic-entry", "v3-element"])
+async def test_an_entry_refused_again_after_its_methods_pause_began_doubles_the_hold(route: RouteKind) -> None:
+    # A batch command's own entry, classic or REST 3.0, refuses it with a time limit, no reset known; its retry
+    # leaves after the pause began and is refused again: the method's streak grows, so its hold doubles.
+    time = _Time()
+    transport = _EntryTimeLimits(time)
+    executor = _executor(transport, time)
+    policy = ExecutionPolicy(max_attempts_per_request=2, retry=RetryPolicy(jitter=0))
+    spec = ResultErrorSpec(ResultSelector(("error",)), ("code",)) if route is RouteKind.API_V3 else None
+    request = Request("crm.item.get", {"id": 1}, ReplaySafety.SAFE, route=route, result_error=spec)
+    chunk = (_Command(0, "c000000000000", request, None),)
+
+    (outcome,) = await BatchExecutor(executor).execute_chunk(chunk, context=executor.context(policy), halt=False)
+    held = executor.coordinator.admission_delay(frozenset({"crm.item.get"}))
+    await executor.coordinator.close()
+
+    assert isinstance(outcome, BatchFailure)
+    assert transport.sent == [0.0, 0.5]
+    assert held == pytest.approx(1.0)
+
+
 @pytest.mark.asyncio
 async def test_a_first_send_refuses_a_command_whose_hold_outlasts_what_the_hosts_hold_leaves() -> None:
     # The host is held 0.3 s and the operation has 1 s: a command's window opens after the host's hold, so 0.7 s
@@ -620,6 +731,129 @@ async def test_a_burst_whose_sends_left_at_different_moments_before_the_pause_pa
     await executor.coordinator.close()
 
     assert snapshot.cooldown_seconds == pytest.approx(0.5)
+
+
+_BURST = 3
+# How far the clock moves while each refusal of a burst comes back: the answers arrive one after another.
+_ANSWER_LAG = 0.01
+_V3_RATE_LIMIT = WireResponse(
+    429, _JSON, json.dumps({"error": {"code": "BITRIX_REST_V3_EXCEPTION_RATELIMITEXCEPTION", "message": "x"}}).encode()
+)
+
+
+class _BurstThenAnswers(ScriptedTransport):
+    """Refuse a burst of sends, all in flight at once, one answer after another as the clock moves; then answer."""
+
+    def __init__(self, time: _Time, dialect: str) -> None:
+        super().__init__(())
+        self.time = time
+        self.dialect = dialect
+        self.sent: list[float] = []
+        # Each refusal's turn: the first comes once the whole burst is in flight, each next after the one before.
+        self.turns = [asyncio.Event() for _ in range(_BURST)]
+
+    async def send_wire(self, wire: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        del attempt_timeout, max_response_bytes
+        self.sent.append(self.time.now)
+        number = len(self.sent)
+        if number > _BURST:
+            return self._answer(wire)
+        if number == _BURST:
+            self.turns[0].set()
+        await self.turns[number - 1].wait()
+        self.time.now += _ANSWER_LAG
+        if number < _BURST:
+            self.turns[number].set()
+        return self._refusal(wire)
+
+    def _refusal(self, wire: WireRequest) -> WireResponse:
+        if self.dialect in {"call", "classic"}:
+            return _refusal("QUERY_LIMIT_EXCEEDED")
+        if self.dialect == "v3":
+            return _V3_RATE_LIMIT
+        if wire.array_body is not None:
+            elements = [{"error": {"code": "QUERY_LIMIT_EXCEEDED"}} for _ in wire.array_body.commands]
+            return WireResponse(200, _JSON, json.dumps({"result": elements}).encode())
+        commands = wire.parameters["cmd"]
+        assert isinstance(commands, dict)
+        errors = {key: {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "x"} for key in commands}
+        return WireResponse(200, _JSON, json.dumps({"result": {"result": [], "result_error": errors}}).encode())
+
+    @staticmethod
+    def _answer(wire: WireRequest) -> WireResponse:
+        if wire.array_body is not None:
+            return WireResponse(
+                200, _JSON, json.dumps({"result": [{"item": 1} for _ in wire.array_body.commands]}).encode()
+            )
+        if wire.method == "batch":
+            commands = wire.parameters["cmd"]
+            assert isinstance(commands, dict)
+            body = {"result": {"result": dict.fromkeys(commands, 1), "result_error": []}}
+            return WireResponse(200, _JSON, json.dumps(body).encode())
+        return WireResponse(200, _JSON, b'{"result":1}')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dialect", ["call", "classic", "v3", "classic_entry", "v3_entry"])
+async def test_a_burst_refused_while_the_clock_moves_pauses_the_host_once(dialect: str) -> None:
+    # Three sends leave together and are refused one after another as the clock moves: each refusal is read after the
+    # first began the pause, but every send left before it. The streak counts when a send left, not when its refusal
+    # came back, so the burst never grows it, on every route a refusal comes by: each refusal holds the host for the
+    # initial delay from when it came back, and the pause ends that long after the last.
+    time = _Time()
+    transport = _BurstThenAnswers(time, dialect)
+    executor = _executor(transport, time, max_concurrency=_BURST)
+    context = executor.context(ExecutionPolicy(retry=RetryPolicy(initial_delay=0.1, maximum_delay=1.0, jitter=0)))
+    route = RouteKind.API_V3 if dialect.startswith("v3") else RouteKind.BARE
+    spec = ResultErrorSpec(ResultSelector(("error",)), ("code",)) if dialect == "v3_entry" else None
+
+    async def one(index: int) -> None:
+        request = Request(f"crm.item.get{index}", {"id": 1}, ReplaySafety.SAFE, route=route, result_error=spec)
+        if dialect == "call":
+            await executor.execute(request, context=context)
+            return
+        chunk = (_Command(0, "c000000000000", request, None),)
+        (outcome,) = await BatchExecutor(executor).execute_chunk(chunk, context=context, halt=False)
+        assert isinstance(outcome, BatchSuccess)
+
+    await asyncio.gather(*(one(index) for index in range(_BURST)))
+    snapshot = await context.snapshot()
+    await executor.coordinator.close()
+
+    assert transport.sent[:_BURST] == [0.0] * _BURST
+    assert snapshot.cooldown_seconds == pytest.approx(0.1 + (_BURST - 1) * _ANSWER_LAG)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dialect", ["call", "classic", "v3", "classic_entry", "v3_entry"])
+async def test_a_request_queued_for_a_permit_waits_for_the_hold_the_refusal_that_freed_it_set(dialect: str) -> None:
+    # Every permit is taken by the burst, and one more request waits for a permit. The first refusal frees its permit
+    # before its answer is read; the hold that answer sets holds the queued request too: it leaves once the pause
+    # ends, never inside it, and the burst pauses the host once.
+    time = _Time()
+    transport = _BurstThenAnswers(time, dialect)
+    executor = _executor(transport, time, max_concurrency=_BURST)
+    context = executor.context(ExecutionPolicy(retry=RetryPolicy(initial_delay=0.1, maximum_delay=1.0, jitter=0)))
+    route = RouteKind.API_V3 if dialect.startswith("v3") else RouteKind.BARE
+    spec = ResultErrorSpec(ResultSelector(("error",)), ("code",)) if dialect == "v3_entry" else None
+
+    async def one(index: int) -> None:
+        request = Request(f"crm.item.get{index}", {"id": 1}, ReplaySafety.SAFE, route=route, result_error=spec)
+        if dialect == "call":
+            await executor.execute(request, context=context)
+            return
+        chunk = (_Command(0, "c000000000000", request, None),)
+        (outcome,) = await BatchExecutor(executor).execute_chunk(chunk, context=context, halt=False)
+        assert isinstance(outcome, BatchSuccess)
+
+    await asyncio.gather(*(one(index) for index in range(_BURST + 1)))
+    snapshot = await context.snapshot()
+    await executor.coordinator.close()
+
+    pause_end = 0.1 + _BURST * _ANSWER_LAG
+    assert transport.sent[:_BURST] == [0.0] * _BURST
+    assert transport.sent[_BURST] == pytest.approx(pause_end)
+    assert snapshot.cooldown_seconds == pytest.approx(0.1 + (_BURST - 1) * _ANSWER_LAG)
 
 
 @pytest.mark.asyncio
@@ -688,7 +922,17 @@ async def test_a_time_limit_after_its_methods_reset_has_passed_holds_it_for_the_
 
 
 @pytest.mark.asyncio
-async def test_a_time_limit_with_a_hint_holds_its_method_for_the_hint_not_until_its_reset() -> None:
+@pytest.mark.parametrize(
+    ("hint", "resent_at"),
+    [
+        ("2", 2.0),
+        # A zero hint holds nothing: the retry waits its backoff alone, not until the method's reset.
+        ("0", RetryPolicy().initial_delay),
+    ],
+)
+async def test_a_time_limit_with_a_hint_holds_its_method_for_the_hint_not_until_its_reset(
+    hint: str, resent_at: float
+) -> None:
     time = _Time()
     sent_at: list[float] = []
     answered = {"result": 1, "time": {"operating_reset_at": wall.time() + 100, "operating": 470}}
@@ -698,7 +942,7 @@ async def test_a_time_limit_with_a_hint_holds_its_method_for_the_hint_not_until_
             time,
             replies(
                 WireResponse(200, (*_JSON, _now_date()), json.dumps(answered).encode()),
-                _refusal("OPERATION_TIME_LIMIT", headers=(("retry-after", "2"),)),
+                _refusal("OPERATION_TIME_LIMIT", headers=(("retry-after", hint),)),
                 {"result": 2},
             ),
         )
@@ -709,7 +953,7 @@ async def test_a_time_limit_with_a_hint_holds_its_method_for_the_hint_not_until_
     await executor.execute(_get(), policy=_POLICY)
     await executor.coordinator.close()
 
-    assert sent_at == [0.0, 0.0, 2.0]
+    assert sent_at == [0.0, 0.0, resent_at]
 
 
 @pytest.mark.asyncio
@@ -859,3 +1103,272 @@ async def test_a_limit_an_element_declares_holds_its_method_or_the_host_as_a_dir
     await executor.coordinator.close()
 
     assert held == (method_held, host_held)
+
+
+_HOLDS = (10.0, 20.0, 30.0, 40.0, 50.0)
+_SHORT_WINDOW = 60.0
+
+
+def _held_then_answered(
+    time: _Time, sends: list[tuple[float, list[str]]], holds: dict[str, float], executor: list[Executor]
+) -> Callable[[Request], object]:
+    """Refuse every entry of the first envelope by quota and hold each method ``holds`` says; answer the rest."""
+
+    def respond(request: Request) -> object:
+        methods = _sent_methods(request)
+        sends.append((time.now, methods))
+        keys = _keys(request)
+        if len(sends) > 1:
+            return {"result": {"result": dict.fromkeys(keys, 1), "result_error": []}}
+        for method, held in holds.items():
+            executor[0].coordinator.hold_method(method, held)
+        errors = {key: {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "x"} for key in keys}
+        return {"result": {"result": [], "result_error": errors}}
+
+    return respond
+
+
+async def _replayed(
+    holds: dict[str, float], safeties: tuple[ReplaySafety, ...], policy: ExecutionPolicy
+) -> tuple[list[tuple[float, list[str]]], tuple[object, ...]]:
+    time = _Time()
+    sends: list[tuple[float, list[str]]] = []
+    built: list[Executor] = []
+    executor = _executor(ResponderTransport(_held_then_answered(time, sends, holds, built)), time)
+    built.append(executor)
+    chunk = tuple(
+        _Command(index, f"c{index:012d}", Request.bare(method, {"i": index}, safety), None)
+        for index, (method, safety) in enumerate(zip(holds, safeties, strict=True))
+    )
+    outcomes = await BatchExecutor(executor).execute_chunk(chunk, context=executor.context(policy), halt=False)
+    await executor.coordinator.close()
+    return sends, tuple(outcomes)
+
+
+@pytest.mark.asyncio
+async def test_a_replay_round_waits_for_every_safe_command_it_can_so_carrying_spends_no_attempt() -> None:
+    # The rounds of a batch share its attempts: a round carrying the more held commands would spend one attempt per
+    # hold. Five commands held 10 to 50 s go together once the longest hold ends, within two attempts.
+    holds = {f"m{index}.get": held for index, held in enumerate(_HOLDS)}
+    policy = ExecutionPolicy(max_attempts_per_request=2, retry=RetryPolicy(initial_delay=0.01, jitter=0))
+
+    sends, outcomes = await _replayed(holds, tuple(ReplaySafety.SAFE for _ in holds), policy)
+
+    assert [methods for _, methods in sends] == [list(holds), list(holds)]
+    assert sends[1][0] == pytest.approx(max(_HOLDS), abs=0.1)
+    assert all(isinstance(outcome, BatchSuccess) for outcome in outcomes)
+
+
+@pytest.mark.asyncio
+async def test_a_replay_round_sends_an_unsafe_command_with_a_safe_one_held_longer_it_can_wait_for() -> None:
+    holds = {"m.u": 1.0, "m.s": 3.0}
+    policy = ExecutionPolicy(retry=RetryPolicy(initial_delay=0.01, jitter=0))
+
+    sends, outcomes = await _replayed(holds, (ReplaySafety.UNSAFE, ReplaySafety.SAFE), policy)
+
+    assert [methods for _, methods in sends] == [["m.u", "m.s"], ["m.u", "m.s"]]
+    assert all(isinstance(outcome, BatchSuccess) for outcome in outcomes)
+
+
+_U, _S = ReplaySafety.UNSAFE, ReplaySafety.SAFE
+_SEND, _CARRY, _HELD_OUT = _SendPlan.SEND, _SendPlan.CARRY, _SendPlan.HELD_OUT
+
+
+_WINDOW = 120.0
+
+
+@pytest.mark.parametrize(
+    ("sends", "window", "round_kind", "held", "plans"),
+    [
+        # A replay round waits for every send that can wait as long: carrying would spend an attempt per hold.
+        (tuple((each, _S) for each in _HOLDS), _WINDOW, "replay", max(_HOLDS), (_SEND,) * len(_HOLDS)),
+        (((1.0, _U), (3.0, _S)), _WINDOW, "replay", 3.0, (_SEND, _SEND)),
+        # The UNSAFE send cannot wait 40 s in a 60 s window: it goes when it needs, the SAFE one in a later round.
+        (((1.0, _U), (40.0, _S)), _SHORT_WINDOW, "replay", 1.0, (_SEND, _CARRY)),
+        # It cannot wait 100 s in a 120 s window either, but it can wait 3 s: the SAFE send held 3 s goes with it.
+        (((1.0, _U), (3.0, _S), (100.0, _S)), _WINDOW, "replay", 3.0, (_SEND, _SEND, _CARRY)),
+        # An UNSAFE send its window refuses is not sent: its hold does not limit the round's wait for the others.
+        (((70.0, _U), (80.0, _S), (0.0, _S)), _WINDOW, "replay", 80.0, (_HELD_OUT, _SEND, _SEND)),
+        # A first send's later envelopes have attempts of their own: the least held go now.
+        (
+            tuple((each, _S) for each in _HOLDS),
+            _WINDOW,
+            "first send",
+            min(_HOLDS),
+            (_SEND, *(_CARRY,) * (len(_HOLDS) - 1)),
+        ),
+    ],
+)
+def test_a_round_plan_waits_for_its_sends_together_only_where_they_share_attempts(
+    sends: tuple[tuple[float, ReplaySafety], ...],
+    window: float,
+    round_kind: str,
+    held: float,
+    plans: tuple[_SendPlan, ...],
+) -> None:
+    own = tuple(_Pause(0.0, hold, window, 0.0) for hold, _safety in sends)
+    safeties = tuple(safety for _hold, safety in sends)
+
+    plan = _plan_round(own, safeties, whole=False, together=round_kind == "replay")
+
+    assert plan.pause.held == held
+    assert plan.plans == plans
+
+
+_FIRST_BACKOFF = 0.05
+_SECOND_BACKOFF = 0.1
+
+
+class _InTurn(ScriptedTransport):
+    """Answer each send, a lone call or an envelope of either dialect, with the next of ``answers``."""
+
+    def __init__(self, *answers: WireResponse) -> None:
+        super().__init__(())
+        self.answers = list(answers)
+
+    async def send_wire(self, wire: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        del wire, attempt_timeout, max_response_bytes
+        return self.answers.pop(0)
+
+
+_ENVELOPE_REFUSALS = {
+    RouteKind.BARE: _refusal("INVALID_REQUEST", status=400),
+    RouteKind.API_V3: WireResponse(
+        403,
+        _JSON,
+        json.dumps({"error": {"code": "BITRIX_REST_V3_EXCEPTION_ACCESSDENIEDEXCEPTION", "message": "no"}}).encode(),
+    ),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", list(_ENVELOPE_REFUSALS))
+@pytest.mark.parametrize(
+    ("code", "scope", "held"),
+    [
+        # The envelope's own failure is an answer from the host: it ends the host's streak, so the next quota
+        # refusal holds for the first backoff again.
+        ("QUERY_LIMIT_EXCEEDED", frozenset[str](), _FIRST_BACKOFF),
+        # It answers about no command's method: the method's time-limit streak goes on to the second backoff.
+        ("OPERATION_TIME_LIMIT", frozenset({"crm.item.get"}), _SECOND_BACKOFF),
+    ],
+)
+async def test_an_envelope_refused_whole_for_no_load_limit_ends_the_hosts_streak_and_no_methods(
+    code: str, scope: frozenset[str], held: float, route: RouteKind
+) -> None:
+    time = _Time()
+    transport = _InTurn(_refusal(code), _ENVELOPE_REFUSALS[route], _refusal(code))
+    executor = _executor(transport, time)
+    policy = ExecutionPolicy(
+        max_attempts_per_request=1,
+        retry=RetryPolicy(initial_delay=_FIRST_BACKOFF, maximum_delay=5.0, jitter=0),
+    )
+    time.now += 1.0
+    with pytest.raises(B24ApiError):
+        await executor.execute(_get(), policy=policy)
+    time.now += 1.0
+    command = Request("crm.item.get", {"id": 1}, ReplaySafety.SAFE, route=route)
+    (outcome,) = await BatchExecutor(executor).execute_chunk(
+        (_Command(0, "c000000000000", command, None),), context=executor.context(policy), halt=False
+    )
+    assert isinstance(outcome, BatchFailure)
+    time.now += 1.0
+    with pytest.raises(B24ApiError):
+        await executor.execute(_get(), policy=policy)
+    delay = executor.coordinator.admission_delay(scope)
+    await executor.coordinator.close()
+
+    assert delay == pytest.approx(held)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", [RouteKind.BARE, RouteKind.API_V3])
+async def test_an_envelope_refused_whole_with_a_load_status_keeps_the_hosts_streak(route: RouteKind) -> None:
+    # A 503 that names no limit is still an answer about the load, for an envelope as for a lone request: it ends
+    # no streak, so the quota refusal after it holds the host for the second backoff.
+    time = _Time()
+    transport = _InTurn(
+        _refusal("QUERY_LIMIT_EXCEEDED"), _refusal("BUSY", status=503), _refusal("QUERY_LIMIT_EXCEEDED")
+    )
+    executor = _executor(transport, time)
+    policy = ExecutionPolicy(
+        max_attempts_per_request=1,
+        retry=RetryPolicy(initial_delay=_FIRST_BACKOFF, maximum_delay=5.0, jitter=0),
+    )
+    time.now += 1.0
+    with pytest.raises(B24ApiError):
+        await executor.execute(_get(), policy=policy)
+    time.now += 1.0
+    command = Request("crm.item.get", {"id": 1}, ReplaySafety.SAFE, route=route)
+    (outcome,) = await BatchExecutor(executor).execute_chunk(
+        (_Command(0, "c000000000000", command, None),), context=executor.context(policy), halt=False
+    )
+    assert isinstance(outcome, BatchFailure)
+    time.now += 1.0
+    with pytest.raises(B24ApiError):
+        await executor.execute(_get(), policy=policy)
+    delay = executor.coordinator.admission_delay(frozenset())
+    await executor.coordinator.close()
+
+    assert delay == pytest.approx(_SECOND_BACKOFF)
+
+
+class _GatewayWhileHeld(ScriptedTransport):
+    """Answer every send with a gateway's 502, no answer about the load, as a neighbour holds its method 200 s."""
+
+    def __init__(self, coordinator: RateCoordinator) -> None:
+        super().__init__(())
+        self.coordinator = coordinator
+
+    async def send_wire(self, wire: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        del wire, attempt_timeout, max_response_bytes
+        self.coordinator.hold_method("crm.item.get", 200.0)
+        return WireResponse(502, (("content-type", "text/html"),), b"<html>bad gateway</html>")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sent_as", ["call", "batch"])
+async def test_a_send_held_beyond_its_window_after_a_failure_about_no_load_ends_with_the_budgets_refusal(
+    sent_as: str,
+) -> None:
+    # Only the server's answer about its load ends a send held out with itself: after a 502 the budget refuses it,
+    # caused by the 502, for a lone request as for a classic batch command.
+    coordinator = RateCoordinator()
+    executor = Executor(_GatewayWhileHeld(coordinator), coordinator=coordinator, random_source=lambda: 0.5)
+    policy = ExecutionPolicy(retry=RetryPolicy(initial_delay=0.01, jitter=0))
+    if sent_as == "call":
+        with pytest.raises(B24ApiError) as raised:
+            await executor.execute(_get(), policy=policy)
+        refusal: BaseException = raised.value
+    else:
+        chunk = tuple(_Command(index, f"c{index:012d}", _get(), None) for index in range(2))
+        first, _second = await BatchExecutor(executor).execute_chunk(
+            chunk, context=executor.context(policy), halt=False
+        )
+        assert isinstance(first, BatchFailure)
+        # The 502 left the command's fate unknown; what ended it is the budget's refusal.
+        assert first.error.__cause__ is not None
+        refusal = first.error.__cause__
+    await coordinator.close()
+
+    assert isinstance(refusal, BudgetExceededError)
+    assert isinstance(refusal.__cause__, HTTPGatewayError)
+
+
+@pytest.mark.asyncio
+async def test_a_command_held_out_after_its_load_answer_keeps_what_its_earlier_send_left_open() -> None:
+    # The command's first envelope got a gateway's 502, so it may have run; the replay's 503 holds the host beyond
+    # the window. The command is held out, yet still possibly run: it ends with the failure that left it open.
+    answers = [
+        WireResponse(502, (("content-type", "text/html"),), b"<html>bad gateway</html>"),
+        _refusal("QUERY_LIMIT_EXCEEDED", headers=(("retry-after", "200"),)),
+    ]
+    executor = _executor(ResponderTransport(replies(*answers)), _Time())
+    chunk = (_Command(0, "c000000000000", _get(), None),)
+
+    (outcome,) = await BatchExecutor(executor).execute_chunk(chunk, context=executor.context(_POLICY), halt=False)
+    await executor.coordinator.close()
+
+    assert isinstance(outcome, BatchFailure)
+    assert execution(outcome.error) is Execution.POSSIBLY_RUN
+    assert isinstance(outcome.error.__cause__, HTTPGatewayError)

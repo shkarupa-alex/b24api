@@ -227,8 +227,8 @@ hangs leaves the rest of the window to its retries; one that times out before an
 The portal's load limits pause what they limit, for every request of the client. A request-rate
 refusal (`QUERY_LIMIT_EXCEEDED`, the REST 3.0 rate limit, or a 429) holds the whole portal for the
 server's hint (`Retry-After` or `X-Bitrix-RateLimit-Reset`), or, without one, for the retry backoff of
-the refusals in a row, so the requests that share the portal slow down together, more with each
-refusal of a request sent after the latest pause began. An `OPERATION_TIME_LIMIT` holds its method
+the refusals in a row, so the requests that share the portal slow down together, those waiting for a
+connection slot included, more with each refusal of a request sent after the latest pause began. An `OPERATION_TIME_LIMIT` holds its method
 alone: for the hint, else until the method's operating time resets, as its latest answer said
 (`time.operating_reset_at`, of a classic batch command too), else for the backoff. A hint on any
 other answer than a 429, a 503 or a load limit's code holds nothing. A retry waits the longer of its
@@ -249,10 +249,12 @@ it ends with `BudgetExceededError`, whose cause is that refusal. The same holds 
 of a classic batch and the replays of a REST 3.0 envelope: a command its own entry or element answered
 keeps that answer; one whose batch was refused as a whole ends with that refusal when its own hold
 alone outlasts the window, or with `BudgetExceededError` caused by it. Each command is weighed against
-its own method's hold, as known when its round is planned: a round waits as long as its `UNSAFE` and
-`UNKNOWN` commands need and at least until one command can go, and a `SAFE` command whose method is
-held longer is sent in a later round; one still waiting when `max_attempts_per_request` is spent is not
-sent again. A hold that appears during a round's wait stops the whole round at its permit when it
+its own method's hold, as known when its round is planned. The rounds share the batch's attempts, so a
+round waits for the longest hold among its commands when each of them can wait that long, and sends them
+all; when an `UNSAFE` or `UNKNOWN` command cannot (the wait must leave it as much window again), the
+round waits for the longest hold those commands can afford, sends every command held no longer, and the
+`SAFE` commands held longer go together in the next round;
+one still waiting when `max_attempts_per_request` is spent is not sent again. A hold that appears during a round's wait stops the whole round at its permit when it
 outlasts the window. The first send of a `batch()` or `batch_outcomes()` chunk weighs its commands the
 same way, by how much longer their methods are held than the portal: the least held go at once, a
 command held longer goes in a later envelope once its hold ends, and only one whose hold outlasts what
@@ -359,7 +361,10 @@ async with client.batch_outcomes(commands) as stream:
 Commands whose request uses `RouteKind.API_V3` travel in native REST 3.0 batch envelopes: one JSON
 array of at most 50 commands, never mixed with classic commands and grouped into contiguous runs of
 one replay safety (`UNSAFE` and `UNKNOWN` share a run). Envelopes go out in input order: a classic
-command between two v3 commands travels in its own envelope between theirs. The transport must
+command between two v3 commands travels in its own envelope between theirs. The one exception is a
+command whose method is held longer than the rest of its envelope's: it goes in a later envelope, after
+the chunk's other envelopes (see the load limits above). Outcomes come back in input order either way.
+The transport must
 advertise JSON-array bodies, as `HttpxTransport` does; otherwise such a command fails with
 `CapabilityError` before any request. Each array element is checked against its own request's
 embedded-error contract, so one failed command neither fails nor resends its successful neighbours.
@@ -393,7 +398,10 @@ hint, attempts, retry window, deadline), then sends one command at a time, so it
 dispatch's concurrency; `UNSAFE` and `UNKNOWN` commands arrive
 as `CommandOutcomeUnknown` without a resend. The report counts `ambiguous_physical_attempts` and
 `batch_isolation_requests`. Fail-fast `batch()` finishes resolving the envelope it already sent and
-then raises without reading further input.
+then raises without reading further input. A batch stream that ends before it delivered every outcome
+(cancelled mid-envelope, say) tells the admitted commands it never delivered apart in its report:
+`undelivered_possibly_run` counts those a send may have run (in flight, or sent without an answer),
+`undelivered_not_sent` those never sent; the rest were answered.
 
 A classic (non-REST 3.0) batch sends each command as a PHP query string, which cannot carry every
 JSON value with the meaning a direct call gives it. A command is sent in a classic batch only when its

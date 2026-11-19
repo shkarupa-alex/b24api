@@ -3,6 +3,7 @@
 from __future__ import annotations
 import asyncio
 import contextlib
+import itertools
 import math
 import time
 from collections import deque
@@ -47,6 +48,13 @@ class CoordinatorBudgetError(TimeoutError):
 class _Waiter:
     future: asyncio.Future[None]
     methods: frozenset[str]
+    arrival: int
+
+
+def _requeue(queue: deque[_Waiter], waiter: _Waiter) -> None:
+    """Queue a waiter that gave its permit back where its arrival puts it: behind earlier arrivals, ahead of later."""
+    place = next((index for index, each in enumerate(queue) if each.arrival > waiter.arrival), len(queue))
+    queue.insert(place, waiter)
 
 
 class WorkClass(StrEnum):
@@ -108,6 +116,16 @@ class _Streak:
     since: float
 
 
+def _check_admission(work_class: WorkClass, methods: frozenset[str], budget: DeadlineBudget | None) -> None:
+    """Refuse an admission request whose arguments are not what ``RateCoordinator.acquire`` takes."""
+    if not isinstance(work_class, WorkClass):
+        raise TypeError("work_class must be a WorkClass")
+    if not isinstance(methods, frozenset) or not methods or any(not isinstance(m, str) or not m for m in methods):
+        raise ValueError("methods must be a non-empty frozenset of method names")
+    if budget is not None and not isinstance(budget, DeadlineBudget):
+        raise TypeError("budget must be a DeadlineBudget")
+
+
 class RateCoordinator:
     """Cooldown-aware fair permit scheduler shared by every execution class.
 
@@ -135,6 +153,7 @@ class RateCoordinator:
         self._clock = clock
         self._sleep = sleep
         self._queues: dict[WorkClass, deque[_Waiter]] = {work_class: deque() for work_class in WorkClass}
+        self._arrivals = itertools.count()
         self._method_until: dict[str, float] = {}
         # The monotonic moment each method's operating time resets, as its latest answer gave it.
         self._method_reset: dict[str, float] = {}
@@ -161,41 +180,53 @@ class RateCoordinator:
         methods: frozenset[str],
         budget: DeadlineBudget | None = None,
     ) -> _Permit:
-        """Acquire one coordinator permit for the requested work class."""
-        if not isinstance(work_class, WorkClass):
-            raise TypeError("work_class must be a WorkClass")
-        if not isinstance(methods, frozenset) or not methods or any(not isinstance(m, str) or not m for m in methods):
-            raise ValueError("methods must be a non-empty frozenset of method names")
-        if budget is not None and not isinstance(budget, DeadlineBudget):
-            raise TypeError("budget must be a DeadlineBudget")
+        """Acquire one coordinator permit for the requested work class.
+
+        A permit granted as another is released is checked again when its waiter wakes (``_still_admits``).
+        """
+        _check_admission(work_class, methods, budget)
         loop = asyncio.get_running_loop()
-        future: asyncio.Future[None] = loop.create_future()
-        waiter = _Waiter(future, methods)
         if self._state is CoordinatorState.CLOSED:
             raise ClientClosedError("rate coordinator is closed")
         self._refresh_cooldown()
         if budget is not None and self._clock() >= budget.deadline:
             raise CoordinatorBudgetError("coordinator admission budget exhausted")
-        self._queues[work_class].append(waiter)
-        self._grant()
+        queue = self._queues[work_class]
+        waiter = _Waiter(loop.create_future(), methods, next(self._arrivals))
+        queue.append(waiter)
         try:
-            if budget is None:
-                await future
-            else:
-                async with asyncio.timeout_at(loop.time() + max(0.0, budget.deadline - self._clock())):
-                    await future
+            async with (
+                contextlib.nullcontext()
+                if budget is None
+                else asyncio.timeout_at(loop.time() + max(0.0, budget.deadline - self._clock()))
+            ):
+                while True:
+                    self._grant()
+                    await waiter.future
+                    if self._closed():
+                        # Closed between the grant and this wake-up: the send is refused as a queued one is.
+                        self._return_granted()
+                        raise ClientClosedError("rate coordinator is closed")
+                    if self._still_admits(methods):
+                        return _Permit(self)
+                    # The answer that freed this permit held the host or a method of ``methods`` before this waiter
+                    # woke: the permit goes back, and the waiter keeps the place its arrival gave it, ahead of
+                    # every waiter that queued after it.
+                    self._return_granted()
+                    waiter = _Waiter(loop.create_future(), methods, waiter.arrival)
+                    _requeue(queue, waiter)
         except (asyncio.CancelledError, TimeoutError) as error:
+            future = waiter.future
             was_granted = future.done() and not future.cancelled() and future.exception() is None
             if was_granted:
                 self._return_granted()
             else:
                 with contextlib.suppress(ValueError):
-                    self._queues[work_class].remove(waiter)
+                    queue.remove(waiter)
             self._grant()
             if isinstance(error, TimeoutError):
                 raise CoordinatorBudgetError("coordinator admission budget exhausted") from error
             raise
-        return _Permit(self)
 
     def hold_method(self, method: str, delay: float) -> None:
         """Hold every permit for ``method`` for ``delay`` seconds (capped at an hour), or longer if already held."""
@@ -343,6 +374,19 @@ class RateCoordinator:
         self._refresh_cooldown()
         self._grant()
 
+    def _closed(self) -> bool:
+        """Return whether the coordinator is closed: read again after an await, where ``close`` may have run."""
+        return self._state is CoordinatorState.CLOSED
+
+    def _still_admits(self, methods: frozenset[str]) -> bool:
+        """Return whether a permit granted for ``methods`` may still be used: nothing held them since the grant.
+
+        A permit is granted as another is released, before the released request has read its answer; a refusal there
+        holds the host or a method at once, and the granted send must wait for that hold as a queued one does.
+        """
+        self._refresh_cooldown()
+        return self._state is not CoordinatorState.COOLDOWN and self._methods_ready(methods)
+
     def _return_granted(self) -> None:
         if self._active < 1:
             raise RuntimeError("granted permit accounting underflow")
@@ -385,8 +429,16 @@ class RateCoordinator:
         return all(self._method_until.get(method, 0.0) <= now for method in methods)
 
     def _prune_methods(self) -> None:
+        """Drop the method holds that ended; a waiter one held may go now, so the free permits are granted at once.
+
+        Whoever reads the holds prunes them (a re-check on wake, ``snapshot``, a new hold): the wake task, sleeping
+        for a pruned deadline, then finds none left and grants nothing.
+        """
         now = self._clock()
+        held = len(self._method_until)
         self._method_until = {method: until for method, until in self._method_until.items() if until > now}
+        if len(self._method_until) < held:
+            self._grant()
 
     def _refresh_cooldown(self) -> None:
         self._prune_methods()

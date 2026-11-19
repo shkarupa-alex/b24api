@@ -12,7 +12,7 @@ from b24api.contracts.policy import ExecutionPolicy, RetryPolicy
 from b24api.contracts.request import RouteKind
 from b24api.errors import ApiResponseError, BudgetExceededError
 from b24api.execution import CoordinatorState, Executor, RateCoordinator, WireResponse
-from b24api.execution.throttle import parse_rate_limit_reset, parse_retry_after
+from b24api.execution.throttle import Limit, limit_of, parse_rate_limit_reset, parse_retry_after
 from tests.scripting import ResponderTransport, always
 
 HOST = "test.invalid"
@@ -115,3 +115,18 @@ async def test_invalid_rate_limit_reset_never_freezes_the_host() -> None:
         assert snapshot.cooldown_until is None
     finally:
         await coordinator.close()
+
+
+@pytest.mark.parametrize(
+    ("code", "status", "limit"),
+    [
+        # A method's time limit holds that method alone, whatever status it comes with, 429 included.
+        ("OPERATION_TIME_LIMIT", 429, Limit.METHOD),
+        ("OPERATION_TIME_LIMIT", 200, Limit.METHOD),
+        ("QUERY_LIMIT_EXCEEDED", 503, Limit.HOST),
+        ("ANY_OTHER", 429, Limit.HOST),
+        ("ANY_OTHER", 503, None),
+    ],
+)
+def test_a_refusal_names_the_limit_of_its_code_before_its_status(code: str, status: int, limit: Limit | None) -> None:
+    assert limit_of(ApiResponseError(code=code, description=None, http_status=status)) is limit

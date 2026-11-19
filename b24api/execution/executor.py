@@ -284,11 +284,13 @@ class _RoundPlan:
 
     Each send is weighed against the round's one backoff and its own methods' hold, and admitted when that wait
     fits the window for its safety; one that does not fit is refused, held out when its hold alone does not fit
-    (``_SendPlan.HELD_OUT``). A whole round is refused whole when one of its sends does not fit. The round waits as
-    little as it can: as long as its admitted sends that may not be repeated need, so each of them is sent, and at
-    least until one admitted send can go. Every admitted send whose own wait is no longer is sent; a longer one,
-    which may always be repeated, is carried to a later round (or a first send to a later envelope) instead of
-    holding the others back. A round that carries a send always sends one.
+    (``_SendPlan.HELD_OUT``). A whole round is refused whole when one of its sends does not fit. A batch's replay
+    rounds share its attempts, so a replay round waits for its longest admitted send when every admitted send can
+    wait that long, and sends them all; otherwise it waits as long as its sends that may not be repeated need, and
+    the SAFE sends held longer go together in the next round. A first send's later envelopes have attempts of their
+    own, so it waits as little as it can: at least until one admitted send can go, and a send held longer goes in a
+    later envelope instead of holding the others back. Every admitted send whose own wait is no longer than the
+    round's is sent; the others are carried. A round that carries a send always sends one.
     """
 
     pause: _Pause
@@ -318,8 +320,16 @@ def _retry_refusal(replay: _RoundPlan | None) -> str:
     return "per-request attempt budget exhausted" if replay is None else "retry delay would exceed elapsed budget"
 
 
-def _plan_round(own: tuple[_Pause, ...], safeties: tuple[ReplaySafety, ...], *, whole: bool) -> _RoundPlan:
-    """Plan a round from each send's own pause (see ``_RoundPlan``)."""
+def _plan_round(
+    own: tuple[_Pause, ...], safeties: tuple[ReplaySafety, ...], *, whole: bool, together: bool
+) -> _RoundPlan:
+    """Plan a round from each send's own pause (see ``_RoundPlan``).
+
+    ``together``: the rounds share one attempt budget (a batch's replay rounds), so a carried send's later round
+    would spend an attempt of the sends it carries: the round waits for every admitted send when each can wait that
+    long, and carries only the sends held longer than a send that may not be repeated can wait. Without it (a first
+    send, whose later envelopes have attempts of their own) the least held sends go now.
+    """
     first = own[0]
     refusals = tuple(
         _SendPlan.HELD_OUT if not dataclasses.replace(each, backoff=0.0).admits(safety) else _SendPlan.REFUSE
@@ -341,8 +351,18 @@ def _plan_round(own: tuple[_Pause, ...], safeties: tuple[ReplaySafety, ...], *, 
         ),
         default=0.0,
     )
-    held = max(needed, min(admitted, default=0.0))
-    pause = dataclasses.replace(first, held=held)
+    pause = dataclasses.replace(first, held=max(needed, min(admitted, default=0.0)))
+    if together:
+        # The longest wait each send it would take along can afford: those held longer go together next round.
+        for held in sorted({each for each in admitted if each >= needed}, reverse=True):
+            candidate = dataclasses.replace(first, held=held)
+            if all(
+                candidate.admits(safety)
+                for each, fit, safety in zip(own, fits, safeties, strict=True)
+                if fit and each.delay <= candidate.delay
+            ):
+                pause = candidate
+                break
     return _RoundPlan(
         pause,
         tuple(
@@ -1049,7 +1069,7 @@ class Executor:
         now = self._clock()
         holds = context.coordinator.admission_delays(tuple(methods for _, methods in sends))
         own = tuple(_Pause(backoff, held, window, now) for held in holds)
-        return _plan_round(own, tuple(safety for safety, _ in sends), whole=whole)
+        return _plan_round(own, tuple(safety for safety, _ in sends), whole=whole, together=True)
 
     def plan_first_send(self, context: ExecutionContext, *, methods: tuple[frozenset[str], ...]) -> _RoundPlan | None:
         """Plan which commands an envelope's first send leaves for a later envelope; ``None``: it goes whole.
@@ -1069,7 +1089,7 @@ class Executor:
         host, *holds = context.coordinator.admission_delays((frozenset(), *methods))
         window = context.time_left(_PERMIT_REFUSAL) - host
         pauses = tuple(_Pause(0.0, held - host, window, now) for held in holds)
-        plan = _plan_round(pauses, tuple(ReplaySafety.SAFE for _ in pauses), whole=False)
+        plan = _plan_round(pauses, tuple(ReplaySafety.SAFE for _ in pauses), whole=False, together=False)
         if all(each is _SendPlan.SEND for each in plan.plans) or all(each.refused for each in plan.plans):
             return None
         return plan

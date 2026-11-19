@@ -28,7 +28,7 @@
   `QUERY_LIMIT_EXCEEDED`) only delayed the refused request's own retry: every other request of the client
   went on at full rate and was refused in turn. Such a refusal now holds the whole portal for the retry
   backoff of the refusals in a row (0.5 s, then 1, 2 and so on up to 30 s by default), so the client's
-  requests slow down together. A refusal of a request sent after the latest pause began grows that
+  requests slow down together, a request waiting for the slot the refused one frees included. A refusal of a request sent after the latest pause began grows that
   backoff; the refusals of one burst, sent before it, do not; an answer about anything but the load (a
   success, or a failure with no limit's code, no 429 and no 503), to a request sent after that pause
   began, resets it. A
@@ -37,7 +37,8 @@
   for a fixed 120 s, which no setting changed. It now holds it for the answer's hint, else until the
   method's operating time resets, as its latest answer said (`time.operating_reset_at`), else for the
   backoff of that method's refusals in a row. A classic batch command's `result_time` is now decoded
-  (`CommandSuccess.response.time` was always `None`) and counts the same.
+  (`CommandSuccess.response.time` was always `None`) and counts the same. Its `Retry-After` now holds only
+  the refused method, where it held every request to the portal too.
 - **Breaking: a throttle hint holds the portal only on an answer about its load.** A `Retry-After` on
   any failed answer held every request to the portal, for up to an hour: a 401 `expired_token` with
   `Retry-After: 3600` refused every later call at once. A hint now holds the portal only on a 429, a
@@ -56,31 +57,32 @@
   `ResultErrorSpec` finds `QUERY_LIMIT_EXCEEDED` or `OPERATION_TIME_LIMIT` inside a 200 answer
   raised it at once. It is now classified within the attempt, as a refusal of the whole answer is:
   it holds the portal or the method, and the request is retried after the hold, an `UNSAFE` one
-  included, since the refusal proves it did not run.
+  included, since the refusal proves it did not run. So is any other code
+  `RetryPolicy.transient_api_codes` lists, a code you added included: found inside a 200 answer, it is
+  retried as the same refusal of the whole answer would be.
 - **Breaking: a held command goes in a later envelope.** The first send of a `batch()` or
   `batch_outcomes()` chunk left out a command whose method was held longer than the retry window when
   another command could go, and that command failed unsent with `BudgetExceededError` ("coordinator
   hold exceeds execution time budget"): after one `OPERATION_TIME_LIMIT` on `crm.deal.update`, a chunk
   of 49 updates and one get sent the get and failed the updates. The command now goes in a later
   envelope of its chunk, once its hold ends; only a command whose hold outlasts what the operation has
-  left (`max_elapsed`, after the portal's own hold) is refused unsent. A chunk is still sent whole when
-  every command can go at once, or none can.
-- **Breaking: a replay round of `SAFE` commands waits for the least held.** A classic replay round
-  of `SAFE` commands only waited for the longest hold among them before it sent them all. It now
-  waits as long as its `UNSAFE` and `UNKNOWN` commands need and at least until one command can go;
-  a `SAFE` command held longer goes in a later round, as one beside an `UNSAFE` command already
-  did.
+  left (`max_elapsed`, after the portal's own hold) is refused unsent. That later envelope goes after
+  the chunk's other envelopes, so a held update sent before its comment now goes after it; outcomes
+  still come back in input order. A chunk is still sent whole when every command can go at once, or
+  none can.
 - **Breaking: retries take turns with first sends.** A retry, whose window runs while it queues,
   got one permit in six from the client's shared limiter, behind every other class of work.
-  Retries and first sends now alternate, so a retry waits for at most one other permit.
+  Retries and first sends now alternate: a retry waits behind the retries queued before it and at most
+  one first send per retry granted.
 - **New: a cancelled batch stream tells in flight from never sent.** A `batch_outcomes()` or `batch()`
   stream ended before it delivered every outcome (cancelled mid-envelope, say) reported `unknown=0`,
   though up to an envelope of commands may have run. `OperationReport.undelivered_possibly_run` counts
   the admitted commands never delivered that a send may have run (in flight, or sent without an answer),
   and `undelivered_not_sent` those never sent; the rest of `admitted - emitted` were answered.
-- **`cooldown_seconds` counts the time the portal was held.** Concurrent refusals each added their
+- **Breaking: `cooldown_seconds` counts the time the portal was held.** Concurrent refusals each added their
   whole hint: ten 429s at once with a 0.2-second hint reported 2 s of cooldown for 0.2 s of pause. Each
-  now adds only how far it extended the hold.
+  now adds only how far it extended the hold. `RateCoordinator.observe_throttle` returns that extension,
+  not the hold left: a hint the current hold already covers returns `0.0`.
 - **The backoff saturates.** A large `RetryPolicy.backoff` or many attempts raised `OverflowError`
   computing the delay (`backoff=1e200` after three sends, `backoff=2.0` after 1,025). The delay now
   saturates at `maximum_delay`.
@@ -1019,12 +1021,13 @@ Public signatures are unchanged; when a retry waits and when it is sent have cha
   `Date` header when it has one, not the local clock, so a local clock running ahead no longer
   shortens it (unless that `Date` is more than a minute behind the local clock: see "The retry path").
 - **Breaking: a call may now wait up to `max_elapsed` for its first permit.** The retry window
-  `max_retry_elapsed_per_request` (`Settings.http_timeout`, 30 s by default, for the client's default
-  policy) used to start before the request queued for a permit of the client's shared limiter. A
+  `max_retry_elapsed_per_request` (120 s by default; see "Load limits, holds and attempt timeouts" for
+  `Settings.http_timeout`, which no longer sets it) used to start before the request queued for a permit
+  of the client's shared limiter. A
   request that queued behind others was refused without a send, or sent with a sliver of time and
   reported unknown. The window now opens when the first send gets its permit, so queueing for that
   permit is bounded only by the operation's `max_elapsed`, 900 s by default, where it used to be
-  bounded by `http_timeout`. Every send, retry wait and later permit wait spends the window, and each
+  bounded by the window. Every send, retry wait and later permit wait spends the window, and each
   attempt is also bounded by its transport's timeout (see "Load limits, holds and attempt timeouts"). A pause the client
   already knows about that outlasts what is left of `max_elapsed` (a `Retry-After` or an
   `OPERATION_TIME_LIMIT` cooldown on the request's methods) fails at once with

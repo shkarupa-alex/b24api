@@ -382,25 +382,25 @@ class BatchExecutor:
         """
         eligible, rejected = self._partition_capabilities(commands)
         settled: Mapping[int, BatchOutcome] = {}
-        if halt and rejected:
-            first_rejected = next(command.index for command in commands if command.index in rejected)
-            message = "physical batch command was not executed after fail-fast capability rejection"
-            rejected = {
-                command.index: rejected[command.index]
-                if command.index == first_rejected
-                else _shared_failure(command, _withheld(message, command))
-                for command in commands
-            }
-        elif eligible:
-            options = _RoundOptions(halt, advisory_totals, strict_envelope, split_held and not halt)
-            progress = BatchProgress() if progress is None else progress
-            try:
+        progress = BatchProgress() if progress is None else progress
+        try:
+            if halt and rejected:
+                first_rejected = next(command.index for command in commands if command.index in rejected)
+                message = "physical batch command was not executed after fail-fast capability rejection"
+                rejected = {
+                    command.index: rejected[command.index]
+                    if command.index == first_rejected
+                    else _shared_failure(command, _withheld(message, command))
+                    for command in commands
+                }
+            elif eligible:
+                options = _RoundOptions(halt, advisory_totals, strict_envelope, split_held and not halt)
                 settled = await self._execute_groups(
                     eligible, context=context, options=options, on_envelope=on_envelope, progress=progress
                 )
-            finally:
-                # Whichever way the groups end, nothing more of the chunk is sent.
-                progress.end()
+        finally:
+            # Whichever way the chunk ends, a chunk refused before any send included, nothing more of it is sent.
+            progress.end()
         # Every outcome of the chunk leaves the engine through the one mapping from execution facts.
         return tuple(_by_facts(outcome) for outcome in _merge_outcomes(commands, tuple(settled.values()), rejected))
 
@@ -886,7 +886,10 @@ def _decode_batch_envelope(
     errors = _decode_php_map(raw["result_error"], field="result_error")
     totals = _decode_optional_php_map(raw, field="result_total")
     continuations = _decode_optional_php_map(raw, field="result_next")
-    times = _decode_optional_php_map(raw, field="result_time")
+    # The commands' timing is diagnostic, as each command's is (``_command_time``): a member that is not a map of
+    # them is left out, and the answers are kept.
+    timing = raw.get("result_time")
+    times = timing if isinstance(timing, dict) else {}
     result_keys = frozenset(results)
     error_keys = frozenset(errors)
     contradictory = result_keys & error_keys
@@ -1001,7 +1004,8 @@ def _envelope_groups(eligible: tuple[_Command, ...]) -> tuple[tuple[_Command, ..
 
     A run of classic commands shares one envelope as before; a native v3 run carries one safety class:
     a SAFE run never carries an UNSAFE or UNKNOWN command, and UNSAFE and UNKNOWN travel together. A
-    change of dialect or v3 safety class closes the run, so no command is sent before an earlier one.
+    change of dialect or v3 safety class closes the run, so the envelopes keep the commands' input order (the first
+    send may still move a command held longer than the rest of its envelope to a later one, after the others).
     """
     groups: list[tuple[_Command, ...]] = []
     run: list[_Command] = []

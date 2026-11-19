@@ -9,7 +9,7 @@ import pytest
 from b24api import ReplaySafety, Request, RouteKind, TerminalState
 from b24api.batch.correlation import _Command
 from b24api.batch.engine import BatchExecutor, BatchProgress
-from b24api.contracts import Command, ExecutionPolicy
+from b24api.contracts import Command, ExecutionPolicy, ResultErrorSpec, ResultSelector, RetryPolicy
 from b24api.errors import BatchFailed
 from b24api.execution import Executor, RateCoordinator
 from b24api.execution.facts import Execution
@@ -20,7 +20,7 @@ from tests.scripting import client_for, json_response
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-    from b24api.contracts import CommandSuccess, OperationReport
+    from b24api.contracts import OperationReport
     from b24api.contracts.stream import OperationStream
     from b24api.transport import WireRequest
 
@@ -216,7 +216,7 @@ async def test_commands_admitted_from_a_source_that_then_failed_are_reported_not
     assert (report.undelivered_possibly_run, report.undelivered_not_sent) == (0, 2)
 
 
-async def _drain(stream: OperationStream[CommandSuccess[int]]) -> None:
+async def _drain[T](stream: OperationStream[T]) -> None:
     async with stream:
         async for _outcome in stream:
             pass
@@ -232,4 +232,123 @@ async def test_a_fail_fast_batch_whose_source_failed_reports_its_admitted_comman
     assert report is not None
 
     assert (report.admitted, report.emitted) == (3, 0)
+    assert (report.undelivered_possibly_run, report.undelivered_not_sent) == (0, 3)
+
+
+_HALTED_CHUNK = 10
+
+
+class _HaltsAtTheFirstEntry(ScriptedTransport):
+    """Answer each classic envelope with its first command failed, so a halting batch stops before the others."""
+
+    def __init__(self) -> None:
+        super().__init__(())
+
+    async def send_wire(self, wire: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        del attempt_timeout, max_response_bytes
+        commands = wire.parameters["cmd"]
+        assert isinstance(commands, dict)
+        first = next(iter(commands))
+        errors = {first: {"error": "ERROR_NOT_FOUND", "error_description": "not found"}}
+        return json_response({"result": {"result": [], "result_error": errors}})
+
+
+@pytest.mark.asyncio
+async def test_commands_a_halting_envelope_withheld_are_reported_not_sent() -> None:
+    # The server halted the envelope at its first command: it proved it never ran the others, which are not sent.
+    commands = [
+        Command(Request.bare("x.item.get", {"id": index}, ReplaySafety.SAFE), index) for index in range(_HALTED_CHUNK)
+    ]
+    async with client_for(_HaltsAtTheFirstEntry()) as client:
+        stream = client.batch(commands, batch_size=_HALTED_CHUNK)
+        with pytest.raises(BatchFailed):
+            await _drain(stream)
+    report = stream.report
+    assert report is not None
+    assert report.undelivered_possibly_run == 0
+    assert report.undelivered_not_sent == _HALTED_CHUNK - 1
+
+
+class _AnswersOneThenHangs(ScriptedTransport):
+    """Answer a REST 3.0 envelope's first element and refuse its second for the quota; the replay never returns."""
+
+    def __init__(self) -> None:
+        super().__init__(())
+        self.sends = 0
+        self.hanging = asyncio.Event()
+
+    async def send_wire(self, wire: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        del wire, attempt_timeout, max_response_bytes
+        self.sends += 1
+        if self.sends == 1:
+            return json_response({"result": [{"item": 1}, {"error": {"code": "QUERY_LIMIT_EXCEEDED"}}]})
+        self.hanging.set()
+        await asyncio.Future()
+        raise AssertionError
+
+
+@pytest.mark.asyncio
+async def test_a_rest_v3_command_its_group_answered_before_the_cancel_is_neither_possibly_run_nor_unsent() -> None:
+    # The group's first envelope answered one command; the replay of the other is in flight when the stream is
+    # cancelled. Only the replayed command may have run; the answered one is in neither count.
+    transport = _AnswersOneThenHangs()
+    spec = ResultErrorSpec(ResultSelector(("error",)), ("code",))
+    commands = [
+        Command(
+            Request("x.item.get", {"id": index}, ReplaySafety.SAFE, route=RouteKind.API_V3, result_error=spec), index
+        )
+        for index in range(2)
+    ]
+    policy = ExecutionPolicy(retry=RetryPolicy(initial_delay=0.01, jitter=0))
+    async with client_for(transport, policy=policy) as client:
+        stream = client.batch_outcomes(commands)
+        consumer = asyncio.ensure_future(_drain(stream))
+        await transport.hanging.wait()
+        consumer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await consumer
+    report = stream.report
+    assert report is not None
+
+    assert (report.admitted, report.emitted) == (2, 0)
+    assert (report.undelivered_possibly_run, report.undelivered_not_sent) == (1, 0)
+
+
+def _refused_locally(params: list[dict[str, object]]) -> list[Command[int]]:
+    """Commands of ``params``; a ``None`` value is one no classic envelope can carry, refused before any send."""
+    return [Command(Request.bare("x.item.add", each, ReplaySafety.UNSAFE), index) for index, each in enumerate(params)]
+
+
+@pytest.mark.asyncio
+async def test_commands_of_a_chunk_refused_before_any_send_are_reported_not_sent() -> None:
+    # No envelope can carry any of the chunk's commands, so nothing of it is sent; the consumer stops after the first
+    # outcome, and the two it left behind were never sent.
+    transport = _HangingTransport(hang_at=0)
+    async with client_for(transport) as client:
+        stream = client.batch_outcomes(_refused_locally([{"id": None}] * 3))
+        async with stream:
+            async for _outcome in stream:
+                break
+    report = stream.report
+    assert report is not None
+
+    assert transport.sends == 0
+    assert (report.admitted, report.emitted) == (3, 1)
+    assert (report.undelivered_possibly_run, report.undelivered_not_sent) == (0, 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("params", [[{"id": None}] * 3, [{"id": 1}, {"id": None}, {"id": 1}]], ids=["all", "one"])
+async def test_a_fail_fast_chunk_a_refused_command_failed_reports_its_commands_not_sent(
+    params: list[dict[str, object]],
+) -> None:
+    transport = _HangingTransport(hang_at=0)
+    async with client_for(transport) as client:
+        stream = client.batch(_refused_locally(params))
+        with pytest.raises(BatchFailed):
+            await _drain(stream)
+    report = stream.report
+    assert report is not None
+
+    assert transport.sends == 0
     assert (report.undelivered_possibly_run, report.undelivered_not_sent) == (0, 3)
