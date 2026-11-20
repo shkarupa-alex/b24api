@@ -41,6 +41,10 @@ class KernelReport:
     empty_source_witness: EmptySourceWitness | None = None
     ambiguous_physical_attempts: int = field(default=0, kw_only=True)
     batch_isolation_requests: int = field(default=0, kw_only=True)
+    # Admitted batch commands the operation ended before their outcome was delivered: possibly run (sent, in flight
+    # or unanswered) and never sent.
+    undelivered_possibly_run: int = field(default=0, kw_only=True)
+    undelivered_not_sent: int = field(default=0, kw_only=True)
 
     def __post_init__(self) -> None:  # noqa: C901 - one flat validation of every report field
         """Validate and normalize instance state."""
@@ -69,6 +73,8 @@ class KernelReport:
             self.buffered_rows_high_water,
             self.ambiguous_physical_attempts,
             self.batch_isolation_requests,
+            self.undelivered_possibly_run,
+            self.undelivered_not_sent,
         )
         if any(not _is_plain_int(value) or value < 0 for value in counters) or self.cooldown_seconds < 0:
             raise ValueError("report counters must be non-negative")

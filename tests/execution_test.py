@@ -3,6 +3,7 @@
 from __future__ import annotations
 import asyncio
 import contextlib
+import dataclasses
 import gc
 import weakref
 from pathlib import Path
@@ -13,7 +14,7 @@ import pytest
 
 import b24api
 from b24api import execution as execution_module
-from b24api.contracts import Command
+from b24api.contracts import Command, CommandFailure
 from b24api.contracts.policy import ExecutionPolicy, RetryPolicy
 from b24api.contracts.request import ReplaySafety, Request, RouteKind
 from b24api.errors import (
@@ -37,17 +38,21 @@ from b24api.execution import (
     rearm_cancellation,
 )
 from b24api.execution.context import LatchState, OperationLatch, is_interrupt, settle
+from b24api.execution.facts import Execution, execution
 from b24api.execution.rate import (
     CoordinatorBudgetError,
     DeadlineBudget,
     RatePolicyCapacityError,
 )
+from b24api.testing import ScriptedTransport
+from b24api.transport import TransportCapabilities
 from b24api.transport import httpx as httpx_transport_module
 from tests.scripting import Blocker, ResponderTransport, client_for, replies
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Generator, Iterable
 
+    from b24api.transport import WireRequest
     from tests.scripting import ClientFactory, Responder
 
 EXPECTED_RETRIED_CALLS = 2
@@ -612,7 +617,9 @@ async def test_structured_throttle_uses_shared_cooldown_and_safe_replay() -> Non
 
 
 @pytest.mark.asyncio
-async def test_coordinator_merges_cooldowns_and_does_not_let_retries_starve_interactive() -> None:
+async def test_coordinator_merges_cooldowns_and_alternates_retries_with_first_sends() -> None:
+    # A retry's window runs while it queues, so it waits for one other permit at most; first sends still get every
+    # other turn, so retries never starve them.
     coordinator = RateCoordinator(max_concurrency=1)
     first = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"profile"}))
 
@@ -622,12 +629,13 @@ async def test_coordinator_merges_cooldowns_and_does_not_let_retries_starve_inte
     await asyncio.sleep(0)
     await first.release()
 
+    retry_permit = await asyncio.wait_for(retry_one, timeout=1)
+    assert not interactive.done()
+    assert not retry_two.done()
+    await retry_permit.release()
     interactive_permit = await asyncio.wait_for(interactive, timeout=1)
-    assert not retry_one.done()
     assert not retry_two.done()
     await interactive_permit.release()
-    retry_permit = await asyncio.wait_for(retry_one, timeout=1)
-    await retry_permit.release()
     second_retry_permit = await asyncio.wait_for(retry_two, timeout=1)
     await second_retry_permit.release()
 
@@ -640,6 +648,27 @@ async def test_coordinator_merges_cooldowns_and_does_not_let_retries_starve_inte
     await permit.release()
     assert (await coordinator.snapshot()).state is CoordinatorState.OPEN
     await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_grants_interactive_first_sends_twice_as_often_as_batches() -> None:
+    coordinator = RateCoordinator(max_concurrency=1)
+    first = await coordinator.acquire(WorkClass.TRAVERSAL_DIRECT, methods=frozenset({"m"}))
+    order: list[str] = []
+
+    async def wait(work_class: WorkClass, name: str) -> None:
+        permit = await coordinator.acquire(work_class, methods=frozenset({"m"}))
+        order.append(name)
+        await permit.release()
+
+    tasks = [asyncio.create_task(wait(WorkClass.INTERACTIVE_DIRECT, "I")) for _ in range(8)]
+    tasks += [asyncio.create_task(wait(WorkClass.BATCH, "B")) for _ in range(4)]
+    await asyncio.sleep(0)
+    await first.release()
+    await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+    await coordinator.close()
+
+    assert "".join(order) == "BIIBIIBIIBII"
 
 
 @pytest.mark.asyncio
@@ -703,8 +732,8 @@ async def test_permit_wait_is_bounded_without_counting_or_dispatching_an_attempt
 
 @pytest.mark.asyncio
 async def test_method_limit_blocks_only_affected_method_and_whole_batch() -> None:
-    coordinator = RateCoordinator(max_concurrency=1, operation_time_limit_delay=0.03)
-    await coordinator.observe_operation_time_limit("crm.item.list")
+    coordinator = RateCoordinator(max_concurrency=1)
+    coordinator.hold_method("crm.item.list", 0.03)
     blocked = asyncio.create_task(
         coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"crm.item.list"})),
     )
@@ -730,9 +759,169 @@ async def test_method_limit_blocks_only_affected_method_and_whole_batch() -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("hold", ["host", "method"])
+async def test_a_permit_granted_before_a_hold_is_returned_and_its_waiter_keeps_its_place(hold: str) -> None:
+    # A permit is released, which grants it to the next waiter, and the released request's answer then holds the
+    # host or the waiter's method before the waiter wakes. The waiter does not use the grant: it waits for the hold,
+    # first in its queue, ahead of one that queued after it.
+    coordinator = RateCoordinator(max_concurrency=1)
+    profile = frozenset({"profile"})
+    held = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=profile)
+    first = asyncio.create_task(coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=profile))
+    await asyncio.sleep(0)
+    later = asyncio.create_task(coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=profile))
+    await asyncio.sleep(0)
+    held.release_now()
+    await _hold(coordinator, hold)
+    await asyncio.sleep(0.02)
+    assert not first.done()
+    snapshot = await coordinator.snapshot()
+    assert snapshot.active_permits == 0
+    assert dict(snapshot.queued)[WorkClass.INTERACTIVE_DIRECT] == len((first, later))
+    permit = await asyncio.wait_for(first, timeout=1)
+    assert not later.done()
+    await permit.release()
+    await (await asyncio.wait_for(later, timeout=1)).release()
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hold", ["host", "method"])
+async def test_a_permit_granted_before_a_hold_the_budget_cannot_wait_out_gives_up_typed(hold: str) -> None:
+    coordinator = RateCoordinator(max_concurrency=1)
+    profile = frozenset({"profile"})
+    held = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=profile)
+    budget = DeadlineBudget(asyncio.get_running_loop().time() + 0.02)
+    waiter = asyncio.create_task(coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=profile, budget=budget))
+    await asyncio.sleep(0)
+    held.release_now()
+    await _hold(coordinator, hold)
+    with pytest.raises(CoordinatorBudgetError):
+        await waiter
+    snapshot = await coordinator.snapshot()
+    assert snapshot.active_permits == 0
+    assert dict(snapshot.queued)[WorkClass.INTERACTIVE_DIRECT] == 0
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hold", ["host", "method", "none"])
+async def test_a_permit_granted_before_a_close_is_refused_as_a_queued_one_is(hold: str) -> None:
+    # The released request's answer holds the waiter's methods (or nothing), then the client closes, all before the
+    # waiter wakes. The waiter has not sent yet: it is refused as a queued one is, at once, and its permit returned.
+    coordinator = RateCoordinator(max_concurrency=1)
+    profile = frozenset({"profile"})
+    held = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=profile)
+    waiter = asyncio.create_task(coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=profile))
+    await asyncio.sleep(0)
+    held.release_now()
+    if hold != "none":
+        await _hold(coordinator, hold)
+    await coordinator.close()
+    with pytest.raises(ClientClosedError, match="rate coordinator is closed"):
+        await asyncio.wait_for(waiter, timeout=1)
+    assert (await coordinator.snapshot()).active_permits == 0
+
+
+@pytest.mark.asyncio
+async def test_a_permit_given_back_for_a_method_hold_goes_at_once_to_a_waiter_of_another_method() -> None:
+    # The released request's answer holds the method of the waiter its permit was granted to, before that waiter
+    # wakes. The permit it gives back is not left idle for the hold: a waiter of another method, queued behind it, is
+    # granted it at once.
+    coordinator = RateCoordinator(max_concurrency=1)
+    held = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"profile"}))
+    first = asyncio.create_task(coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"profile"})))
+    await asyncio.sleep(0)
+    other = asyncio.create_task(coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"other"})))
+    await asyncio.sleep(0)
+    held.release_now()
+    coordinator.hold_method("profile", 1.0)
+    permit = await asyncio.wait_for(other, timeout=0.5)
+    assert not first.done()
+    await permit.release()
+    first.cancel()
+    await asyncio.gather(first, return_exceptions=True)
+    assert (await coordinator.snapshot()).active_permits == 0
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hold", ["host", "method"])
+async def test_waiters_that_give_their_permits_back_keep_their_arrival_order(hold: str) -> None:
+    # Two permits are released at once, granting them to the two waiters that queued first, and the released
+    # requests' answer holds the host or their method before they wake. Both give their permits back; when the hold
+    # ends they are granted in the order they queued, both ahead of a waiter that queued after them.
+    coordinator = RateCoordinator(max_concurrency=2)
+    profile = frozenset({"profile"})
+    held = [await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=profile) for _ in range(2)]
+    granted: list[str] = []
+
+    async def wait(name: str) -> None:
+        permit = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=profile)
+        granted.append(name)
+        await asyncio.sleep(0.01)
+        await permit.release()
+
+    waiters = []
+    for name in ("first", "second", "third"):
+        waiters.append(asyncio.create_task(wait(name)))
+        await asyncio.sleep(0)
+    for permit in held:
+        permit.release_now()
+    await _hold(coordinator, hold)
+    await asyncio.wait_for(asyncio.gather(*waiters), timeout=1)
+    await coordinator.close()
+
+    assert granted == ["first", "second", "third"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seen_by", ["re-check", "snapshot"])
+async def test_a_method_hold_seen_ended_grants_its_waiter_a_free_permit_at_once(seen_by: str) -> None:
+    # A method's hold ends with a permit free and a waiter of that method queued. Whoever sees the hold ended first,
+    # a granted waiter's re-check or a snapshot, grants that waiter the free permit then: the wake task that slept for
+    # the hold finds it gone and would grant nothing. Here the wake task never wakes, so only that grant can.
+    now = [0.0]
+
+    async def never(_delay: float) -> None:
+        await asyncio.Event().wait()
+
+    coordinator = RateCoordinator(max_concurrency=2, clock=lambda: now[0], sleep=never)
+    coordinator.hold_method("m.get", 1.0)
+    held = [await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"n.get"})) for _ in range(2)]
+    waiter = asyncio.create_task(coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"m.get"})))
+    other = asyncio.create_task(coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"n.get"})))
+    await asyncio.sleep(0)
+    if seen_by == "re-check":
+        held[0].release_now()  # granted to ``other``, which re-checks the holds as it wakes
+    else:
+        await held[0].release()
+        await (await other).release()
+    held[1].release_now()
+    now[0] = 1.1
+    if seen_by == "snapshot":
+        await coordinator.snapshot()
+    for _turn in range(5):
+        await asyncio.sleep(0)
+
+    assert waiter.done()
+    for task in (waiter, other):
+        await (await task).release()
+    await coordinator.close()
+
+
+async def _hold(coordinator: RateCoordinator, hold: str) -> None:
+    """Hold the host or ``profile`` for 0.05 s at once: before a waiter a permit was just granted to wakes."""
+    if hold == "host":
+        await coordinator.observe_throttle(0.05, reason="refused")
+    else:
+        coordinator.hold_method("profile", 0.05)
+
+
+@pytest.mark.asyncio
 async def test_method_limit_admission_budget_and_closed_error_are_typed() -> None:
-    coordinator = RateCoordinator(operation_time_limit_delay=1)
-    await coordinator.observe_operation_time_limit("profile")
+    coordinator = RateCoordinator()
+    coordinator.hold_method("profile", 1.0)
     with pytest.raises(CoordinatorBudgetError):
         await coordinator.acquire(
             WorkClass.INTERACTIVE_DIRECT,
@@ -759,7 +948,9 @@ async def test_unsafe_operation_time_limit_waits_for_the_method_and_replays() ->
             WireResponse(200, (), b'{"result":true}'),
         ],
     )
-    coordinator = RateCoordinator(operation_time_limit_delay=0.1)
+    coordinator = RateCoordinator()
+    # The method's latest answer said its operating time resets in 0.1 seconds: the time limit holds it that long.
+    coordinator.observe_reset("crm.item.add", 0.1)
     loop = asyncio.get_running_loop()
     started = loop.time()
     response = await Executor(transport, coordinator=coordinator).execute(
@@ -780,20 +971,21 @@ _SAFE_PROFILE = Request("profile", route=RouteKind.BARE, replay_safety=ReplaySaf
 
 
 @pytest.mark.asyncio
-async def test_safe_operation_time_limit_past_the_budget_fails_at_once_with_its_cause() -> None:
+async def test_safe_operation_time_limit_past_the_budget_fails_at_once_with_its_own_code() -> None:
     transport = _sequence([_OPERATION_TIME_LIMIT, WireResponse(200, (), b'{"result":true}')])
     coordinator = RateCoordinator()
+    coordinator.observe_reset("profile", 120.0)
     loop = asyncio.get_running_loop()
     started = loop.time()
-    with pytest.raises(BudgetExceededError) as captured:
+    with pytest.raises(ApiResponseError) as captured:
         await Executor(transport, coordinator=coordinator).execute(
             _SAFE_PROFILE, policy=ExecutionPolicy(max_retry_elapsed_per_request=2.0)
         )
-    # The default 120-second method cooldown cannot fit a 2-second budget, so nothing waits.
+    # The method's operating time resets in 120 seconds, which a 2-second budget cannot wait: nothing waits, and
+    # the request ends with the server's refusal.
     assert loop.time() - started < 1.0
     assert len(transport.requests) == 1
-    assert isinstance(captured.value.__cause__, ApiResponseError)
-    assert captured.value.__cause__.normalized_code == "operation_time_limit"
+    assert captured.value.normalized_code == "operation_time_limit"
     await coordinator.close()
 
 
@@ -801,7 +993,8 @@ async def test_safe_operation_time_limit_past_the_budget_fails_at_once_with_its_
 async def test_safe_operation_time_limit_within_the_budget_retries_after_the_cooldown() -> None:
     cooldown = 0.2
     transport = _sequence([_OPERATION_TIME_LIMIT, WireResponse(200, (), b'{"result":true}')])
-    coordinator = RateCoordinator(operation_time_limit_delay=cooldown)
+    coordinator = RateCoordinator()
+    coordinator.observe_reset("profile", cooldown)
     loop = asyncio.get_running_loop()
     started = loop.time()
     response = await Executor(transport, coordinator=coordinator).execute(
@@ -816,41 +1009,44 @@ async def test_safe_operation_time_limit_within_the_budget_retries_after_the_coo
 @pytest.mark.asyncio
 async def test_safe_traversal_page_operation_time_limit_keeps_its_typed_cause(scripted_client: ClientFactory) -> None:
 
-    transport = _sequence([_OPERATION_TIME_LIMIT])
+    # The server asks for two minutes, which a 2-second window cannot wait: the page ends with its refusal.
+    refusal = dataclasses.replace(_OPERATION_TIME_LIMIT, headers=(("retry-after", "120"),))
+    transport = _sequence([refusal])
     stream = scripted_client(transport).iter_list(
         Request("crm.item.list", route=RouteKind.BARE, replay_safety=ReplaySafety.SAFE),
         page_size=50,
         policy=ExecutionPolicy(max_retry_elapsed_per_request=2.0),
     )
-    with pytest.raises(BudgetExceededError) as captured:
+    with pytest.raises(ApiResponseError) as captured:
         _ = [row async for row in stream]
     assert len(transport.requests) == 1
-    assert isinstance(captured.value.__cause__, ApiResponseError)
-    assert captured.value.__cause__.normalized_code == "operation_time_limit"
+    assert captured.value.normalized_code == "operation_time_limit"
     assert stream.report is not None
     assert not stream.report.exhausted
 
 
 @pytest.mark.asyncio
-async def test_method_limit_repeated_signal_extends_deadline_and_capacity_is_explicit() -> None:
-    now = 100.0
-    default_delay = 120.0
+async def test_method_hold_repeated_extends_its_deadline_and_capacity_is_explicit() -> None:
+    now, hold = 100.0, 120.0
 
     def clock() -> float:
         return now
 
     coordinator = RateCoordinator(clock=clock)
-    assert await coordinator.observe_api_throttle("profile", "OPERATION_TIME_LIMIT") == default_delay
+    coordinator.hold_method("profile", hold)
     now += 30.0
-    assert await coordinator.observe_api_throttle("profile", "OPERATION_TIME_LIMIT") == default_delay
-    assert await coordinator.observe_api_throttle("profile", "SOME_OTHER_ERROR") == 0.0
+    coordinator.hold_method("profile", hold)
+    assert coordinator.admission_delay(frozenset({"profile"})) == hold
+    # A shorter hold never shortens a longer one.
+    coordinator.hold_method("profile", 1.0)
+    assert coordinator.admission_delay(frozenset({"profile"})) == hold
     for index in range(1_023):
-        await coordinator.observe_api_throttle(f"method.{index}", "OPERATION_TIME_LIMIT")
+        coordinator.hold_method(f"method.{index}", hold)
     with pytest.raises(RatePolicyCapacityError):
-        await coordinator.observe_api_throttle("overflow", "OPERATION_TIME_LIMIT")
+        coordinator.hold_method("overflow", hold)
     now += 121.0
     assert (await coordinator.snapshot()).method_cooldowns == 0
-    await coordinator.observe_api_throttle("overflow", "OPERATION_TIME_LIMIT")
+    coordinator.hold_method("overflow", hold)
     await coordinator.close()
 
 
@@ -881,6 +1077,292 @@ async def test_socket_connect_and_post_dispatch_failures_have_distinct_phases() 
         assert not_dispatched.value.phase is FailurePhase.NOT_DISPATCHED
     finally:
         await dead_transport.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("safety", [ReplaySafety.UNSAFE, ReplaySafety.SAFE])
+async def test_an_attempt_timed_out_in_the_tls_handshake_is_not_sent_and_is_retried_whatever_its_safety(
+    safety: ReplaySafety,
+) -> None:
+    # The server accepts TCP and never answers the TLS handshake. Each attempt times out after the client's attempt
+    # timeout (Settings.http_timeout), however long the window of the policy passed beside it: no byte of the request
+    # left, so a write is retried as a read is, until its attempts run out, and nothing is unknown.
+    connections: list[asyncio.StreamWriter] = []
+
+    async def silent(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        connections.append(writer)
+
+    server = await asyncio.start_server(silent, "127.0.0.1", 0)
+    socket = server.sockets[0]
+    assert socket is not None
+    host, port = socket.getsockname()[:2]
+    settings = b24api.Settings(webhook_url=f"https://{host}:{port}/rest/1/token/", http_timeout=0.2)
+    policy = ExecutionPolicy(max_attempts_per_request=3, retry=RetryPolicy(initial_delay=0, jitter=0))
+    started = asyncio.get_running_loop().time()
+    try:
+        async with b24api.Bitrix24(settings, policy=policy) as client:
+            with pytest.raises(BudgetExceededError, match="attempt budget exhausted") as raised:
+                await client.call(Request("crm.deal.add", {"fields": {"TITLE": "x"}}, safety, route=RouteKind.BARE))
+    finally:
+        for writer in connections:
+            writer.close()
+        server.close()
+        await server.wait_closed()
+
+    assert len(connections) == policy.max_attempts_per_request
+    assert asyncio.get_running_loop().time() - started < policy.max_retry_elapsed_per_request / 10
+    cause = raised.value.__cause__
+    assert isinstance(cause, TransportError)
+    # TCP connected, the TLS handshake never completed: nothing of the request left, so it is no unknown outcome.
+    assert cause.phase is FailurePhase.CONNECTION_ESTABLISHED
+    assert cause.possible_acceptance is False
+    assert execution(raised.value) is Execution.ANSWERED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("safety", [ReplaySafety.UNSAFE, ReplaySafety.SAFE])
+@pytest.mark.parametrize("sent_as", ["call", "batch", "rest-v3-batch"])
+async def test_an_attempt_the_retry_window_cuts_in_the_tls_handshake_is_still_proven_not_sent(
+    safety: ReplaySafety, sent_as: str
+) -> None:
+    # As above, but the retry window closes long before the attempt timeout: the window's end cuts the attempt in
+    # the TLS handshake, where the transport knows that nothing of the request left. It is no unknown outcome, for a
+    # lone call as for a batch envelope's command.
+    connections: list[asyncio.StreamWriter] = []
+
+    async def silent(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        connections.append(writer)
+
+    server = await asyncio.start_server(silent, "127.0.0.1", 0)
+    socket = server.sockets[0]
+    assert socket is not None
+    host, port = socket.getsockname()[:2]
+    settings = b24api.Settings(webhook_url=f"https://{host}:{port}/rest/1/token/", http_timeout=5.0)
+    policy = ExecutionPolicy(max_retry_elapsed_per_request=0.3, retry=RetryPolicy(initial_delay=0, jitter=0))
+    route = RouteKind.API_V3 if sent_as == "rest-v3-batch" else RouteKind.BARE
+    request = Request("crm.deal.add", {"fields": {"TITLE": "x"}}, safety, route=route)
+    try:
+        async with b24api.Bitrix24(settings, policy=policy) as client:
+            if sent_as != "call":
+                # Two commands, so they go in one envelope rather than as a lone call.
+                outcomes = [each async for each in client.batch_outcomes([Command(request, 0), Command(request, 1)])]
+                assert all(isinstance(outcome, CommandFailure) for outcome in outcomes)
+                first = outcomes[0]
+                assert isinstance(first, CommandFailure)
+                refusal: BaseException = first.error
+            else:
+                with pytest.raises(BudgetExceededError) as raised:
+                    await client.call(request)
+                refusal = raised.value
+    finally:
+        for writer in connections:
+            writer.close()
+        server.close()
+        await server.wait_closed()
+
+    assert len(connections) == 1
+    assert isinstance(refusal, BudgetExceededError)
+    assert "retry time budget exhausted" in str(refusal)
+    cause = refusal.__cause__
+    assert isinstance(cause, TransportError)
+    assert cause.phase is FailurePhase.CONNECTION_ESTABLISHED
+    assert cause.possible_acceptance is False
+    assert execution(refusal) is Execution.ANSWERED
+
+
+@pytest.mark.asyncio
+async def test_an_attempt_its_own_deadline_cuts_while_it_waits_for_a_pooled_connection_was_not_sent() -> None:
+    # The client has one connection, which the first request holds in a TLS handshake the server never answers. The
+    # second request waits for it in the pool until its own deadline cuts it: it never had a connection, so nothing
+    # of it left.
+    connections: list[asyncio.StreamWriter] = []
+    connected = asyncio.Event()
+
+    async def silent(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        connections.append(writer)
+        connected.set()
+
+    server = await asyncio.start_server(silent, "127.0.0.1", 0)
+    socket = server.sockets[0]
+    assert socket is not None
+    host, port = socket.getsockname()[:2]
+    client = httpx.AsyncClient(limits=httpx.Limits(max_connections=1))
+    transport = HttpxTransport(f"https://{host}:{port}/rest/1/token/", client=client, timeout=5.0)
+    request = Request("crm.deal.add", {"fields": {"TITLE": "x"}}, ReplaySafety.UNSAFE, route=RouteKind.BARE)
+    try:
+        holder = asyncio.ensure_future(transport.send(request, attempt_timeout=5.0, max_response_bytes=1024))
+        await connected.wait()
+        with pytest.raises(TransportError) as waited:
+            await transport.send(request, attempt_timeout=0.2, max_response_bytes=1024)
+        holder.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await holder
+    finally:
+        for writer in connections:
+            writer.close()
+        server.close()
+        await server.wait_closed()
+        await transport.aclose()
+        await client.aclose()
+
+    assert len(connections) == 1
+    assert str(waited.value) == "Transport attempt timed out before dispatch"
+    assert waited.value.phase is FailurePhase.NOT_DISPATCHED
+    assert waited.value.possible_acceptance is False
+
+
+class _SilentHttpServer:
+    """A loopback HTTP server that reads each request's head and never answers it, or reads nothing (``reads``)."""
+
+    def __init__(self, *, reads: bool = True) -> None:
+        self.reads = reads
+        self.connections: list[asyncio.StreamWriter] = []
+        self.received = asyncio.Event()
+        self.server: asyncio.Server | None = None
+
+    async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self.connections.append(writer)
+        if not self.reads:
+            # Nothing is read: a large request fills the socket's buffers, and its write blocks.
+            transport = writer.transport
+            assert isinstance(transport, asyncio.ReadTransport)
+            transport.pause_reading()
+            return
+        await reader.readuntil(b"\r\n\r\n")
+        self.received.set()
+
+    async def __aenter__(self) -> str:
+        self.server = await asyncio.start_server(self._serve, "127.0.0.1", 0)
+        socket = self.server.sockets[0]
+        host, port = socket.getsockname()[:2]
+        return f"http://{host}:{port}/rest/1/token/"
+
+    async def __aexit__(self, *_exc: object) -> None:
+        for writer in self.connections:
+            writer.close()
+        assert self.server is not None
+        self.server.close()
+        await self.server.wait_closed()
+
+
+# Far shorter than the attempt's own deadline, so only the transport's phase timeout can end the attempt in time.
+_PHASE_TIMEOUT = 0.2
+_ATTEMPT_DEADLINE = 5.0
+
+
+@pytest.mark.asyncio
+async def test_the_transport_timeout_bounds_the_wait_for_an_answer_once_the_request_was_sent() -> None:
+    request = Request("crm.deal.add", {"fields": {"TITLE": "x"}}, ReplaySafety.UNSAFE, route=RouteKind.BARE)
+    loop = asyncio.get_running_loop()
+    async with _SilentHttpServer() as url:
+        transport = HttpxTransport(url, timeout=_PHASE_TIMEOUT)
+        started = loop.time()
+        try:
+            with pytest.raises(TransportError) as raised:
+                await transport.send(request, attempt_timeout=_ATTEMPT_DEADLINE, max_response_bytes=1024)
+        finally:
+            await transport.aclose()
+    assert loop.time() - started < _ATTEMPT_DEADLINE / 2
+    assert raised.value.possible_acceptance is True
+
+
+# Larger than a loopback socket's buffers on both ends, so a server that reads nothing blocks the write.
+_UNWRITABLE_BYTES = 32 * 1024 * 1024
+
+
+@pytest.mark.asyncio
+async def test_the_transport_timeout_bounds_writing_the_request() -> None:
+    request = Request(
+        "crm.deal.add", {"fields": {"TITLE": "x" * _UNWRITABLE_BYTES}}, ReplaySafety.UNSAFE, route=RouteKind.BARE
+    )
+    loop = asyncio.get_running_loop()
+    async with _SilentHttpServer(reads=False) as url:
+        transport = HttpxTransport(url, timeout=_PHASE_TIMEOUT)
+        started = loop.time()
+        try:
+            with pytest.raises(TransportError) as raised:
+                await transport.send(request, attempt_timeout=_ATTEMPT_DEADLINE, max_response_bytes=1024)
+        finally:
+            await transport.aclose()
+    assert loop.time() - started < _ATTEMPT_DEADLINE / 2
+    assert raised.value.phase is FailurePhase.DISPATCH_STARTED
+    assert raised.value.possible_acceptance is True
+
+
+@pytest.mark.asyncio
+async def test_the_transport_timeout_bounds_the_wait_for_a_pooled_connection() -> None:
+    # Two transports share one client of one connection. The first holds it waiting for an answer far longer than the
+    # second's timeout, which ends the second's wait for the pool: nothing of it left.
+    request = Request("crm.deal.add", {"fields": {"TITLE": "x"}}, ReplaySafety.UNSAFE, route=RouteKind.BARE)
+    loop = asyncio.get_running_loop()
+    server = _SilentHttpServer()
+    async with server as url:
+        client = httpx.AsyncClient(limits=httpx.Limits(max_connections=1))
+        holding = HttpxTransport(url, client=client, timeout=_ATTEMPT_DEADLINE)
+        waiting = HttpxTransport(url, client=client, timeout=_PHASE_TIMEOUT)
+        holder = asyncio.ensure_future(
+            holding.send(request, attempt_timeout=_ATTEMPT_DEADLINE, max_response_bytes=1024)
+        )
+        try:
+            await server.received.wait()
+            started = loop.time()
+            with pytest.raises(TransportError) as raised:
+                await waiting.send(request, attempt_timeout=_ATTEMPT_DEADLINE, max_response_bytes=1024)
+            waited = loop.time() - started
+        finally:
+            holder.cancel()
+            with contextlib.suppress(asyncio.CancelledError, TransportError):
+                await holder
+            await client.aclose()
+    assert waited < _ATTEMPT_DEADLINE / 2
+    assert raised.value.phase is FailurePhase.NOT_DISPATCHED
+    assert raised.value.possible_acceptance is False
+
+
+class _SelfBoundedTransport(ScriptedTransport):
+    """Bounds its attempts itself, a little after their timeout, and proves that nothing of the request left."""
+
+    capabilities = dataclasses.replace(ScriptedTransport.capabilities, bounds_attempts=True)
+
+    def __init__(self) -> None:
+        super().__init__(())
+
+    async def send_wire(self, wire: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        del max_response_bytes
+        await asyncio.sleep(attempt_timeout + 0.05)
+        raise TransportError(
+            "Transport attempt timed out before dispatch",
+            phase=FailurePhase.CONNECTION_ESTABLISHED,
+            request_summary=wire.summary,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", [RouteKind.BARE, RouteKind.API_V3])
+@pytest.mark.parametrize("commands", [1, 2], ids=["call", "envelope"])
+async def test_the_executor_leaves_the_attempt_bound_to_a_transport_that_declares_it(
+    route: RouteKind, commands: int
+) -> None:
+    # The transport ends its attempt itself and says how far it got: the executor sets no deadline of its own that
+    # would cut it first and leave the request possibly run, for a lone call as for an envelope.
+    request = Request("crm.deal.add", {"fields": {"TITLE": "x"}}, ReplaySafety.UNSAFE, route=route)
+    policy = ExecutionPolicy(max_retry_elapsed_per_request=0.1, retry=RetryPolicy(initial_delay=0, jitter=0))
+    async with client_for(_SelfBoundedTransport(), policy=policy) as client:
+        outcomes = [each async for each in client.batch_outcomes([Command(request, i) for i in range(commands)])]
+
+    for outcome in outcomes:
+        assert isinstance(outcome, CommandFailure)
+        cause = outcome.error.__cause__
+        assert isinstance(cause, TransportError)
+        assert cause.phase is FailurePhase.CONNECTION_ESTABLISHED
+        assert execution(outcome.error) is Execution.ANSWERED
+
+
+def test_only_a_transport_that_declares_it_bounds_its_own_attempts() -> None:
+    assert TransportCapabilities().bounds_attempts is False
+    assert HttpxTransport.capabilities.bounds_attempts is True
+    with pytest.raises(TypeError, match="bounds_attempts"):
+        TransportCapabilities(bounds_attempts=1)  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
@@ -1345,3 +1827,52 @@ def test_a_settled_task_lets_its_coroutine_be_closed() -> None:
     assert not is_interrupt(GeneratorExit())
     assert is_interrupt(KeyboardInterrupt())
     assert is_interrupt(SystemExit())
+
+
+_HOUR = 3600.0
+
+
+@pytest.mark.asyncio
+async def test_a_method_hold_is_capped_at_an_hour() -> None:
+    coordinator = RateCoordinator()
+    coordinator.hold_method("m", 2 * _HOUR)
+    held = coordinator.admission_delay(frozenset({"m"}))
+    await coordinator.close()
+
+    assert held == pytest.approx(_HOUR, abs=1)
+
+
+@pytest.mark.asyncio
+async def test_a_methods_reset_is_capped_at_an_hour() -> None:
+    coordinator = RateCoordinator()
+    coordinator.observe_reset("m", 2 * _HOUR)
+    reset = coordinator.method_reset("m")
+    await coordinator.close()
+
+    assert reset == pytest.approx(_HOUR, abs=1)
+
+
+@pytest.mark.asyncio
+async def test_a_held_coordinator_wakes_at_the_first_hold_that_ends_not_the_last() -> None:
+    # The host is held 0.1 s and one method 1 s: the coordinator's first wait ends with the host's hold, when a permit
+    # for another method can be granted. Its later waits run on a clock only they move, so the waits are compared.
+    now = 0.0
+    waits: list[float] = []
+
+    def clock() -> float:
+        return now
+
+    async def sleep(seconds: float) -> None:
+        nonlocal now
+        waits.append(seconds)
+        now += seconds
+        await asyncio.sleep(0)
+
+    coordinator = RateCoordinator(clock=clock, sleep=sleep)
+    await coordinator.observe_throttle(0.1, reason="quota")
+    coordinator.hold_method("m.slow", 1.0)
+    permit = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"m.fast"}))
+    await permit.release()
+    await coordinator.close()
+
+    assert waits[0] == pytest.approx(0.1)

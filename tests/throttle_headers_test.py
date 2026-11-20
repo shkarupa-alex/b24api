@@ -10,9 +10,9 @@ import pytest
 from b24api import ReplaySafety, Request
 from b24api.contracts.policy import ExecutionPolicy, RetryPolicy
 from b24api.contracts.request import RouteKind
-from b24api.errors import BudgetExceededError
+from b24api.errors import ApiResponseError, BudgetExceededError
 from b24api.execution import CoordinatorState, Executor, RateCoordinator, WireResponse
-from b24api.execution.throttle import parse_rate_limit_reset, parse_retry_after
+from b24api.execution.throttle import Limit, limit_of, parse_rate_limit_reset, parse_retry_after
 from tests.scripting import ResponderTransport, always
 
 HOST = "test.invalid"
@@ -67,11 +67,13 @@ async def _cooldown_after(headers: tuple[tuple[str, str], ...]) -> float:
     transport = ResponderTransport(always(_json(429, {"error": "QUERY_LIMIT_EXCEEDED"}, headers)))
     executor = Executor(transport, coordinator=coordinator)
     try:
-        with pytest.raises(BudgetExceededError):
+        # The hint holds the portal longer than the request's window: it ends with the refusal that set the hold.
+        with pytest.raises(ApiResponseError) as refused:
             await executor.execute(
                 Request("sample.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
                 policy=_short_policy(),
             )
+        assert refused.value.normalized_code == "query_limit_exceeded"
         snapshot = await coordinator.snapshot()
         assert snapshot.cooldown_until is not None
         return snapshot.cooldown_until - time.monotonic()
@@ -113,3 +115,18 @@ async def test_invalid_rate_limit_reset_never_freezes_the_host() -> None:
         assert snapshot.cooldown_until is None
     finally:
         await coordinator.close()
+
+
+@pytest.mark.parametrize(
+    ("code", "status", "limit"),
+    [
+        # A method's time limit holds that method alone, whatever status it comes with, 429 included.
+        ("OPERATION_TIME_LIMIT", 429, Limit.METHOD),
+        ("OPERATION_TIME_LIMIT", 200, Limit.METHOD),
+        ("QUERY_LIMIT_EXCEEDED", 503, Limit.HOST),
+        ("ANY_OTHER", 429, Limit.HOST),
+        ("ANY_OTHER", 503, None),
+    ],
+)
+def test_a_refusal_names_the_limit_of_its_code_before_its_status(code: str, status: int, limit: Limit | None) -> None:
+    assert limit_of(ApiResponseError(code=code, description=None, http_status=status)) is limit

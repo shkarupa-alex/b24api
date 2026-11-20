@@ -1425,13 +1425,17 @@ def test_a_send_consumes_the_wait_before_it() -> None:
     assert attempts.pause is None
 
 
+_SAFE_HOLD = 20.0
+
+
 @pytest.mark.asyncio
-async def test_a_replay_round_waits_for_its_unrepeatable_sends_and_carries_a_longer_held_safe_one() -> None:
+async def test_a_replay_round_carries_a_safe_send_only_when_its_unrepeatable_sends_cannot_wait_for_it() -> None:
     # A SAFE command's method is held 20 seconds, which fits a 30-second window for SAFE work; an UNSAFE command's
     # 1-second backoff fits too. The round waits the UNSAFE send's second and carries the SAFE one to a later
-    # round; fail-fast, it waits the 20 seconds, which the UNSAFE send cannot fit twice, so nothing is sent.
+    # round; fail-fast, it waits the 20 seconds, which the UNSAFE send cannot fit twice, so nothing is sent. With
+    # SAFE sends alone the round waits the 20 seconds and sends both, since its sends share their attempts.
     executor = Executor(ResponderTransport(always(WireResponse(200, (), b"{}"))), clock=lambda: 0.0)
-    await executor.coordinator.observe_operation_time_limit("crm.item.get", delay=20.0)
+    executor.coordinator.hold_method("crm.item.get", _SAFE_HOLD)
     policy = ExecutionPolicy(max_retry_elapsed_per_request=30.0, retry=RetryPolicy(initial_delay=1.0, jitter=0))
     context = executor.context(policy)
     sends = ((ReplaySafety.SAFE, frozenset({"crm.item.get"})), (ReplaySafety.UNSAFE, frozenset({"crm.item.add"})))
@@ -1447,10 +1451,9 @@ async def test_a_replay_round_waits_for_its_unrepeatable_sends_and_carries_a_lon
     assert plan.pause.delay == 1.0
     assert whole is not None
     assert whole.plans == (_SendPlan.REFUSE, _SendPlan.REFUSE)
-    # With no send that may not be repeated, the round waits its longest SAFE wait and carries nothing.
     assert safe is not None
     assert safe.plans == (_SendPlan.SEND, _SendPlan.SEND)
-    assert safe.pause.delay == 20.0  # noqa: PLR2004
+    assert safe.pause.delay == _SAFE_HOLD
 
 
 def test_a_replay_round_that_carries_a_send_must_send_one() -> None:

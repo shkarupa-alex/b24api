@@ -578,6 +578,8 @@ class CompletionGate:
             ),
             ambiguous_physical_attempts=source.ambiguous_physical_attempts,
             batch_isolation_requests=source.batch_isolation_requests,
+            undelivered_possibly_run=source.undelivered_possibly_run,
+            undelivered_not_sent=source.undelivered_not_sent,
         )
         self._published = report
         return report

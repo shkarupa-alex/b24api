@@ -5,9 +5,12 @@ import contextlib
 import datetime
 import email.utils
 import math
+import sys
 import time
+from enum import Enum
 from typing import TYPE_CHECKING
 
+from b24api.contracts.v3_codes import RATE_LIMIT_ERROR_CODE
 from b24api.errors import ApiResponseError, B24ApiError
 
 if TYPE_CHECKING:
@@ -22,6 +25,10 @@ _EPOCH_SECONDS_MINIMUM = 1e9
 _DATE_LAG_TOLERANCE_SECONDS = 60.0
 
 
+# A power whose natural logarithm stays below this is a float, with a margin for rounding in the logarithm.
+_LOG_FLOAT_MAX = math.log(sys.float_info.max) - 1
+
+
 def _retry_delay(
     policy: ExecutionPolicy,
     *,
@@ -29,11 +36,29 @@ def _retry_delay(
     random_source: Callable[[], float],
 ) -> float:
     retry = policy.retry
-    base = min(retry.maximum_delay, retry.initial_delay * retry.backoff ** max(0, retry_number - 1))
+    base = backoff_delay(policy, retry_number)
     if retry.jitter == 0 or base == 0:
         return base
     factor = 1 - retry.jitter + (2 * retry.jitter * random_source())
     return max(0.0, base * factor)
+
+
+def backoff_delay(policy: ExecutionPolicy, number: int) -> float:
+    """Return the ``number``-th exponential delay of ``policy.retry``, without jitter, saturated at its maximum.
+
+    The delay is taken only below the exponent at which it reaches the maximum, so it is a float itself. The power
+    alone may not be one, when the initial delay is tiny and the maximum huge: the product is then taken in
+    logarithms. So no retry count, however large, and no valid policy overflows it.
+    """
+    retry = policy.retry
+    exponent = max(0, number - 1)
+    if retry.initial_delay == 0 or retry.backoff == 1:
+        return retry.initial_delay
+    if exponent >= (math.log(retry.maximum_delay) - math.log(retry.initial_delay)) / math.log(retry.backoff):
+        return retry.maximum_delay
+    if exponent * math.log(retry.backoff) < _LOG_FLOAT_MAX:
+        return min(retry.maximum_delay, retry.initial_delay * retry.backoff**exponent)
+    return min(retry.maximum_delay, math.exp(math.log(retry.initial_delay) + exponent * math.log(retry.backoff)))
 
 
 def _retry_after_seconds(wire: WireResponse) -> float | None:
@@ -93,6 +118,11 @@ def parse_rate_limit_reset(raw: str, *, wall_now: float, cap: float) -> float | 
     return min(value, cap)
 
 
+def operating_reset_delay(reset_at: float, date: str | None) -> float:
+    """Return the seconds until an epoch ``operating_reset_at``, measured as a dated hint is, within the cap."""
+    return min(max(0.0, reset_at - _hint_now(date)), _RETRY_AFTER_CAP_SECONDS)
+
+
 def _hint_now(date: str | None) -> float:
     """Return the epoch time a dated hint is measured from: the response's ``Date`` if plausible, else the local clock.
 
@@ -135,6 +165,44 @@ def _finite_non_negative(raw: str) -> float | None:
 def _http_date_delay(raw: str, *, now: float, cap: float) -> float | None:
     moment = _http_date(raw)
     return None if moment is None else min(max(0.0, moment - now), cap)
+
+
+class Limit(Enum):
+    """A server's load limit a refusal names: the whole portal's request rate, or one method's operating time."""
+
+    HOST = "host"
+    METHOD = "method"
+
+
+# The request-rate refusals: the classic quota and the REST 3.0 load limiter.
+_HOST_LIMIT_CODES = frozenset({"query_limit_exceeded", RATE_LIMIT_ERROR_CODE.casefold()})
+_METHOD_LIMIT_CODE = "operation_time_limit"
+_HTTP_TOO_MANY_REQUESTS = 429
+# The statuses whose throttle hint a server sends about its load, whatever their body says.
+_LOAD_STATUSES = frozenset({_HTTP_TOO_MANY_REQUESTS, 503})
+
+
+def limit_of(error: B24ApiError) -> Limit | None:
+    """Return the load limit a refusal names, if it names one: by its code, compared without letter case, or HTTP 429.
+
+    A REST 3.0 code keeps its exact case in ``normalized_code``; the limit is the same in any case, as the retry and
+    ambiguity policies compare it.
+    """
+    code = str(error.original_code).strip().casefold() if isinstance(error, ApiResponseError) else None
+    if code == _METHOD_LIMIT_CODE:
+        return Limit.METHOD
+    if code in _HOST_LIMIT_CODES or error.http_status == _HTTP_TOO_MANY_REQUESTS:
+        return Limit.HOST
+    return None
+
+
+def hints_load(error: B24ApiError) -> bool:
+    """Return whether a failed answer's throttle hint is about the server's load: 429, 503 or a limit's code.
+
+    Any other failure's hint (a ``Retry-After`` on a 401 or a 404) says nothing about the load, and never holds
+    the host.
+    """
+    return error.http_status in _LOAD_STATUSES or limit_of(error) is not None
 
 
 def _throttle_reason(error: B24ApiError) -> str:

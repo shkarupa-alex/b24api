@@ -64,11 +64,13 @@ def _unknown_settings_error(fields: set[str]) -> ValidationError:
 
 
 class Settings(BaseSettings):
-    """Environment-backed webhook credential, request timeout and request concurrency of one client.
+    """Environment-backed webhook credential, attempt timeout and request concurrency of one client.
 
-    ``http_timeout`` is the retry window of each request under the client's default policy
-    (``ExecutionPolicy.max_retry_elapsed_per_request``): it opens when the request's first send is granted its
-    permit and bounds that send and every retry after it. It must be a finite number of seconds.
+    ``http_timeout`` bounds each attempt of the client's own HTTPX transport: each of its phases (connecting,
+    TLS included, waiting for a pooled connection, writing the request, each read of the answer) times out after
+    it, and earlier when the request's retry window (``ExecutionPolicy.max_retry_elapsed_per_request``) has less
+    left. An attempt that times out before it was sent is retried whatever the request's safety. It must be a
+    finite number of seconds; an injected transport keeps its own timeouts.
 
     ``max_concurrent_requests`` is how many requests the client keeps in flight at once, all its calls,
     streams and retries together: the number of permits of its shared rate limiter. An operation's own limits

@@ -201,7 +201,7 @@ async def test_batch_method_limit_observes_only_failing_command_without_replay()
         return _wire_batch(keys, errors={keys[0]: {"error": "OPERATION_TIME_LIMIT", "error_description": "wait"}})
 
     transport = ResponderTransport(callback)
-    coordinator = RateCoordinator(operation_time_limit_delay=0.1)
+    coordinator = RateCoordinator()
     executor = BatchExecutor(Executor(transport, coordinator=coordinator))
     context = executor.executor.context(_one_attempt_policy())
     outcomes = await executor.execute_requests(

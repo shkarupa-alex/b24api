@@ -99,12 +99,12 @@ class Bitrix24(_TraversalFacade):
             case Webhook() as webhook:
                 host = webhook.host
         # Every refusal of the configuration comes before the transport, so a refused client opens nothing.
-        default_policy = policy or ExecutionPolicy.from_settings(resolved)
+        default_policy = policy or ExecutionPolicy()
         coordinator = RateCoordinator(max_concurrency=resolved.max_concurrent_requests)
         # The configured webhook credential is an exact secret for every error this client renders.
         codec = ProtocolCodec(redactor=Redactor(known_secrets=secret_values((webhook.token,))))
         if transport is None:
-            selected_transport: Transport = HttpxTransport(webhook.url)
+            selected_transport: Transport = HttpxTransport(webhook.url, timeout=resolved.http_timeout)
             owned_transport: HttpxTransport | None = cast("HttpxTransport", selected_transport)
         else:
             if _normalized_host(transport.host) != _normalized_host(host):

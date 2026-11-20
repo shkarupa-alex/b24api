@@ -85,6 +85,9 @@ TIMEOUTS = Counter(
         ("execution/executor.py", "Executor._send_attempt", "timeout"): 1,
         ("execution/executor.py", "_send_envelope_attempt", "timeout"): 1,
         ("execution/rate.py", "RateCoordinator.acquire", "timeout_at"): 1,
+        # A transport's own bound on its attempt, ``attempt_timeout``, handed the retry window left: it classifies its
+        # expiry by the phase the attempt reached (``TransportCapabilities.bounds_attempts``).
+        ("transport/httpx.py", "HttpxTransport._send_wire_impl", "timeout"): 1,
         # The batch dispatcher's coalescing wait, handed ``coalescing_time_left``: it ends in a send.
         ("references/dispatch.py", "_wait_first", "wait"): 1,
         # Cleanup waits, bounded by ``cleanup_window`` or a deadline handed in: they refuse no work.
@@ -516,12 +519,15 @@ def _get(index: int = 0) -> Request:
 
 
 def _refusal_at(clock: _Clock, now: float) -> ResponderTransport:
-    """Refuse every send for quota (retryable, proven not run), the virtual clock reading ``now`` by the answer."""
+    """Refuse every send for quota (retryable, proven not run), the virtual clock reading ``now`` by the answer.
+
+    The zero hint holds the portal for nothing, so the retry's own backoff alone decides its wait.
+    """
 
     def respond(request: Request) -> WireResponse:
         del request
         clock.now = now
-        return WireResponse(503, _JSON, _QUOTA)
+        return WireResponse(503, (*_JSON, ("retry-after", "0")), _QUOTA)
 
     return ResponderTransport(respond)
 

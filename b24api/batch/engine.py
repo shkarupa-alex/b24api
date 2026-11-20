@@ -3,6 +3,7 @@
 from __future__ import annotations
 import asyncio
 import copy
+from collections import deque
 from collections.abc import AsyncIterable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
@@ -23,7 +24,7 @@ from b24api.batch.outcome import (
     BatchOutcome,
     BatchSuccess,
 )
-from b24api.batch.v3 import _V3Resolution
+from b24api.batch.v3 import _V3Resolution, observe_entry
 from b24api.contracts.dispatch import PORTAL_BATCH_CAP
 from b24api.contracts.json import repeated_names
 from b24api.contracts.policy import (
@@ -31,7 +32,7 @@ from b24api.contracts.policy import (
 )
 from b24api.contracts.request import ReplaySafety, Request, diagnostic_context
 from b24api.contracts.request_summary import RouteKind
-from b24api.contracts.response import Response
+from b24api.contracts.response import Response, ResponseTime
 from b24api.encoding import encode_php_query
 from b24api.errors import (
     AmbiguousExecutionError,
@@ -48,6 +49,7 @@ from b24api.execution import (
 )
 from b24api.execution.executor import (
     _HOLD_REFUSAL,
+    _decode_response_time,
     _is_retryable,
     _Lineage,
     _raise_embedded_result_error,
@@ -55,6 +57,7 @@ from b24api.execution.executor import (
     _retry_refusal,
     _SendPlan,
     _Settled,
+    ends_held_out,
 )
 from b24api.execution.facts import Execution, Verdict, execution, record_execution, send_verdict, settled_as
 
@@ -94,7 +97,7 @@ class _RoundOptions:
     halt: bool
     advisory_totals: bool
     strict_envelope: bool
-    # Whether a command held longer than its envelope's first send may wait is left out (``_split_held``).
+    # Whether a command held longer than the others of its envelope goes in a later one (``_split_held``).
     split_held: bool = False
 
 
@@ -156,7 +159,8 @@ class _Lineup:
 
     ``settled`` holds each command's final outcome; ``waiting`` each command that may run again, in one state:
     answered by its own entry, an answer a stop leaves it; or following the failure of its envelope as a whole,
-    which the budget that stops it reports as its cause, as a lone request's would be. Each waiting command
+    which the budget that stops it reports as its cause, as a lone request's would be, or which ends it when it
+    is held out (``stop``). Each waiting command
     keeps the lineage of the sends it was in: a SAFE command the last plan left for a later round is
     ``carried``, misses that round, and is planned again with the next round's commands, so what a round's
     send left open is added only to the commands that were in it.
@@ -199,10 +203,20 @@ class _Lineup:
         else:
             self._settle(outcome, _Lineage())
 
-    def stop(self, commands: tuple[_Command, ...], refusal: BudgetExceededError) -> None:
-        """End the commands the budget keeps from being sent again, for ``refusal``."""
+    def stop(
+        self, commands: tuple[_Command, ...], refusal: BudgetExceededError, *, plan: _SendPlan = _SendPlan.REFUSE
+    ) -> None:
+        """End the commands the budget keeps from being sent again, for ``refusal``.
+
+        A command held out (``ends_held_out``) after its envelope's answer about the server's load ends with that
+        answer instead, as a lone request does.
+        """
         for command in commands:
-            self._stop(command, self.waiting.pop(command.index), refusal)
+            waiting = self.waiting.pop(command.index)
+            if isinstance(waiting.state, _Follows) and ends_held_out(plan, waiting.state.failure):
+                self._settle(_shared_failure(command, waiting.state.failure), waiting.lineage)
+            else:
+                self._stop(command, waiting, refusal)
 
     def _stop(self, command: _Command, waiting: _Waiting, stop: B24ApiError) -> None:
         """End a command ``stop`` keeps from being sent again: with its entry's answer, or with the stop.
@@ -233,13 +247,15 @@ class BatchProgress:
     reads it by the rule a command's own failure follows: a command whose latest send may have run without an
     answer, or one before it, may have run; one answered, by its entry or with its envelope, was answered
     (it ran, or was refused, as its answer says); one never sent was not sent. Until the chunk has ended, a
-    command without a final outcome may still be sent, so it may run; a REST v3 group in progress keeps its state
-    to itself, so its commands may have run.
+    command without a final outcome may still be sent, so it may run. A REST v3 group sends each command it still
+    resolves in every envelope, so the group's lineage is each such command's own, as a classic round's is.
     """
 
     def __init__(self) -> None:
         """Start with nothing sent."""
         self._final: Mapping[int, BatchOutcome] = {}
+        # The final outcomes of the group in progress, which it settles before the chunk's map has them.
+        self._group: Mapping[int, BatchOutcome] = {}
         self._lineup: _Lineup | None = None
         self._attempts: _RequestAttempts | None = None
         self._round: frozenset[int] = frozenset()
@@ -253,9 +269,7 @@ class BatchProgress:
     def _outcome(self, index: int) -> BatchOutcome | None:
         """Return the final outcome of command ``index``, or ``None`` while it has none."""
         outcome = self._final.get(index)
-        if outcome is None and self._lineup is not None:
-            outcome = self._lineup.settled.get(index)
-        return outcome
+        return self._group.get(index) if outcome is None else outcome
 
     def track_groups(self, settled: Mapping[int, BatchOutcome]) -> None:
         """Read the chunk's final outcomes from ``settled``, which the engine fills as each group ends."""
@@ -263,7 +277,7 @@ class BatchProgress:
 
     def track_bare(self, lineup: _Lineup, attempts: _RequestAttempts) -> None:
         """Read a classic envelope's commands from its lineup and the attempts its rounds share."""
-        self._lineup, self._attempts, self._opaque = lineup, attempts, frozenset()
+        self._lineup, self._attempts, self._opaque, self._group = lineup, attempts, frozenset(), lineup.settled
 
     def track_round(self, commands: tuple[_Command, ...]) -> None:
         """Mark the commands of the latest classic round, whose sends ``execution`` adds to each one's lineage.
@@ -273,9 +287,11 @@ class BatchProgress:
         """
         self._round = frozenset(command.index for command in commands)
 
-    def track_opaque(self, commands: tuple[_Command, ...]) -> None:
-        """Mark the commands of a REST v3 group in progress."""
-        self._lineup, self._attempts, self._round = None, None, frozenset()
+    def track_group(
+        self, commands: tuple[_Command, ...], attempts: _RequestAttempts, settled: Mapping[int, BatchOutcome]
+    ) -> None:
+        """Read a REST v3 group's commands from the attempts its envelopes share and the outcomes it settled."""
+        self._lineup, self._attempts, self._round, self._group = None, attempts, frozenset(), settled
         self._opaque = frozenset(command.index for command in commands)
 
     def settlement(self, index: int) -> CommandSettlement:
@@ -295,8 +311,10 @@ class BatchProgress:
         outcome = self._outcome(index)
         if outcome is not None:
             return Execution.ANSWERED if isinstance(outcome, BatchSuccess) else execution(outcome.error)
-        if not self._ended or index in self._opaque:
+        if not self._ended:
             return Execution.POSSIBLY_RUN
+        if index in self._opaque and self._attempts is not None:
+            return self._attempts.lineage.unsent()
         waiting = None if self._lineup is None else self._lineup.waiting.get(index)
         lineage = _Lineage() if waiting is None else waiting.lineage
         if index in self._round and self._attempts is not None:
@@ -313,6 +331,8 @@ class _BatchEnvelope:
     evidence: ResponseEvidence
     # Keys that are both a result and an error: the answer contradicts itself and attributes nothing.
     contradictory: frozenset[str] = frozenset()
+    # Each command's ``result_time``: its timing, diagnostic only.
+    times: Mapping[str, object] = field(default_factory=dict)
 
 
 class BatchExecutor:
@@ -345,11 +365,13 @@ class BatchExecutor:
         """Execute one admitted chunk: classic BARE and native v3 commands never share an envelope.
 
         ``on_envelope`` is called once as each admitted envelope group starts its first round, the 2.5.2 rule for
-        an admitted chunk: the group counts even when the budget then stops its first send. Halted groups, replay
+        an admitted chunk: the group counts even when its permit then refuses its first send. Commands the first
+        send's plan refuses at once (``_split_held``) form no group and are not counted. Halted groups, replay
         rounds, envelope retries and isolation requests are not counted.
 
         ``split_held`` is set for a user's logical batch, whose commands are independent outcomes: a command whose
-        own method is held longer than its envelope's first send may wait is left out so that the others go. A
+        own method is held longer than the others goes in a later envelope, so that the others go now, and one held
+        beyond what the operation has left is refused (``_split_held``). A
         fail-fast (``halt``) chunk is never split: leaving a command out lets no other command go when its failure
         fails them all, so the envelope goes whole to its permit, which waits within the operation's budget or
         refuses at once a hold that outlasts it. Pages of a traversal, and the commands a dispatcher batches, are not
@@ -360,25 +382,25 @@ class BatchExecutor:
         """
         eligible, rejected = self._partition_capabilities(commands)
         settled: Mapping[int, BatchOutcome] = {}
-        if halt and rejected:
-            first_rejected = next(command.index for command in commands if command.index in rejected)
-            message = "physical batch command was not executed after fail-fast capability rejection"
-            rejected = {
-                command.index: rejected[command.index]
-                if command.index == first_rejected
-                else _shared_failure(command, _withheld(message, command))
-                for command in commands
-            }
-        elif eligible:
-            options = _RoundOptions(halt, advisory_totals, strict_envelope, split_held and not halt)
-            progress = BatchProgress() if progress is None else progress
-            try:
+        progress = BatchProgress() if progress is None else progress
+        try:
+            if halt and rejected:
+                first_rejected = next(command.index for command in commands if command.index in rejected)
+                message = "physical batch command was not executed after fail-fast capability rejection"
+                rejected = {
+                    command.index: rejected[command.index]
+                    if command.index == first_rejected
+                    else _shared_failure(command, _withheld(message, command))
+                    for command in commands
+                }
+            elif eligible:
+                options = _RoundOptions(halt, advisory_totals, strict_envelope, split_held and not halt)
                 settled = await self._execute_groups(
                     eligible, context=context, options=options, on_envelope=on_envelope, progress=progress
                 )
-            finally:
-                # Whichever way the groups end, nothing more of the chunk is sent.
-                progress.end()
+        finally:
+            # Whichever way the chunk ends, a chunk refused before any send included, nothing more of it is sent.
+            progress.end()
         # Every outcome of the chunk leaves the engine through the one mapping from execution facts.
         return tuple(_by_facts(outcome) for outcome in _merge_outcomes(commands, tuple(settled.values()), rejected))
 
@@ -393,7 +415,9 @@ class BatchExecutor:
     ) -> dict[int, BatchOutcome]:
         settled: dict[int, BatchOutcome] = {}
         progress.track_groups(settled)
-        for group in _envelope_groups(eligible):
+        groups = deque(_envelope_groups(eligible))
+        while groups:
+            group = groups.popleft()
             if options.halt and any(not isinstance(outcome, BatchSuccess) for outcome in settled.values()):
                 # Fail-fast: a later envelope of the accepted chunk is not sent after a failed one.
                 message = "physical batch command was not executed after a fail-fast envelope failure"
@@ -401,15 +425,21 @@ class BatchExecutor:
                     (command.index, _shared_failure(command, _withheld(message, command))) for command in group
                 )
                 continue
-            if on_envelope is not None:
-                on_envelope()
-            sending, refused = self._split_held(group, context=context) if options.split_held else (group, {})
+            sending, later, refused = (
+                self._split_held(group, context=context) if options.split_held else (group, (), {})
+            )
             settled.update(refused)
+            if later:
+                # Held longer than the others: a later envelope, planned again once this one is sent.
+                groups.append(later)
             if not sending:
                 continue
+            if on_envelope is not None:
+                on_envelope()
             if sending[0].request.route is RouteKind.API_V3:
-                progress.track_opaque(sending)
-                outcomes = await _V3Resolution(self.executor, context).run(sending)
+                resolution = _V3Resolution(self.executor, context)
+                progress.track_group(sending, resolution.attempts, resolution.settled)
+                outcomes = await resolution.run(sending)
             else:
                 outcomes = await self._execute_bare(sending, context=context, options=options, progress=progress)
             settled.update((outcome.command_index, outcome) for outcome in outcomes)
@@ -417,11 +447,12 @@ class BatchExecutor:
 
     def _split_held(
         self, group: tuple[_Command, ...], *, context: ExecutionContext
-    ) -> tuple[tuple[_Command, ...], dict[int, BatchOutcome]]:
-        """Split off the commands whose own method is held longer than their envelope's first send may wait.
+    ) -> tuple[tuple[_Command, ...], tuple[_Command, ...], dict[int, BatchOutcome]]:
+        """Split a group into what its first send carries now, what a later envelope carries, and what is refused.
 
-        ``Executor.plan_first_send`` decides, so one method's cooldown never holds back or fails the other commands
-        of its envelope. A refused command is never sent: it ends with ``BudgetExceededError``, proven not run.
+        ``Executor.plan_first_send`` decides, so one method's hold never holds back or fails the other commands of
+        its envelope: a command held longer goes in a later envelope, and only one held beyond what the operation
+        has left is refused, never sent: it ends with ``BudgetExceededError``, proven not run.
         """
         try:
             plan = self.executor.plan_first_send(
@@ -429,16 +460,17 @@ class BatchExecutor:
             )
         except BudgetExceededError as refusal:
             # No time is left: the deadline refused the envelope's permit, so none of its commands is sent.
-            return (), {command.index: _shared_failure(command, refusal) for command in group}
+            return (), (), {command.index: _shared_failure(command, refusal) for command in group}
         if plan is None:
-            return group, {}
-        refused = frozenset(plan.sends(_SendPlan.REFUSE))
+            return group, (), {}
+        sending, later = (
+            tuple(group[position] for position in plan.sends(each)) for each in (_SendPlan.SEND, _SendPlan.CARRY)
+        )
+        refused = tuple(command for command, each in zip(group, plan.plans, strict=True) if each.refused)
         return (
-            tuple(command for position, command in enumerate(group) if position not in refused),
-            {
-                group[position].index: _shared_failure(group[position], BudgetExceededError(_HOLD_REFUSAL))
-                for position in sorted(refused)
-            },
+            sending,
+            later,
+            {command.index: _shared_failure(command, BudgetExceededError(_HOLD_REFUSAL)) for command in refused},
         )
 
     async def _execute_bare(
@@ -503,12 +535,14 @@ class BatchExecutor:
         if plan is None:
             lineup.stop(candidates, BudgetExceededError(_retry_refusal(plan)))
             return ()
-        sending, carried, refused = (
+        sending, carried, refused, held_out = (
             tuple(candidates[index] for index in plan.sends(each))
-            for each in (_SendPlan.SEND, _SendPlan.CARRY, _SendPlan.REFUSE)
+            for each in (_SendPlan.SEND, _SendPlan.CARRY, _SendPlan.REFUSE, _SendPlan.HELD_OUT)
         )
         lineup.carried = carried
-        lineup.stop(refused, BudgetExceededError(_retry_refusal(plan)))
+        stop = BudgetExceededError(_retry_refusal(plan))
+        lineup.stop(refused, stop)
+        lineup.stop(held_out, stop, plan=_SendPlan.HELD_OUT)
         if sending:
             await self.executor.replay_after(context, attempts=attempts, pause=plan.pause)
         return sending
@@ -568,12 +602,7 @@ class BatchExecutor:
         # Each command's entry answered this send; a command sent again carries only what earlier sends left open.
         attempts.classified(None, may_have_run=False)
         for command, outcome in zip(commands, outcomes, strict=True):
-            if (
-                isinstance(outcome, BatchFailure)
-                and isinstance(outcome.error, BatchCommandError)
-                and outcome.error.normalized_code == "operation_time_limit"
-            ):
-                await context.coordinator.observe_api_throttle(command.request.method, outcome.error.normalized_code)
+            await observe_entry(self.executor, context, command, outcome, sent_at=attempts.sent_at)
         # A SAFE command is sent again after its own transient error; any other only after a listed refusal.
         replay = (
             ()
@@ -699,6 +728,7 @@ class BatchExecutor:
                     malformed_as_none=advisory_totals,
                 ),
                 next=_optional_batch_integer(envelope.continuations, command.stable_key, field="next"),
+                time=_command_time(envelope.times.get(command.stable_key)),
                 evidence=envelope.evidence,
             )
             _raise_embedded_result_error(
@@ -856,6 +886,10 @@ def _decode_batch_envelope(
     errors = _decode_php_map(raw["result_error"], field="result_error")
     totals = _decode_optional_php_map(raw, field="result_total")
     continuations = _decode_optional_php_map(raw, field="result_next")
+    # The commands' timing is diagnostic, as each command's is (``_command_time``): a member that is not a map of
+    # them is left out, and the answers are kept.
+    timing = raw.get("result_time")
+    times = timing if isinstance(timing, dict) else {}
     result_keys = frozenset(results)
     error_keys = frozenset(errors)
     contradictory = result_keys & error_keys
@@ -875,7 +909,16 @@ def _decode_batch_envelope(
         continuations=continuations,
         evidence=evidence,
         contradictory=contradictory,
+        times=times,
     )
+
+
+def _command_time(raw: object) -> ResponseTime | None:
+    """Decode a command's ``result_time`` as a direct answer's ``time`` is: one that cannot be read is left out."""
+    try:
+        return _decode_response_time(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _decode_optional_php_map(raw: dict[str, JsonValue], *, field: str) -> dict[str, JsonValue]:
@@ -961,7 +1004,8 @@ def _envelope_groups(eligible: tuple[_Command, ...]) -> tuple[tuple[_Command, ..
 
     A run of classic commands shares one envelope as before; a native v3 run carries one safety class:
     a SAFE run never carries an UNSAFE or UNKNOWN command, and UNSAFE and UNKNOWN travel together. A
-    change of dialect or v3 safety class closes the run, so no command is sent before an earlier one.
+    change of dialect or v3 safety class closes the run, so the envelopes keep the commands' input order (the first
+    send may still move a command held longer than the rest of its envelope to a later one, after the others).
     """
     groups: list[tuple[_Command, ...]] = []
     run: list[_Command] = []

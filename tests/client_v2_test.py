@@ -51,6 +51,7 @@ from b24api.contracts.completion import PageAcknowledged, PageScheduled
 from b24api.contracts.request import RouteKind
 from b24api.errors import (
     AmbiguousExecutionError,
+    ApiResponseError,
     BatchCommandError,
     BatchFailed,
     BudgetExceededError,
@@ -65,6 +66,7 @@ from b24api.errors import (
 )
 from b24api.execution.facts import Execution, execution
 from b24api.settings import Settings
+from b24api.transport import WireResponse
 from tests.scripting import (
     HANG_BOUND,
     UNREACHABLE_COALESCE_WAIT,
@@ -79,7 +81,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Iterator
 
     from b24api.contracts import CommandOutcome, OperationStream
-    from b24api.execution import Transport, WireResponse
+    from b24api.execution import Transport
     from tests.scripting import ClientFactory
 
 HTTP_OK = 200
@@ -783,13 +785,20 @@ async def test_reference_outcomes_end_with_the_request_budget_even_when_their_so
 HELD_WAIT = 0.2
 
 
+_TIME_LIMIT_FOR_TWO_MINUTES = WireResponse(
+    200,
+    (("content-type", "application/json"), ("retry-after", "120")),
+    json.dumps({"error": "OPERATION_TIME_LIMIT", "error_description": "wait"}).encode(),
+)
+
+
 def _held_portal(method: str) -> ResponderTransport:
-    """Answer the first call to ``method`` with OPERATION_TIME_LIMIT, holding it client-wide, and everything else."""
+    """Answer the first call to ``method`` with OPERATION_TIME_LIMIT for two minutes, holding it client-wide."""
 
     def respond(request: Request) -> object:
         if len(transport.requests) == 1:
             assert request.method == method
-            return {"error": "OPERATION_TIME_LIMIT", "error_description": "wait"}
+            return _TIME_LIMIT_FOR_TWO_MINUTES
         return _answer_direct_or_batch(request)
 
     transport = ResponderTransport(respond)
@@ -797,8 +806,11 @@ def _held_portal(method: str) -> ResponderTransport:
 
 
 async def _hold(client: Bitrix24, method: str) -> None:
-    """Hold ``method`` on the client's coordinator for the default two minutes: the portal limits a call to it."""
-    with pytest.raises(BudgetExceededError):
+    """Hold ``method`` on the client's coordinator for two minutes: the portal limits a call to it.
+
+    The hold outlasts the call's retry window, so the call ends with the portal's refusal.
+    """
+    with pytest.raises(ApiResponseError, match="OPERATION_TIME_LIMIT"):
         await client.call(Request(method, replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE))
 
 
@@ -836,14 +848,15 @@ async def test_batch_outcomes_whose_every_command_is_held_waits_instead_of_drain
 
 @pytest.mark.asyncio
 async def test_batch_outcomes_sends_the_other_methods_of_a_chunk_without_its_held_one() -> None:
-    # The list is held for two minutes, beyond the 30-second window of the client's default policy; the get of the
-    # same chunk goes at once without it, and the list is refused unsent.
+    # The list is held for two minutes, beyond the operation's one minute; the get of the same chunk goes at once
+    # without it, and the list is refused unsent. (A hold the operation outlasts would carry the list to a later
+    # envelope instead.)
     transport = _held_portal("test.list")
     held = Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
     free = Request("test.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
     async with _client(transport) as client:
         await _hold(client, "test.list")
-        stream = client.batch_outcomes([Command(held, 0), Command(free, 1)])
+        stream = client.batch_outcomes([Command(held, 0), Command(free, 1)], policy=ExecutionPolicy(max_elapsed=60.0))
         async with asyncio.timeout(HANG_BOUND):
             refused, sent = [outcome async for outcome in stream]
 

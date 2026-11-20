@@ -72,6 +72,7 @@ THREE = 3
 FOUR = 4
 BAD_REQUEST = 400
 COOLDOWN_FLOOR = 0.04
+SERVICE_UNAVAILABLE = 503
 
 
 def _v3(
@@ -938,18 +939,22 @@ async def test_a21_refusal_v3_rate_limit_of_an_envelope_proves_nothing_for_non_s
 
 
 class _ObservingCoordinator(RateCoordinator):
-    def __init__(self) -> None:
-        super().__init__(operation_time_limit_delay=0.05)
-        self.observed: list[tuple[str, str]] = []
+    """Record each method hold; every method's operating time resets 0.05 seconds after it is built."""
 
-    async def observe_api_throttle(self, method: str, code: str, *, delay: float | None = None) -> float:
-        self.observed.append((method, code))
-        return await super().observe_api_throttle(method, code, delay=delay)
+    def __init__(self, methods: tuple[str, ...]) -> None:
+        super().__init__()
+        self.observed: list[str] = []
+        for method in methods:
+            self.observe_reset(method, 0.05)
+
+    def hold_method(self, method: str, delay: float) -> None:
+        self.observed.append(method)
+        super().hold_method(method, delay)
 
 
 @pytest.mark.asyncio
 async def test_a21_throttle_operation_time_limit_abort_observes_each_distinct_method_and_waits() -> None:
-    """A21-THROTTLE: OTL abort on chunk a,b,a observes exactly {a,b}; the retry waits for the cooldown."""
+    """A21-THROTTLE: OTL abort on chunk a,b,a holds exactly {a,b}; the retry waits until their time resets."""
     requests = (_v3(1, method="x.alpha.get"), _v3(2, method="x.beta.get"), _v3(3, method="x.alpha.get"))
     fixture = ScriptedExchange.v3_batch(requests, tuple(_item(i) for i in (1, 2, 3)))
     limited = ScriptedExchange.v3_batch(requests, payload={"error": "OPERATION_TIME_LIMIT"}, status=503)
@@ -965,7 +970,7 @@ async def test_a21_throttle_operation_time_limit_abort_observes_each_distinct_me
             )
 
     transport = _Timed((limited, fixture))
-    coordinator = _ObservingCoordinator()
+    coordinator = _ObservingCoordinator(("x.alpha.get", "x.beta.get"))
     engine = BatchExecutor(Executor(transport, coordinator=coordinator))
     context = engine.executor.context(_policy())
     try:
@@ -974,9 +979,9 @@ async def test_a21_throttle_operation_time_limit_abort_observes_each_distinct_me
         await coordinator.close()
 
     assert all(isinstance(outcome, BatchSuccess) for outcome in outcomes)
-    assert coordinator.observed == [("x.alpha.get", "operation_time_limit"), ("x.beta.get", "operation_time_limit")]
+    assert coordinator.observed == ["x.alpha.get", "x.beta.get"]
     assert len(sent_at) == TWO
-    # The 0.05 s method cooldown, less timer slack.
+    # The 0.05 s until the methods' time resets, less timer slack.
     assert sent_at[1] - sent_at[0] >= COOLDOWN_FLOOR
     snapshot = await context.snapshot()
     assert snapshot.ambiguous_physical_attempts == 1
@@ -1415,12 +1420,16 @@ def _timed_executor(transport: ScriptedTransport, clock: _Clock) -> Executor:
 
 
 def _hinted_abort(requests: tuple[Request, ...], retry_after: float | None) -> ScriptedExchange:
-    """A SAFE envelope's abort, which may have run it, hinting a host cooldown of ``retry_after`` seconds."""
+    """A SAFE envelope's abort, which may have run it, hinting a host cooldown of ``retry_after`` seconds.
+
+    A hint holds the host only on an answer about the load, so a hinted abort comes with a 503.
+    """
     fixture = _poisoned(requests)
     hint = () if retry_after is None else (("retry-after", str(retry_after)),)
+    status = BAD_REQUEST if retry_after is None else SERVICE_UNAVAILABLE
     return ScriptedExchange(
         fixture.request,
-        WireResponse(BAD_REQUEST, (*JSON_HEADERS, *hint), fixture.response.body),
+        WireResponse(status, (*JSON_HEADERS, *hint), fixture.response.body),
         v3_wire=fixture.v3_wire,
     )
 
@@ -1482,8 +1491,10 @@ class _V3Portal(ScriptedTransport):
             payload = {"result": [_item(identifier) for identifier in identifiers]}
             return WireResponse(200, JSON_HEADERS, json.dumps(payload).encode())
         self.clock.now += self.abort_takes
+        # A hint holds the host only on an answer about the load, so a hinted abort comes with a 503.
         hint = () if self.retry_after is None else (("retry-after", str(self.retry_after)),)
-        return WireResponse(BAD_REQUEST, (*JSON_HEADERS, *hint), json.dumps(_abort("SYNTHETIC_NOT_FOUND")).encode())
+        status = BAD_REQUEST if self.retry_after is None else SERVICE_UNAVAILABLE
+        return WireResponse(status, (*JSON_HEADERS, *hint), json.dumps(_abort("SYNTHETIC_NOT_FOUND")).encode())
 
 
 async def _isolation_fan_out(
@@ -1518,14 +1529,20 @@ def _command_id(request: Request) -> int:
     return identifier
 
 
-def _ends_with_the_refusal_caused_by_the_abort(error: object, refusal: str) -> None:
-    """Assert that a command its isolation never reached is unknown, ended by the refusal, caused by the abort."""
+def _ends_with_the_refusal_caused_by_the_abort(error: object, refusal: str | None) -> None:
+    """Assert that a command its isolation never reached is unknown, ended by the refusal, caused by the abort.
+
+    With no ``refusal``, the abort itself ended it.
+    """
     assert type(error) is AmbiguousExecutionError
     assert error.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
     stop = error.__cause__
-    assert type(stop) is BudgetExceededError
-    assert refusal in str(stop)
-    cause = stop.__cause__
+    if refusal is None:
+        cause = stop
+    else:
+        assert type(stop) is BudgetExceededError
+        assert refusal in str(stop)
+        cause = stop.__cause__
     assert type(cause) is ApiResponseError
     assert cause.original_code == "SYNTHETIC_NOT_FOUND"
 
@@ -1536,17 +1553,19 @@ def _ends_with_the_refusal_caused_by_the_abort(error: object, refusal: str) -> N
     [
         # The envelope's abort comes after its retry window closed, long before the operation's deadline.
         ("window_closed", 30.0, None, RETRY_WINDOW_EXHAUSTED),
-        # The host holds the methods for longer than the window left: a wait the window cannot carry.
-        ("hold", 0.0, 60.0, "retry delay would exceed"),
+        # The abort, a 503, holds the host for longer than the window left, whatever the backoff: the abort, the
+        # portal's answer about its load, ends each command itself.
+        ("hold", 0.0, 60.0, None),
     ],
 )
 async def test_a21_isolation_refused_for_the_request_alone_ends_with_the_refusal_and_the_stream_goes_on(
-    label: str, abort_takes: float, retry_after: float | None, refusal: str
+    label: str, abort_takes: float, retry_after: float | None, refusal: str | None
 ) -> None:
     """RS_isolation: a replay refused for the group alone sends nothing more, records nothing and ends nothing.
 
     Each command ends as a refused retry of a lone request or a classic batch does: with the refusal, caused by
-    the envelope's abort, unknown since that envelope may have run.
+    the envelope's abort, or with the abort itself when its own hold outlasts the window; unknown since that
+    envelope may have run.
     """
     portal = _V3Portal(_Clock(), abort_takes=abort_takes, retry_after=retry_after)
     policy = _policy(max_elapsed=1000.0, max_retry_elapsed_per_request=10.0)
@@ -1642,7 +1661,9 @@ async def test_a21_lineage_an_envelope_retry_the_budget_refused_is_not_followed_
 
     The isolation would be refused by the same budget: the window left is shorter than the retry's backoff, or the
     host holds the methods longer than the operation's time left. Each command is unknown, ended by the refusal
-    caused by the envelope's failure.
+    caused by the envelope's failure; by that answer itself when it is the portal's answer about its load (a 503)
+    and the host's hold alone outlasts the window, as a lone request is: the hold of the test, or the quota hold for
+    the backoff that the busy portal's answer and the abort both name (a REST 3.0 code compares without case).
     """
     clock = _Clock()
     envelope_failure = _TRANSIENT_ENVELOPE_FAILURES[failure]()
@@ -1674,8 +1695,11 @@ async def test_a21_lineage_an_envelope_retry_the_budget_refused_is_not_followed_
         assert isinstance(outcome, BatchFailure)
         assert isinstance(outcome.error, AmbiguousExecutionError)
         stop = outcome.error.__cause__
-        assert type(stop) is BudgetExceededError
-        followed = stop.__cause__
+        if failure in {"busy", "abort"}:
+            followed = stop
+        else:
+            assert type(stop) is BudgetExceededError
+            followed = stop.__cause__
         if isinstance(envelope_failure, TransportError):
             assert followed is envelope_failure
         else:
@@ -1745,7 +1769,8 @@ async def _first_envelope_stopped(stop: str, how: str) -> tuple[list[CommandOutc
             if stop == "closed client":
                 await client.aclose()  # the user closed the HTTPX client it injected
             else:
-                with pytest.raises(BudgetExceededError):
+                # The hint outlasts the call's own window, so the call ends with the portal's refusal.
+                with pytest.raises(ApiResponseError, match="QUERY_LIMIT_EXCEEDED"):
                     await api.call(Request.bare("crm.item.get", {"id": 1}))
             stream = (
                 api.fan_out_outcomes(commands, dispatch=BatchDispatch(concurrency=1))
@@ -1917,3 +1942,31 @@ def test_an_interrupt_isolated_sends_raise_as_their_reader_is_cancelled_leaves_t
     assert [(violation.code, violation.message) for violation in report.violations] == [
         ("interrupted", "operation interrupted (KeyboardInterrupt)")
     ]
+
+
+_TOO_MANY_REQUESTS = 429
+
+
+@pytest.mark.asyncio
+async def test_a21_lineage_an_envelope_refused_whole_and_held_past_its_window_ends_with_the_refusal() -> None:
+    """A SAFE envelope refused by the load (a 429 the portal holds itself for 30 s) is not retried into the hold.
+
+    Its window is shorter than the hold: each command ends with the refusal itself, as a lone request and a classic
+    envelope do, not with a budget error hiding it.
+    """
+    clock = _Clock()
+    refusal = WireResponse(_TOO_MANY_REQUESTS, (("retry-after", "30"), ("content-type", "text/plain")), b"Too many")
+    transport = _OneEnvelope(refusal, clock, takes=0.0, hold=0.0)
+    executor = _timed_executor(transport, clock)
+    transport.coordinator = executor.coordinator
+    context = executor.context(ExecutionPolicy(max_retry_elapsed_per_request=1.0, retry=RetryPolicy(jitter=0)))
+
+    outcomes = await BatchExecutor(executor).execute_requests((_v3(1), _v3(2)), context=context)
+    await executor.coordinator.close()
+
+    assert transport.sends == 1
+    for outcome in outcomes:
+        assert isinstance(outcome, BatchFailure)
+        assert not isinstance(outcome.error, BudgetExceededError)
+        assert isinstance(outcome.error, B24ApiError)
+        assert outcome.error.http_status == _TOO_MANY_REQUESTS

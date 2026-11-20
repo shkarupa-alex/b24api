@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from b24api.batch.correlation import (
     _Command,
@@ -19,7 +19,7 @@ from b24api.batch.correlation import (
     _command_success,
     _shared_failure,
 )
-from b24api.batch.outcome import BatchCommandEvidence, BatchFailure
+from b24api.batch.outcome import BatchCommandEvidence, BatchFailure, BatchSuccess
 from b24api.contracts.json import FrozenMapping, _freeze_json
 from b24api.contracts.policy import ReplayDisposition
 from b24api.contracts.request import ReplaySafety
@@ -38,6 +38,7 @@ from b24api.execution.executor import (
     _RequestAttempts,
     _retry_refusal,
     _SendPlan,
+    ends_held_out,
 )
 from b24api.execution.facts import Verdict, send_verdict
 from b24api.transport.base import WireRequest
@@ -51,7 +52,15 @@ if TYPE_CHECKING:
     from b24api.execution import ExecutionContext, Executor
     from b24api.execution.executor import PhysicalAttemptOutcome
 
-_OPERATION_TIME_LIMIT = "operation_time_limit"
+
+async def observe_entry(
+    executor: Executor, context: ExecutionContext, command: _Command, outcome: BatchOutcome, *, sent_at: float
+) -> None:
+    """Record what a command's own entry in its envelope's answer says about the load, if its entry answered it."""
+    if isinstance(outcome, BatchSuccess):
+        await executor.observe_command(context, command.request.method, outcome.response, sent_at=sent_at)
+    elif isinstance(outcome.error, BatchCommandError):
+        await executor.observe_command(context, command.request.method, outcome.error, sent_at=sent_at)
 
 
 @dataclass(slots=True)
@@ -132,9 +141,7 @@ class _V3Resolution:
         self.attempts.classified(None, may_have_run=False)
         for command, outcome in zip(pending, outcomes, strict=True):
             self.last[command.index] = outcome
-            error = outcome.error if isinstance(outcome, BatchFailure) else None
-            if isinstance(error, BatchCommandError) and error.normalized_code == _OPERATION_TIME_LIMIT:
-                await self.context.coordinator.observe_api_throttle(command.request.method, error.normalized_code)
+            await observe_entry(self.executor, self.context, command, outcome, sent_at=self.attempts.sent_at)
         # A SAFE command is sent again after its own transient error; any other only after a listed refusal.
         replay = tuple(
             command
@@ -145,7 +152,7 @@ class _V3Resolution:
         )
         replayed = {command.index for command in replay}
         self._settle(command for command in pending if command.index not in replayed)
-        if replay and await self._pause(replay) is None:
+        if replay and await self._pause(replay, followed=None) is _SendPlan.SEND:
             return replay
         self._settle(replay)
         return ()
@@ -195,10 +202,11 @@ class _V3Resolution:
             self.last[command.index] = _shared_failure(command, error)
         safety = ReplaySafety.SAFE if safe else ReplaySafety.UNKNOWN
         if _is_retryable(error, safety=safety, policy=self.context.policy, v3_envelope=True):
-            refusal = await self._pause(pending)
-            if refusal is None:
+            paced = await self._pause(pending, followed=error)
+            if paced is _SendPlan.SEND:
                 return pending
-            self._refused(pending, refusal)
+            if isinstance(paced, BudgetExceededError):
+                self._refused(pending, paced)
         self._settle(pending)
         return ()
 
@@ -209,7 +217,6 @@ class _V3Resolution:
         self.context.record_ambiguous_physical_attempt()
         self.attempts.classified(error, may_have_run=True)
         self.attempts.record(error, self.context.policy)
-        await self._observe_abort_throttle(pending, error)
         for command in pending:
             self.last[command.index] = _shared_failure(command, error)
         if safe:
@@ -220,13 +227,13 @@ class _V3Resolution:
                 error, safety=ReplaySafety.SAFE, policy=self.context.policy
             )
             if retry or self.context.policy.retry.isolate_safe_batch_abort:
-                refusal = await self._pause(pending)
-                if refusal is not None:
-                    self._refused(pending, refusal)
-                elif retry:
+                paced = await self._pause(pending, followed=error)
+                if isinstance(paced, BudgetExceededError):
+                    self._refused(pending, paced)
+                elif paced is _SendPlan.SEND and retry:
                     self.envelope_retry_used = True
                     return pending
-                else:
+                elif paced is _SendPlan.SEND:
                     await self._isolate(pending)
         self._settle(pending)
         return ()
@@ -262,20 +269,16 @@ class _V3Resolution:
         for command in commands:
             self.settled[command.index] = self.last[command.index]
 
-    async def _observe_abort_throttle(self, pending: tuple[_Command, ...], error: B24ApiError) -> None:
-        """A top-level throttle code cannot be attributed, so every distinct inner method observes it."""
-        if not isinstance(error, ApiResponseError) or error.normalized_code != _OPERATION_TIME_LIMIT:
-            return
-        for method in sorted({command.request.method for command in pending}):
-            await self.context.coordinator.observe_api_throttle(method, error.normalized_code)
-
-    async def _pause(self, commands: tuple[_Command, ...]) -> BudgetExceededError | None:
-        """Wait before sending ``commands`` again; return the group's budget refusal of it, if it refuses.
+    async def _pause(
+        self, commands: tuple[_Command, ...], *, followed: B24ApiError | None
+    ) -> Literal[_SendPlan.SEND, _SendPlan.HELD_OUT] | BudgetExceededError:
+        """Wait before sending ``commands`` again and return ``SEND``; or return why the group is not sent again.
 
         A group carries one safety class and travels in one envelope, so its replay, another envelope or the isolation
         of its commands, is admitted or refused whole: by the attempt budget, the retry window, the operation's
         deadline (recorded) or a wait, the longer of the backoff and the coordinator's hold, that the window cannot
-        carry.
+        carry (the budget's refusal). A group held out after the envelope failure it ``followed`` (``ends_held_out``)
+        keeps that failure, the server's answer about its load, as a lone request does (``HELD_OUT``).
         """
         safety = envelope_safety(command.request.replay_safety for command in commands)
         methods = frozenset(command.request.method for command in commands)
@@ -283,10 +286,12 @@ class _V3Resolution:
             plan = self.executor.plan_replay(self.context, attempts=self.attempts, sends=((safety, methods),))
         except BudgetExceededError as refusal:
             return refusal
+        if plan is not None and followed is not None and ends_held_out(plan.plans[0], followed):
+            return _SendPlan.HELD_OUT
         if plan is None or plan.plans != (_SendPlan.SEND,):
             return BudgetExceededError(_retry_refusal(plan))
         await self.executor.replay_after(self.context, attempts=self.attempts, pause=plan.pause)
-        return None
+        return _SendPlan.SEND
 
     async def _isolate(self, pending: tuple[_Command, ...]) -> None:
         """Send each unresolved SAFE command alone, never packed into a batch again, after the group's replay wait.
