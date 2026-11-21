@@ -1,5 +1,6 @@
 """Tests for deep immutability, controls, policies, budgets, and reports."""
 
+import asyncio
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
 
@@ -207,6 +208,38 @@ async def test_budget_ledger_counts_attempts_pages_references_and_buffers_before
     assert counters.buffered_rows_high_water == TEST_LIMIT
     with pytest.raises(BudgetExceededError, match="buffered row budget"):
         await context.set_buffered_rows(3)
+
+
+HELD = 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settles", ["released", "committed"])
+@pytest.mark.parametrize("wave", [1, 2])
+async def test_a_page_wave_waits_for_pages_in_flight_and_is_refused_once_they_are_committed(
+    wave: int, settles: str
+) -> None:
+    # A wave (one page, or several reserved at once) that fits the page budget only once pages in flight come back
+    # waits for them. A released page lets it reserve; committed pages never come back, so once they leave it no
+    # room the budget refuses it.
+    context = ExecutionContext(ExecutionPolicy(max_pages=HELD + wave - 1), RateCoordinator())
+    await context.start()
+    held = await context.reserve_pages(HELD)
+    waiting = asyncio.ensure_future(context.reserve_page() if wave == 1 else context.reserve_pages(wave))
+    await asyncio.sleep(0)
+    assert not waiting.done()
+    async with asyncio.timeout(5):
+        if settles == "released":
+            context.release_page(held[0])
+            await waiting
+            assert (await context.snapshot()).counters.logical_pages == 0
+            return
+        context.commit_page(held[0])
+        await asyncio.sleep(0)
+        assert not waiting.done()
+        context.commit_page(held[1])
+        with pytest.raises(BudgetExceededError, match="logical page budget"):
+            await waiting
 
 
 @pytest.mark.asyncio

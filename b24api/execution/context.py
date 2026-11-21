@@ -3,8 +3,11 @@
 from __future__ import annotations
 import asyncio
 import contextlib
+import contextvars
 import inspect
+import sys
 import time
+import weakref
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
@@ -30,6 +33,7 @@ if TYPE_CHECKING:
 WORK_OWNERS: ContextVar[tuple[object, ...]] = ContextVar("b24api_work_owners", default=())
 
 REQUEST_BUDGET_EXHAUSTED = "physical request budget exhausted"
+LOGICAL_PAGE_BUDGET_EXHAUSTED = "logical page budget exhausted"
 # A request's own retry window closed before the operation's deadline: that request alone is refused, whatever the
 # work it was refused (``ExecutionContext.time_left``), and the operation goes on.
 RETRY_WINDOW_EXHAUSTED = "per-request retry time budget exhausted"
@@ -42,6 +46,12 @@ _ENDS_OPERATION = "_b24api_ends_operation"
 # worker-thread hop. The grace lets such a close finish, so the budget's end is never reported as a cleanup failure,
 # while a close that really blocks overruns the budget by at most this much per step.
 CLEANUP_GRACE_SECONDS = 0.1
+
+# How long a close, or the end of a stream a read runs, defers a cancellation of its caller: a short wait of its own,
+# not the operation's time left (which may be the whole ``max_elapsed``), so a cancelled close returns promptly. Cleanup
+# still running then goes on in the background, reported as a cleanup failure (``CleanupOverrunError``) behind the
+# cancellation, which is what the close raises: the cancellation caused the overrun.
+CANCEL_GRACE_SECONDS = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,8 +115,6 @@ class ExecutionContext:
         self._clock = clock
         self._start: float | None = None
         self._physical_requests = 0
-        # Set once the request budget refuses a send: the count never falls, so no later send can be admitted.
-        self._requests_refused = False
         # The first refusal of work by the request budget or the operation's deadline (a send, a page, an admission
         # or a pull), which ends the operation: neither budget comes back, so no later work can be admitted either.
         self._refusal: str | None = None
@@ -139,19 +147,12 @@ class ExecutionContext:
         return max(0.0, self._clock() - self._start)
 
     @property
-    def requests_refused(self) -> bool:
-        """Return whether the request budget has refused a send: no send can follow.
-
-        Once it is set, the batch streams' source pull (``AsyncIteratorController.get``) refuses further input.
-        """
-        return self._requests_refused
-
-    @property
     def refusal(self) -> str | None:
         """Return the first refusal of work by the operation's budget, which ends the operation, or ``None``.
 
         It is the refusal's message: the request budget's (``REQUEST_BUDGET_EXHAUSTED``), or the deadline's, which
-        names what the deadline refused. Only a refusal sets it: a budget spent exactly by the last send the
+        names what the deadline refused, or the page budget's (``LOGICAL_PAGE_BUDGET_EXHAUSTED``). Only a refusal sets
+        it: a budget spent exactly by the last send the
         operation needed, or a deadline that passes while the application holds control once nothing is left to
         admit, ends nothing. The reference scheduler reads its source ahead of the sends, so it may have read the
         source out before the refusal: once it is set, every later pull is refused, which ends its source, and once
@@ -244,12 +245,17 @@ class ExecutionContext:
         refuse, and again when it reserves the attempt.
         """
         if self._physical_requests >= self.policy.max_requests:
-            self._requests_refused = True
             self._record_refusal(REQUEST_BUDGET_EXHAUSTED)
             raise self.operation_refusal(REQUEST_BUDGET_EXHAUSTED)
 
     async def start(self) -> None:
-        """Start the operation clock exactly once when execution first begins."""
+        """Start the operation clock exactly once when execution first begins, on the loop its client serves.
+
+        An operation started from another event loop is refused before it does any work: ``RuntimeError``
+        (``RateCoordinator.bind_loop``), which the operation raises as it is, never as a command's or a binding's
+        outcome.
+        """
+        self.coordinator.bind_loop()
         if self._start is None:
             self._start = self._clock()
 
@@ -313,17 +319,25 @@ class ExecutionContext:
         return entry is None or entry.committed + entry.pending < self.policy.max_pages_per_reference
 
     async def reserve_pages(self, count: int) -> tuple[PageReservation, ...]:
-        """Atomically reserve a fixed operation-local page wave or fail immediately."""
+        """Atomically reserve a fixed operation-local page wave, waiting while pages in flight may still come back.
+
+        A wave the committed pages leave no room for never fits, as committed pages never come back: the operation's
+        page budget refuses it, which ends the operation as a spent budget does (``_check_page_budget``).
+        """
         if not isinstance(count, int) or isinstance(count, bool) or count < 1:
             raise ValueError("page reservation count must be a positive integer")
         self.time_left("page reservation exceeded operation time budget")
-        used = self._logical_pages + len(self._page_reservations)
-        if used + count > self.policy.max_pages:
-            raise BudgetExceededError("logical page budget cannot fit the requested wave")
-        reservations = tuple(PageReservation(self._page_sequence + offset, None) for offset in range(count))
-        self._page_sequence += count
-        self._page_reservations.update(dict.fromkeys(reservations))
-        return reservations
+        while True:
+            if self._logical_pages + count > self.policy.max_pages:
+                raise self._page_budget_refusal()
+            if self._logical_pages + len(self._page_reservations) + count <= self.policy.max_pages:
+                reservations = tuple(PageReservation(self._page_sequence + offset, None) for offset in range(count))
+                self._page_sequence += count
+                self._page_reservations.update(dict.fromkeys(reservations))
+                return reservations
+            self._page_changed.clear()
+            async with self.deadline("page reservation exceeded operation time budget"):
+                await self._page_changed.wait()
 
     def commit_page(self, reservation: PageReservation) -> None:
         """Atomically charge one decoded response with no cancellation point."""
@@ -362,12 +376,21 @@ class ExecutionContext:
             self._drop_settled(reference, entry)
 
     def _check_page_budget(self, reference: str | None) -> None:
-        """Refuse a page once the operation or the reference has committed its whole page budget."""
+        """Refuse a page once the operation or the reference has committed its whole page budget.
+
+        The operation's page budget, once spent, never comes back, so its refusal ends the operation as the request
+        budget's does (``refusal``); a reference's own page budget refuses that reference alone.
+        """
         if self._logical_pages >= self.policy.max_pages:
-            raise BudgetExceededError("logical page budget exhausted")
+            raise self._page_budget_refusal()
         entry = None if reference is None else self._reference_pages.get(reference)
         if entry is not None and entry.committed >= self.policy.max_pages_per_reference:
             raise BudgetExceededError("per-reference page budget exhausted")
+
+    def _page_budget_refusal(self) -> BudgetExceededError:
+        """Record and return the operation's page budget refusal, which ends the operation."""
+        self._record_refusal(LOGICAL_PAGE_BUDGET_EXHAUSTED)
+        return self.operation_refusal(LOGICAL_PAGE_BUDGET_EXHAUSTED)
 
     def _drop_settled(self, reference: str, entry: _ReferencePages) -> None:
         if entry.settled:
@@ -547,14 +570,19 @@ class OperationLatch:
             self.hand_on(error)
         return raised
 
-    def close_to_loop(self) -> None:
-        """The operation's end on its interrupt with no read or close to raise to: the interrupt leaves the event loop.
+    def close_to_loop(self, *, raised_by_read: bool = False) -> None:
+        """The operation's end with no read or close to raise to: what it raises (``close``) leaves the event loop.
 
-        Only the wake calls it, once ``record`` latched the interrupt (``first``), which ``close`` returns; it is raised
-        out of ``asyncio.run`` from a callback.
+        The wake calls it once ``record`` latched the interrupt (``first``), which ``close`` returns; it is raised out
+        of ``asyncio.run`` from a callback. So is the end of an operation whose close can raise nothing (its coroutine
+        closed), unless that interrupt is out already, or a read the close ended raises it (``raised_by_read``). Any
+        other escape goes to the loop's exception handler, as ``hand_on`` hands it.
         """
-        if (interrupt := self.close()) is not None:
-            asyncio.get_running_loop().call_soon(_raise, interrupt)
+        interrupt_out = self.first is not None and self._is_out(self.first)
+        escape = self.close()
+        if escape is None or (is_interrupt(escape) and (interrupt_out or raised_by_read)):
+            return
+        self._deliver(escape, raise_it=is_interrupt(escape))
 
     def record(self, error: BaseException | None) -> None:
         """Latch ``error`` when it is an escape; anything else is not this latch's.
@@ -594,8 +622,8 @@ class OperationLatch:
         As asyncio reports a task's exception nobody retrieved, it reports and never raises, an interrupt included,
         on a closed loop too. The interrupt that ends the operation (``first``) is not among them: its wake delivers
         it at once (a read in flight raises it, or the event loop, ``close_to_loop``), one latched while the operation
-        ends is raised by that end, and it also leaves on its own through an inline kernel's read that ends in it, so
-        reporting it here could deliver it twice.
+        ends is raised by that end (or by the event loop, when the end's claimant can raise nothing), and it also
+        leaves on its own through an inline kernel's read that ends in it, so reporting it here could deliver it twice.
         """
         if self._loop is not None:
             for error in self._undelivered:
@@ -634,6 +662,17 @@ def _raise(error: BaseException) -> None:
 # The latch of the operation whose work runs the current code: its runner sets it in its read and cleanup tasks, and
 # every task they start inherits it.
 OPERATION_LATCH: ContextVar[OperationLatch | None] = ContextVar("b24api_operation_latch", default=None)
+
+
+def outside_operation_work() -> contextvars.Context:
+    """Return a copy of the current context that belongs to no stream's work: no work marker, no operation latch.
+
+    For work the library starts on behalf of no stream, such as the client's close, which decided ownership already.
+    """
+    context = contextvars.copy_context()
+    context.run(WORK_OWNERS.set, ())
+    context.run(OPERATION_LATCH.set, None)
+    return context
 
 
 def latch_escape(error: BaseException) -> None:
@@ -689,14 +728,29 @@ async def settle[T](work: Awaitable[T]) -> Settled[T]:
     return settled
 
 
-def spawn_settled[T](work: Awaitable[T]) -> asyncio.Task[Settled[T]]:
-    """Start ``work`` as a task that returns how it ended (``Settled``) and never ends in a failure."""
-    task = asyncio.ensure_future(settle(work))
+def spawn_settled[T](work: Awaitable[T], *, context: contextvars.Context | None = None) -> asyncio.Task[Settled[T]]:
+    """Start ``work`` as a task that returns how it ended (``Settled``) and never ends in a failure.
+
+    ``context`` runs it in that context instead of a copy of the current one.
+    """
+    task = asyncio.get_running_loop().create_task(settle(work), context=context)
     if inspect.iscoroutine(work):
         # A task cancelled before its first step never starts ``settle``, which would leave ``work`` never awaited;
         # once the task is done, ``work`` has finished or never started, so closing it is safe.
         task.add_done_callback(lambda _task: work.close())
     return task
+
+
+def own_failure[T](task: asyncio.Task[Settled[T]]) -> Exception | None:
+    """Return the failure a settled task has already ended in on its own: not cancelled, not a source's end.
+
+    A wait for such a task that is then stopped (a close cancels it) ends in that failure, not in the stop: the
+    failure came first, so it is the waiter's, and no cleanup failure of the stop.
+    """
+    if not task.done() or task.cancelled():
+        return None
+    error = task.result().error
+    return error if isinstance(error, Exception) and not isinstance(error, StopAsyncIteration) else None
 
 
 class AsyncIteratorController[T]:
@@ -720,7 +774,7 @@ class AsyncIteratorController[T]:
         self._exhausted = False
 
     async def get(self, context: ExecutionContext) -> T:
-        """Pull one item within the operation's budget: its time left, and a request budget that refused nothing.
+        """Pull one item within the operation's budget: its time left, and a budget that refused nothing yet.
 
         Once a pull has ended the source, every later one raises ``StopAsyncIteration`` again without reading the
         source or the budget.
@@ -731,21 +785,23 @@ class AsyncIteratorController[T]:
             raise RuntimeError("source cleanup has already started")
         if self._exhausted:
             raise StopAsyncIteration
-        if context.requests_refused:
-            # No item pulled now could be sent: the operation ends with its request budget, as with its time budget.
-            raise context.operation_refusal(REQUEST_BUDGET_EXHAUSTED)
+        # No item pulled once the budget refused work could be sent: the source ends with the operation's refusal.
+        context.raise_if_refused()
         pull: asyncio.Task[Settled[T]] | None = None
         try:
             async with context.deadline(self._input_error):
                 pull = spawn_settled(anext(self._source))
                 self._active_pull = pull
                 await asyncio.wait((pull,))
-        except BaseException:
-            if pull is not None:
-                if not pull.done():
-                    pull.cancel()
-                self._retain_close_after(pull)
-            raise
+        except BaseException as error:
+            # A source that failed before the wait was stopped failed on its own (``own_failure``): the pull ends in
+            # that failure, below.
+            if is_escape(error) or pull is None or own_failure(pull) is None:
+                if pull is not None:
+                    if not pull.done():
+                        pull.cancel()
+                    self._retain_close_after(pull)
+                raise
         try:
             settled = await pull
         finally:
@@ -856,34 +912,69 @@ class CleanupResult:
             raise self.error
 
 
+# When the grace of each cancellation a cleanup deferred ends (``_grace_end``).
+_GRACE_ENDS: weakref.WeakKeyDictionary[asyncio.CancelledError, float] = weakref.WeakKeyDictionary()
+
+
+def _grace_end(cancellation: asyncio.CancelledError, grace: float) -> float:
+    """Return when ``cancellation``'s grace ends: from the first cleanup that defers it, however many defer it after.
+
+    One cancellation passes through every close it unwinds (a stream's ``async with``, then the client's): together
+    they defer it for one grace, not one each. A cancellation a cleanup replayed (``rearm_cancellation``) arrives as a
+    new ``CancelledError``, a new delivery with a grace of its own.
+    """
+    if (end := _GRACE_ENDS.get(cancellation)) is not None:
+        return end
+    return _share_grace(cancellation, asyncio.get_running_loop().time() + grace)
+
+
+def _share_grace(cancellation: asyncio.CancelledError, end: float) -> float:
+    """Give ``cancellation`` the grace ending at ``end``, unless a cleanup deferred it already; return its end."""
+    return _GRACE_ENDS.setdefault(cancellation, end)
+
+
+def grace_left(cancellation: asyncio.CancelledError, grace: float) -> float:
+    """Return what is left of ``cancellation``'s grace (``_grace_end``), starting it if no wait deferred it yet."""
+    return max(0.0, _grace_end(cancellation, grace) - asyncio.get_running_loop().time())
+
+
+def share_grace(source: asyncio.CancelledError, target: asyncio.CancelledError) -> None:
+    """Give ``target``, raised for ``source`` (by work ``source`` cancelled), what is left of ``source``'s grace."""
+    if (end := _GRACE_ENDS.get(source)) is not None:
+        _share_grace(target, end)
+
+
 async def await_cleanup_resistant(
     awaitable: Awaitable[object],
     *,
-    deadline: float | None = None,
-    cancelled: bool = False,
+    grace: float | None = None,
+    cancelled: asyncio.CancelledError | None = None,
 ) -> CleanupResult:
     """Finish owned cleanup without losing a concurrent caller cancellation.
 
-    ``deadline`` (event-loop time) bounds how long a cancellation is deferred, one that arrives here
-    or one the caller already holds (``cancelled``): cleanup still running at the deadline is left
-    to finish in the background, returned as ``unfinished`` with a ``BudgetExceededError``. Without a
-    cancellation, or without a deadline, cleanup is awaited to its end.
+    ``grace`` (seconds) bounds how long a cancellation is deferred, counted from when a cleanup first defers it: one
+    that arrives here, or one the caller already holds (``cancelled``), whose grace may have begun at an earlier close
+    (``_grace_end``). Cleanup still running when the grace ends is left to finish in the background, returned as
+    ``unfinished`` with a ``CleanupOverrunError``. Without a cancellation, or without a grace, cleanup is awaited to
+    its end.
     """
     task = _owned_task(awaitable)
     cancellation: asyncio.CancelledError | None = None
     loop = asyncio.get_running_loop()
+    deadline = _grace_end(cancelled, grace) if grace is not None and cancelled is not None else None
     while not task.done():
-        timeout = None
-        if deadline is not None and (cancelled or cancellation is not None):
-            timeout = max(0.0, deadline - loop.time())
+        timeout = None if deadline is None else max(0.0, deadline - loop.time())
         try:
             await asyncio.wait((task,), timeout=timeout)
         except asyncio.CancelledError as error:
             cancellation = error
+            if grace is not None:
+                # A cancellation that arrives while another's grace runs ends with it: the cleanup waits no longer.
+                deadline = _grace_end(error, grace) if deadline is None else _share_grace(error, deadline)
             continue
         if not task.done():
             task.add_done_callback(_observe_background_cleanup)
-            overrun = CleanupOverrunError("cleanup exceeded the operation time budget")
+            overrun = CleanupOverrunError("cleanup outlasted the grace a cancellation is deferred for")
             return CleanupResult(cancellation, overrun, unfinished=task)
     try:
         _ended(await task)
@@ -899,14 +990,40 @@ async def await_cleanup_resistant(
 def rearm_cancellation(cancellation: asyncio.CancelledError | None) -> None:
     """Replay a cancellation that atomic cleanup absorbed, after a failure that is not one replaced it.
 
+    The replay is a new delivery: each exit it reaches defers it for a grace of its own (``_grace_end``).
+
     ``None`` means cleanup absorbed no cancellation, so nothing is replayed: a cancellation that is
     itself leaving as the exception, or one the caller already handled, is never delivered twice.
+
+    A structured owner of the cancellation (``asyncio.timeout``, ``TaskGroup``) that takes it back (``Task.uncancel``)
+    as the failure passes through it withdraws the replay too. Python 3.13 disarms a cancellation that ``uncancel``
+    takes back, so the replay is armed now: it lands where the task next waits, or ends the task cancelled if it
+    returns first. Python 3.12 does not disarm it, so an armed replay would cancel a later wait that nobody cancelled;
+    there the replay is decided where the task next waits, and a task that returns without waiting again ends with
+    what it returned (``_REPLAY_ARMED``).
     """
     task = asyncio.current_task()
     if cancellation is None or task is None or not task.cancelling():
         return
+    message = cancellation.args[0] if cancellation.args else None
+    if _REPLAY_ARMED:
+        _replay_cancellation(task, message)
+    else:
+        asyncio.get_running_loop().call_soon(_replay_cancellation, task, message)
+
+
+# Whether ``Task.uncancel`` disarms a cancellation it takes back (Python 3.13 and later), so a replay can be armed at
+# once instead of decided at the task's next wait.
+_REPLAY_ARMED = sys.version_info >= (3, 13)
+
+
+def _replay_cancellation(task: asyncio.Task[object], message: object) -> None:
+    """Deliver a replayed cancellation to ``task``, unless it ended or nobody requests the cancellation any more."""
+    if task.done() or not task.cancelling():
+        return
+    # The request is counted already: replaying it must not count it twice.
     task.uncancel()
-    task.cancel(cancellation.args[0] if cancellation.args else None)
+    task.cancel(message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -938,6 +1055,21 @@ class CancellationMark:
         """Raise a cancellation requested after the mark that no await delivered."""
         if self.requested():
             raise asyncio.CancelledError
+
+
+def cancelled_here() -> bool:
+    """Return whether the current task itself is being cancelled, not only something it awaited."""
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
+
+
+def own_cancellation(error: BaseException | None) -> asyncio.CancelledError | None:
+    """Return ``error`` if it is the current task's own cancellation, ``None`` for anything else.
+
+    A ``CancelledError`` the task was never asked for is not its own: one a future another task cancelled ended in,
+    or the one an awaited task that was cancelled raised. The task's close then runs as nobody's cancellation.
+    """
+    return error if isinstance(error, asyncio.CancelledError) and cancelled_here() else None
 
 
 async def mark_cancellation() -> CancellationMark:

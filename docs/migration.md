@@ -91,6 +91,90 @@
   `hold_method(method, seconds)` and its reset recorded with `observe_reset(method, seconds)`;
   `RateCoordinator` takes `sleep=` to wait out a hold on its `clock`'s time.
 
+## Stream lifecycle, cancellation and closing
+
+- **Breaking: a read ended by a close from another task raises `StreamClosedError`.** A stream or client
+  closed from another task while a read was in flight made that read raise `CancelledError`, although nobody
+  cancelled the reader's task: in a `TaskGroup` the code after the loop was skipped silently, and a parent
+  awaiting the reader took it for its own cancellation. The read now raises `b24api.errors.StreamClosedError`
+  with the stream's report as `.report` (or the close's failure, when the close failed). A reader whose own
+  task is cancelled still gets its `CancelledError`, unless an interrupt ends the stream within the one second
+  its read waits for the close: then it gets the interrupt, which the close raises too. A read that starts
+  after the stream ended still raises `StopAsyncIteration`.
+- **Breaking: a cancellation is deferred for one second, not for the rest of `max_elapsed`.** A cancelled
+  read, `aclose()` or `async with` exit waited for cleanup that ignored the cancellation (a synchronous
+  source blocked in `next()`, a source close that waits) up to the operation's time left: by default up to
+  15 minutes of `task.cancel()` or Ctrl-C doing nothing, and `client.aclose()` had no bound at all. Each now
+  waits at most one second, then raises the cancellation; an `async with` exit
+  whose body the cancellation ended (Ctrl-C while the body processes an item) is a cancelled exit, and the
+  exits one cancellation unwinds (the stream's, then the client's) share that one second, as does a second
+  cancellation that arrives within it. One an exit replays behind another exception (the body's own, or a
+  failed read or close) is a new delivery: each exit it then reaches waits at most one second more. Ctrl-C under
+  `asyncio.run` ends with `KeyboardInterrupt`, an `asyncio.timeout` with `TimeoutError`. Cleanup still
+  running goes on in the background, the report records it as a cleanup failure behind the cancellation
+  ("stream cleanup also failed (CleanupOverrunError)"), and a later `client.aclose()` waits for it. A close
+  nobody cancelled still waits for its cleanup as before, including an exit whose body ended with a
+  `CancelledError` its task was never asked for (one an awaited task that was cancelled raised).
+- **Breaking: the operation's page budget ends the operation.** Once `max_pages` refused a page, every binding read
+  after it got its own `BudgetExceededError` and the source was drained to its end, with its side effects;
+  the operation ended `completed_with_failures`. It now ends as when `max_requests` refuses a send: the
+  source is not read further, the report is `incomplete` with a `budget_exhausted` violation, and the
+  stream raises the budget's error. This holds for keyset traversal too, whose waves reserve their pages at
+  once: a wave the pages already read leave no room for is that refusal. A wave that fits only once pages in
+  flight are released waits for them, where it failed at once. `max_pages_per_reference` still refuses only
+  its reference.
+- **`collect()` and `first()` keep what they read before a failure.** The items a helper had read were lost
+  with its return value when the stream then failed or its close failed, though the report counted them
+  in `emitted`. The raised error now carries them as `partial_values` (a tuple).
+- **Breaking: a close from another task while a failed read cleans up returns quietly.** `aclose()` (or the client's
+  close) raised the read's failure (`BatchFailed`, `ReferenceFailed`, a `TransportError`) and the report was
+  `early_closed` with a cleanup failure and without the read's failure, in a shape that differed by family.
+  The failure is now the read's alone: the report is `failed` with it as the terminal reason, and the close
+  returns. A source's failure is the same: a read that waited for work when the source failed raises it.
+- **Breaking: a close no longer raises a source failure no read reached.** When the source had failed in the
+  read-ahead of `fan_out()`, `fan_out_outcomes()` or a reference stream after the items the reader took,
+  `aclose()` (or the `async with` exit after `break`) raised it as a cleanup failure, and the report was
+  `early_closed` with a `cleanup_failure` violation. The close now ends the stream before that failure, as
+  before a binding's failure the reader did not reach: it returns, and the report is `early_closed` with no
+  violation. A failure the source raised while being closed is still the close's.
+- **`async with client` keeps a cancellation that arrives while the body's exception closes it.** The body's
+  exception left and the cancellation was lost, so under `asyncio.run` the first Ctrl-C did nothing. The
+  body's exception still leaves, and the cancellation lands at the next `await`, as for a stream's
+  `async with`. **Breaking:** a close that fails behind the body's exception is no longer set as its
+  `__cause__`, which replaced the body's own cause; it is noted on it, "client close also failed (X)".
+- **A cancellation re-armed after a failed body no longer leaks on Python 3.12.** After `async with stream`
+  whose body raised, a timeout that fired during the close made the next unrelated `await` after a handled
+  `asyncio.timeout`, `wait_for` or `TaskGroup` raise `CancelledError` on Python 3.12 (not on 3.13). It now
+  ends within the scope that owns it on both. Python 3.12 cannot withdraw a cancellation once it is armed
+  (`Task.uncancel` does not disarm it), so there the replay is decided where the task next waits: a task
+  that catches the body's exception and returns without another `await` ends with what it returned, not
+  cancelled. On Python 3.13 and later the replay is armed at once, and such a task ends cancelled.
+- **A read coroutine closed while it waits ends the stream.** A `__anext__()` coroutine closed during its
+  wait (by hand, or by the garbage collector for an unreferenced task) left the stream in cleanup forever,
+  and `stream.aclose()` and `client.aclose()` then hung. The stream now ends early-closed and closes as any
+  other.
+- **A started stream the application drops stays the client's.** It fell out of the client's weak set:
+  its tasks were destroyed by the garbage collector ("Task was destroyed but it is pending"), it got no
+  report, and `client.aclose()` did not know of it. The client now keeps a started stream until it ends and
+  closes it with itself.
+- **A close requested from a stream's own work is refused wherever it comes from.** A close of the stream
+  or its client from a callback during the handoff of an item to the reader, or from a synchronous
+  source's worker thread, was not refused and could wait for itself. Both are now refused as from the
+  stream's other work. `client.aclose()` decides once whether its caller is such work, then runs outside
+  it, so a stream it closes no longer refuses it later.
+- **A cancellation nobody requested ends what it reached.** A transport or caller code that raised
+  `CancelledError` while its task was not cancelled (a shared future it awaited was cancelled) hung the
+  operation forever. `call()` now raises a `TransportError`, and in a stream the command or binding it
+  reached gets an outcome and the stream ends.
+- **Breaking: a client serves the one event loop it was first used in.** Used from a second loop (two `asyncio.run`
+  calls in turn), a client could hang after a server pause, its wake task left on the closed loop. It now
+  raises `RuntimeError` at once: a call, a stream (on its first read, before it reads its source or sends) or
+  a close, which leaves the client open. Create a client per event loop, and close it there.
+- **Breaking: an early close always gives its reason.** A `fan_out()`, `fan_out_outcomes()` or `iter_list()` stream
+  closed before its first read, or a close whose cleanup a cancellation cut at the grace, reported the
+  `terminal_reason` `"early_closed"`, the state's name, because its source recorded no end. Every early
+  close now reports `"stream closed before exhaustion"`, as a logical batch's did.
+
 ## Offset traversal ends at the page without `next`
 
 - **Breaking: `iter_list()` ends at the page without `next`.** It followed `next` and then asked for
@@ -551,7 +635,8 @@ alike (see the execution facts in `docs/architecture.md`).
   between reads, or your source's pull or close did; raised by your source's close it replaces whatever
   ended the stream, as from a `finally`. It is never lost silently: what no read got, the close raises,
   once; one the library could no longer deliver to a read or a close (raised after the stream ended, by
-  work that outlived its cleanup window, or in a stream nothing ever ends, once it is collected) is
+  work that outlived its cleanup window, by the cleanup of a close or a read whose coroutine was closed while it ran the end,
+  or in a stream nothing ever ends, once it is collected) is
   reported to the event loop's exception handler, once. Your source is closed once and nothing hangs. Its
   report and its rank behind other ends are not promised. Code that caught it as the `__cause__` of
   `InputSourceError`, `BatchFailed` or `ReferenceFailed`, or read it from a failure outcome, catches it
@@ -657,12 +742,12 @@ alike (see the execution facts in `docs/architecture.md`).
   violation names `CleanupOverrunError`.
 - **A close before the first pull is bounded too.** A stream closed before it was read waited for its
   source's close without bound; it now waits as any cleanup step does.
-- **A read the client closes, and a close, raise public errors.** A read in flight when the stream's
-  client closed could raise a private exception class (for example `_BindingSourceError`) when the
-  source had failed meanwhile, and so could `aclose()` (or the `async with` exit after `break`) when
-  the source had failed during the read-ahead. Both now raise the public error the stream raises for
-  that failure otherwise: `InputSourceError` (`fan_out()`: `BatchFailed`; a failed reference window:
-  `ReferenceFailed`).
+- **A read the client closes raises a public error.** A read in flight when the stream's client closed
+  could raise a private exception class (for example `_BindingSourceError`) when the source had failed
+  meanwhile. It now raises the public error the stream raises for that failure otherwise:
+  `InputSourceError` (`fan_out()`: `BatchFailed`; a failed reference window: `ReferenceFailed`). A close
+  after the source failed in the read-ahead raises nothing (see "Stream lifecycle, cancellation and
+  closing").
 - **A source failure chains from the source's own exception.** The `__cause__` of the
   `InputSourceError` a failed source raises is now the exception the source raised (`BatchFailed`
   chains to it through that `InputSourceError`); for `fan_out()`, `fan_out_outcomes()` and the

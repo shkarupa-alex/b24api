@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 from b24api.completion.closure import DECLARED_SHORT_PAGE_REACHED, qualified_closure
 from b24api.contracts.completion import BindingClosure
 from b24api.contracts.dispatch import PORTAL_PAGE_ROWS
+from b24api.execution.context import own_failure
 from b24api.traversal.plans import (
     CountedOffsetPlan,
     DispatchPlan,
@@ -87,6 +88,20 @@ async def _wait_for_admission(producer: asyncio.Task[Settled[None]], changed: as
 
 
 async def _wait_for_event(queue: asyncio.Queue[_Event], producer: asyncio.Task[Settled[None]]) -> _Event:
+    """Wait for the next event; a wait stopped after the source failed on its own ends in that failure.
+
+    The bindings admitted before the source failed come first, so a source's failure waits for their events. A
+    close that stops the wait meanwhile does not hide it as a cleanup failure (``own_failure``).
+    """
+    try:
+        return await _next_event(queue, producer)
+    except asyncio.CancelledError:
+        if (failure := own_failure(producer)) is not None:
+            raise failure from failure.__cause__
+        raise
+
+
+async def _next_event(queue: asyncio.Queue[_Event], producer: asyncio.Task[Settled[None]]) -> _Event:
     if producer.done():
         return await queue.get()
     getter = asyncio.create_task(queue.get())

@@ -21,7 +21,7 @@ from b24api.execution import (
     Executor,
     WorkClass,
 )
-from b24api.execution.context import latch_escape
+from b24api.execution.context import cancelled_here, latch_escape
 from b24api.execution.facts import settlement
 from b24api.references.outcome import (
     KernelReferenceFailure,
@@ -1292,10 +1292,18 @@ class _BatchPageDispatcher:
                 progress=progress,
             )
             self._correlate(chunk, outcomes)
-        except asyncio.CancelledError:
-            for item in chunk:
-                item.future.cancel()
-            raise
+        except asyncio.CancelledError as cancellation:
+            if cancelled_here():
+                for item in chunk:
+                    item.future.cancel()
+                raise
+            # Nobody cancelled this worker: the wave failed with a cancellation of something it awaited. Its pages
+            # fail with it, by what the wave's progress says each command did, and the worker sends the next wave.
+            error = CapabilityError("batch wave was cancelled while its operation was running")
+            error.__cause__ = cancellation
+            for position, item in enumerate(chunk):
+                if not item.future.done():
+                    item.future.set_exception(_ChunkPageError(error, progress, position))
         except BaseException as error:  # noqa: BLE001 - total chunk correlation boundary, an escape's too
             # Every page fails with the chunk's error and keeps what its own command did, which the chunk's
             # progress says at the page's position, whatever failed: a sent page no longer has a deadline to end

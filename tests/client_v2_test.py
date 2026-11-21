@@ -62,6 +62,7 @@ from b24api.errors import (
     InputSourceError,
     PaginationError,
     ReferenceFailed,
+    StreamClosedError,
     TransportError,
 )
 from b24api.execution.facts import Execution, execution
@@ -2148,8 +2149,9 @@ async def test_client_context_preserves_body_error_when_owned_cleanup_fails(scri
         async with client:
             raise ValueError("primary body failure")
 
-    assert isinstance(captured.value.__cause__, RuntimeError)
-    assert "owned transport cleanup failed" in str(captured.value.__cause__)
+    # The body's exception keeps its own cause; the failed close is noted on it, as a stream's ``async with`` does.
+    assert captured.value.__cause__ is None
+    assert captured.value.__notes__ == ["client close also failed (RuntimeError)"]
     assert transport.closed
 
 
@@ -2162,12 +2164,12 @@ async def test_public_aclose_is_permitted_during_an_inflight_pull_and_cancels_ow
 
     await stream.aclose()
 
-    with pytest.raises(asyncio.CancelledError) as captured:
+    with pytest.raises(StreamClosedError) as captured:
         await pull
     assert attached_report(captured.value) is stream.report
     assert transport.cancelled.is_set()
     assert stream.report is not None
-    # aclose() owns termination, so the cause is an early close even though the read was cancelled.
+    # aclose() owns termination, so the cause is an early close, and the read it ended says so.
     assert stream.report.state is TerminalState.EARLY_CLOSED
 
 
@@ -2182,7 +2184,7 @@ async def test_concurrent_public_pulls_reject_without_stealing_the_owned_pull() 
         await anext(stream)
 
     await stream.aclose()
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(StreamClosedError):
         await owned_pull
 
 

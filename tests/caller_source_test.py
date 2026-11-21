@@ -19,6 +19,7 @@ import contextvars
 import gc
 import sys
 import threading
+import time
 import warnings
 from typing import TYPE_CHECKING, Any
 
@@ -50,13 +51,15 @@ from b24api.errors import (
     IncompleteTraversalError,
     InputSourceError,
     PaginationError,
+    StreamClosedError,
 )
-from b24api.execution.context import is_interrupt
+from b24api.execution.context import CANCEL_GRACE_SECONDS, is_interrupt
 from tests.scripting import (
     DEADLINE_BUDGET,
     HANG_BOUND,
     BatchPortal,
     ResponderTransport,
+    attached_report,
     client_for,
     raised_by_asyncio_run,
     raised_driving_the_loop,
@@ -443,7 +446,7 @@ async def test_a_callers_own_stream_read_under_a_closed_read_is_cancelled_not_ea
             read = asyncio.create_task(anext(outer))
             await reached(inner_started)
             assert await _settled(outer.aclose()) is None
-            assert isinstance(await _settled(read), asyncio.CancelledError)
+            assert isinstance(await _settled(read), StreamClosedError)
 
         assert outer.report is not None
         assert outer.report.state is TerminalState.EARLY_CLOSED
@@ -512,11 +515,12 @@ async def test_a_close_while_a_read_is_in_flight_is_an_early_close_like_any_othe
     assert report.state is TerminalState.EARLY_CLOSED
     assert source.closes == 1
     if close == "returns":
-        # The read the close ended raises the close's cancellation of it; the close itself succeeded.
+        # The read the close ended raises that the stream was closed while it read; the close itself succeeded.
         assert closed is None
-        assert isinstance(read_end, asyncio.CancelledError)
+        assert isinstance(read_end, StreamClosedError)
         assert report.terminal_reason == "stream closed before exhaustion"
         assert _violations(report) == []
+        assert attached_report(read_end) is report
         return
     # The closer gets the close's failure, and so does the read the close ended in it.
     assert type(closed) is _raised_for(family, close)
@@ -1472,6 +1476,62 @@ def test_a_read_woken_with_the_interrupt_between_reads_closes_the_source_under_a
     assert getattr(error, "report", None) is report
 
 
+def _interrupt_between_reads(family: str) -> tuple[BaseException, float, _InterruptsBetweenReads, _Source]:
+    """Run a stream whose reader holds an item as another binding's send raises an interrupt, under its own loop.
+
+    Return what ``asyncio.run`` raised, how long after the interrupt, the transport and the source.
+    """
+    transport = _InterruptsBetweenReads(KeyboardInterrupt)
+    source = _Source(family, "overruns")
+    raised_at: list[float] = []
+
+    async def main() -> None:
+        # Bounds an end that waited for the cleanup instead of the grace.
+        asyncio.get_running_loop().call_later(4.0, source.release.set)
+        async with client_for(ResponderTransport(transport), policy=POLICIES["returns"]) as client:
+            stream = _stream(client, family, source, DirectDispatch(concurrency=2))
+            async with stream:
+                await anext(stream)
+                transport.between.set()
+                await reached(transport.raising)
+                raised_at.append(time.monotonic())
+                await asyncio.sleep(HANG_BOUND)
+
+    error = raised_by_asyncio_run(main)
+    return error, time.monotonic() - raised_at[0], transport, source
+
+
+@pytest.mark.parametrize("family", ["iter_reference_outcomes", "fan_out_outcomes"])
+def test_an_interrupt_between_reads_ended_by_a_cancelled_exit_waits_for_cleanup_only_the_grace(family: str) -> None:
+    # The reader holds an item while another binding's send raises the interrupt; the shutdown ``asyncio.run`` then
+    # begins cancels the main task, whose stream exit runs the interrupt's end holding that cancellation. The source's
+    # close outlasts the grace: the exit, and the client's after it, wait for it one grace in all.
+    error, waited, transport, source = _interrupt_between_reads(family)
+    assert error is transport.raised[0]
+    assert source.closes == 1
+    assert waited < CANCEL_GRACE_SECONDS + 1.0, waited
+
+
+@pytest.mark.parametrize("family", ["iter_reference_outcomes", "fan_out_outcomes"])
+def test_a_stream_its_loop_left_behind_starts_no_work_in_a_later_loop_that_collects_it(family: str) -> None:
+    # The interrupt's loop ends with the stream's reader coroutine still pending. Collected later inside another
+    # loop, that coroutine's close hands nothing over to that loop: its shutdown would wait on the stream's end.
+    _interrupt_between_reads(family)
+    tasks: list[str] = []
+
+    async def later() -> None:
+        gc.collect()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        tasks.extend(repr(task) for task in asyncio.all_tasks() if task is not asyncio.current_task())
+
+    loop = threading.Thread(target=asyncio.run, args=(later(),), daemon=True)
+    loop.start()
+    loop.join(HANG_BOUND)
+    assert not loop.is_alive(), "the later loop waits on a stream it never ran"
+    assert tasks == []
+
+
 class _FailingPageStop:
     """A page stop whose callback raises its own ``Exception``."""
 
@@ -1754,7 +1814,7 @@ def test_a_base_exception_that_is_no_interrupt_reaches_the_reader_as_python_rais
         assert str(error) == point
     if point in {"conc_close_in_read", "sync_pull_cancelled"}:
         assert len(run.readers) == 1
-        assert isinstance(run.readers[0], asyncio.CancelledError)
+        assert isinstance(run.readers[0], StreamClosedError)
     if point in {"behind_body", "client_close"}:
         assert error.__context__ is run.own
 
@@ -1800,7 +1860,8 @@ class _RawRace:
 def test_a_base_exception_a_read_ends_in_reaches_that_read_or_a_concurrent_close_once(family: str) -> None:
     # A read waits in another task when binding 1's send raises it, and the stream is closed after one number of loop
     # turns, then the next: the read's task may have ended in it already, its reader not resumed yet. Whoever comes
-    # first gets it, exactly once: the read, or else the close, which cancels the read. Both come first in the sweep.
+    # first gets it, exactly once: the read, or else the close, whose read then raises that the stream was closed
+    # while it read. Both come first in the sweep.
     # The source is closed once, and nothing reaches the event loop.
     firsts: set[str] = set()
     for turns in range(RACE_TURNS):
@@ -1814,7 +1875,7 @@ def test_a_base_exception_a_read_ends_in_reaches_that_read_or_a_concurrent_close
         assert len(got) == len(raised) == 1, (turns, run.read, run.closed)
         firsts.update(got)
         if got == ["close"]:
-            assert run.read is None or isinstance(run.read, asyncio.CancelledError), turns
+            assert run.read is None or isinstance(run.read, StreamClosedError), turns
         else:
             assert run.closed is None, turns
     assert firsts == {"read", "close"}
@@ -1952,8 +2013,8 @@ def test_an_escape_of_an_operation_nothing_ends_reaches_the_loops_handler_once(
 ) -> None:
     # Nothing ends the operation: no read or close is there to raise the escape. As asyncio reports a task's exception
     # nobody retrieved, the operation reports it to the loop's exception handler, once, with that very object, when it
-    # is collected: after asyncio.run returned, on its closed loop, or as the dropped stream goes while the loop runs
-    # on. A dropped stream whose held send the client's close cancels is that close's to raise instead.
+    # is collected after asyncio.run returned, on its closed loop. A started stream the application dropped while the
+    # loop runs on is still its client's: the client's close ends it and raises its escape, once.
     run = _Abandoned(family, raised, end)
     escaped: list[int] = []
     try:
@@ -1964,7 +2025,7 @@ def test_an_escape_of_an_operation_nothing_ends_reaches_the_loops_handler_once(
     run.kept.clear()
     gc.collect()
     handed = [id(context["exception"]) for context in run.handler.contexts if context.get("exception") is not None]
-    if (raised, end) == ("held", "gc"):
+    if end == "gc":
         assert (escaped, handed) == ([error_id], [])
     else:
         assert (escaped, handed) == ([], [error_id])
@@ -2875,3 +2936,22 @@ def test_no_library_task_ends_in_a_failure_when_the_event_loop_shuts_down(family
     asyncio.run(main())
 
     assert [(context["message"], context.get("task")) for context in reports] == []
+
+
+@pytest.mark.parametrize("family", REFERENCE_FAMILIES)
+@pytest.mark.asyncio
+async def test_a_close_of_a_stream_never_read_whose_coroutine_is_closed_still_ends_it(family: str) -> None:
+    # The close is the stream's first step on its loop. Its coroutine is closed while the source's close waits, as a
+    # loop that stops closes what is pending: the end goes on in a task of that loop and publishes its report.
+    source = _ClosesWhenReleased(family)
+    client = client_for(ResponderTransport(_answer), policy=POLICIES["returns"])
+    async with asyncio.timeout(HANG_BOUND), client:
+        stream = _stream(client, family, source, DirectDispatch(concurrency=2))
+        closing = stream.aclose()
+        closing.send(None)
+        await reached(source.closing)
+        closing.close()
+        source.release.set()
+        await _turns()
+        assert stream.report is not None
+        assert stream.report.state is TerminalState.EARLY_CLOSED
