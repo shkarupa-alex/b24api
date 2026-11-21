@@ -80,7 +80,7 @@ from b24api.traversal.keyset_ordered_admission import OrderedAdmissionState
 from tests.scripting import HANG_BOUND, ResponderTransport, client_for, json_response
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Callable
     from typing import Any
 
     from b24api.contracts import JsonValue
@@ -2837,6 +2837,25 @@ def _batches(transport: ResponderTransport) -> int:
     return sum(sent.method == "batch" for sent in transport.requests)
 
 
+def _hold_the_budget_clock(monkeypatch: pytest.MonkeyPatch) -> Callable[[], None]:
+    """Stand every operation budget's clock still until the returned call, then run it on from where it stood."""
+    started = time.monotonic()
+    resumed: list[float] = []
+
+    def clock() -> float:
+        return started if not resumed else started + time.monotonic() - resumed[0]
+
+    def context(executor: Executor, policy: ExecutionPolicy | None = None) -> ExecutionContext:
+        return ExecutionContext(policy or ExecutionPolicy(), executor.coordinator, clock=clock)
+
+    def resume() -> None:
+        if not resumed:
+            resumed.append(time.monotonic())
+
+    monkeypatch.setattr(Executor, "context", context)
+    return resume
+
+
 @pytest.mark.parametrize("send", [1, 2, 3, "finish"])
 @pytest.mark.parametrize("end", ["cancel", "interrupt", "budget", "transport"])
 def test_a_traversal_ended_while_a_page_is_on_the_wire_settles_every_page_before_rejecting_it(
@@ -2845,7 +2864,9 @@ def test_a_traversal_ended_while_a_page_is_on_the_wire_settles_every_page_before
     # The first send is the boundary wave, the next ones are range waves, and the last a direct finish page.
     # Whatever ends the traversal while one is on the wire (its reader's cancellation, an interrupt, the elapsed
     # budget, a transport failure), every page is settled before the ledger rejects it, and the pages that may
-    # have run make the binding's closure unknown.
+    # have run make the binding's closure unknown. The budget's clock stands still until the held page is on the wire,
+    # so the pages before it are sent within the budget however slow the runner (the responder never pauses before
+    # them), and its whole budget is the held one's.
     events: list[object] = []
     emit = CompletionGate.emit
 
@@ -2856,10 +2877,12 @@ def test_a_traversal_ended_while_a_page_is_on_the_wire_settles_every_page_before
     monkeypatch.setattr(CompletionGate, "emit", observe)
     keyset = KeysetTransport(tuple(range(1, 2000)))
     on_the_wire = asyncio.Event()
+    resume_the_clock = _hold_the_budget_clock(monkeypatch)
 
     async def respond(request: Request) -> object:
         if len(transport.requests) == send or (send == "finish" and request.method != "batch"):
             on_the_wire.set()
+            resume_the_clock()
             if end == "interrupt":
                 raise KeyboardInterrupt
             if end == "transport":
@@ -2868,8 +2891,7 @@ def test_a_traversal_ended_while_a_page_is_on_the_wire_settles_every_page_before
         return await keyset.send(request, attempt_timeout=1.0, max_response_bytes=1 << 20)
 
     transport = ResponderTransport(respond, host=keyset.host)
-    # The budget is long enough for every page before the held one to be sent within it.
-    policy = ExecutionPolicy(max_elapsed=1.0) if end == "budget" else None
+    policy = ExecutionPolicy(max_elapsed=0.3) if end == "budget" else None
     stream = _stream(transport, RangeKeysetExecution(StableIntegerKeysetContract()), policy=policy)
 
     async def main() -> None:
