@@ -70,12 +70,13 @@ class KeysetRuntime:
         self.completion_recorder: FastPageLedger = completion_recorder or FastCompletionRecorder()
         self.completion = execution.contract.page_completion
         requested_batch = getattr(execution, "batch_size", None) or PORTAL_BATCH_CAP
-        self.batch_capacity = min(
+        # The commands a wave may carry whatever rows it fits; planning bounds them by its rows again.
+        self.command_capacity = min(
             requested_batch,
             engine.portal_command_cap,
             context.policy.max_buffered_commands,
-            context.policy.max_buffered_rows // effective_page_cap,
         )
+        self.batch_capacity = min(self.command_capacity, context.policy.max_buffered_rows // effective_page_cap)
         self.admission = OrderedAdmissionState(
             direction="asc" if keyset.direction == "ascending" else "desc",
             identity=identity,

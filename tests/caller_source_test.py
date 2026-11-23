@@ -1882,11 +1882,17 @@ def test_a_base_exception_a_read_ends_in_reaches_that_read_or_a_concurrent_close
 
 
 class _TailWavesRaiseWhenCancelled:
-    """Serve a counted traversal's head and first tail pages; hold every later one, which raises it once cancelled."""
+    """Serve a counted traversal's head page and its first tail wave; hold every later page, raising once cancelled.
+
+    A batch is answered command by command, so a held page holds its whole wave: the first tail wave (``batch_size``
+    pages, 50 to 150) is served whole for the reader to get past the head.
+    """
 
     ROWS = 1001
     WIDTH = 50
-    SERVED = frozenset({0, 50, 100})
+    SERVED = frozenset({0, 50, 100, 150})
+    # The counted window sends page 200 once the reader is past the rows of pages 0 and 50.
+    READ_AHEAD_AT = 2 * WIDTH
 
     def __init__(self) -> None:
         self.raised: list[BaseException] = []
@@ -1930,7 +1936,8 @@ def test_a_base_exception_a_counted_tail_page_the_close_cancelled_raises_is_the_
             )
             async for item in stream:
                 read.append(item)
-                if len(read) > answer.WIDTH:
+                # Past the first tail wave's first page: the next tail page is out and held.
+                if len(read) > answer.READ_AHEAD_AT:
                     break
             for _turn in range(turns):
                 await asyncio.sleep(0)

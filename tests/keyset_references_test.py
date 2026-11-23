@@ -84,7 +84,8 @@ from b24api.errors import (
 from b24api.execution import ExecutionContext, Executor, RateCoordinator, WorkClass
 from b24api.references import wave_engine
 from b24api.references.budget_view import BindingBudgetView, RowLease
-from b24api.references.dispatch import _RowBuffer
+from b24api.references.dispatch import _Reservation, _RowBuffer
+from b24api.references.scheduler import ReferenceScheduler
 from b24api.transport import WireResponse
 from b24api.traversal.keyset_runtime import KeysetRuntime
 from b24api.traversal.keyset_waves import wave_room
@@ -95,10 +96,11 @@ from tests.scripting import (
     ResponderTransport,
     client_for,
     on_loop,
+    reached,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import AsyncIterator, Callable, Mapping
 
     from b24api.contracts import KeysetExecutionReport, ReferenceOutcome
     from b24api.contracts.completion import CompletionEvidence
@@ -203,6 +205,8 @@ class _Leases:
     """Spy on the shared pool: every lease granted, the leases outstanding and their high water."""
 
     granted: list[tuple[int, int]] = field(default_factory=list)
+    # The rows each lease held once its binding planned, where it grew then.
+    grown: dict[int, int] = field(default_factory=dict)
     high_water: int = 0
     pools: list[_RowBuffer] = field(default_factory=list)
     live: list[object] = field(default_factory=list)
@@ -211,6 +215,11 @@ class _Leases:
     def outstanding(self) -> int:
         """Return the rows still held by granted leases (a closed pool zeroes every reservation)."""
         return sum(getattr(reservation, "amount", 0) for reservation in self.live)
+
+    @property
+    def planned(self) -> dict[int, int]:
+        """Return the rows each binding planned with: its grant, or what its lease grew to."""
+        return {index: self.grown.get(index, amount) for index, amount in self.granted}
 
 
 @pytest.fixture
@@ -227,7 +236,17 @@ def leases(monkeypatch: pytest.MonkeyPatch) -> _Leases:
             spy.pools.append(self)
         return reservation
 
+    grow = _RowBuffer.grow_lease
+
+    def tracked_grow(self: _RowBuffer, reservation: _Reservation, grant: Callable[[int], int]) -> None:
+        before = reservation.amount
+        grow(self, reservation, grant)
+        if reservation.amount != before:
+            spy.grown[reservation.index] = reservation.amount
+            spy.high_water = max(spy.high_water, spy.outstanding)
+
     monkeypatch.setattr(_RowBuffer, "lease", tracked_lease)
+    monkeypatch.setattr(_RowBuffer, "grow_lease", tracked_grow)
     return spy
 
 
@@ -316,7 +335,7 @@ async def test_fast_references_match_the_flat_oracle_at_their_lease(
     assert report.state is TerminalState.COMPLETED
     assert leases.outstanding == 0
     assert all(pool.maximum == ExecutionPolicy().max_buffered_rows for pool in leases.pools)
-    grants = dict(leases.granted)
+    grants = leases.planned
     for index, name in enumerate(names):
         evidence = completes[name].keyset_execution
         assert evidence is not None
@@ -1055,21 +1074,33 @@ async def test_fast_keyset_references_refuse_a_batch_too_small_for_the_boundary_
 # shared delta per adjustment; the runtime balance equals the lease holding after every wave.
 
 
+def _track_views(monkeypatch: pytest.MonkeyPatch) -> tuple[list[tuple[BindingBudgetView, int]], dict[int, int]]:
+    """Record every binding view with the rows its lease was granted, and the rows each planned with by its id."""
+    views: list[tuple[BindingBudgetView, int]] = []
+    over, plan_rows = BindingBudgetView.over, BindingBudgetView.planning_rows
+    planned: dict[int, int] = {}
+
+    def tracked_over(shared: ExecutionContext, lease: RowLease, grow: Callable[[], int] | None) -> BindingBudgetView:
+        view = over(shared, lease, grow)
+        views.append((view, lease.capacity))
+        return view
+
+    def tracked_planning(self: BindingBudgetView) -> int:
+        planned[id(self)] = plan_rows(self)
+        return planned[id(self)]
+
+    monkeypatch.setattr(BindingBudgetView, "over", staticmethod(tracked_over))
+    monkeypatch.setattr(BindingBudgetView, "planning_rows", tracked_planning)
+    return views, planned
+
+
 @pytest.mark.parametrize("execution", [_range(), _auto()], ids=["range", "auto"])
 @pytest.mark.asyncio
 async def test_the_budget_view_projects_only_the_lease_and_keeps_execution_on_the_shared_context(
     execution: Execution,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    views: list[tuple[BindingBudgetView, int]] = []
-    over = BindingBudgetView.over
-
-    def tracked_over(shared: ExecutionContext, lease: RowLease) -> BindingBudgetView:
-        view = over(shared, lease)
-        views.append((view, lease.capacity))
-        return view
-
-    monkeypatch.setattr(BindingBudgetView, "over", staticmethod(tracked_over))
+    views, planned = _track_views(monkeypatch)
     shared_deltas: list[int] = []
     shared_adjust = ExecutionContext.adjust_buffered_rows
 
@@ -1114,7 +1145,9 @@ async def test_the_budget_view_projects_only_the_lease_and_keeps_execution_on_th
 
     assert set(_completes(outcomes)) == {"p0", "p1"}
     assert len(views) == 2
-    _assert_only_bounded_plans_trim(views, _completes(outcomes))
+    # Each lease grows, if at all, as its binding plans; the plan and every wave after it fit that capacity.
+    assert all(planned[id(view)] >= granted for view, granted in views)
+    _assert_only_bounded_plans_trim([(view, planned[id(view)]) for view, _granted in views], _completes(outcomes))
     for view, _granted in views:
         shared_policy = view.shared.policy
         differing = {
@@ -1139,7 +1172,7 @@ def _assert_only_bounded_plans_trim(
     views: list[tuple[BindingBudgetView, int]],
     completes: Mapping[object, ReferenceComplete[object]],
 ) -> None:
-    """A plan that bounds the rows it can still hold trims its lease (#33); a lane plan keeps the grant."""
+    """A plan that bounds the rows it can still hold trims its lease (#33); a lane plan keeps what it planned at."""
     bounded = sum(
         complete.keyset_execution is not None
         and complete.keyset_execution.selected_kind
@@ -1159,6 +1192,7 @@ def test_keyset_context_names_exactly_the_members_fast_keyset_uses() -> None:
     assert members == {
         "policy",
         "execution_context",
+        "planning_rows",
         "start",
         "snapshot",
         "reserve_page",
@@ -1270,6 +1304,57 @@ async def test_auto_below_the_floor_runs_exclusively_and_matches_the_flat_oracle
         assert _cost(complete.keyset_execution) == _cost(oracle)
 
 
+# Ч-5: a lease is sized at admission, while the source may still hold bindings that would share the pool; it
+# grows as its binding plans, to the share the facts then known give.
+
+
+@pytest.mark.parametrize("ended", [True, False], ids=["source-read-out", "source-open"])
+@pytest.mark.asyncio
+async def test_a_lone_binding_plans_at_the_share_the_source_leaves_it(
+    leases: _Leases, monkeypatch: pytest.MonkeyPatch, *, ended: bool
+) -> None:
+    # The boundary wave is answered only once the scheduler has seen the source end, or, for an open source,
+    # with its next pull still pending: the binding plans at the whole pool, as a flat run does, or at the half
+    # it was admitted with, the other half kept for the binding the source may still hold.
+    ids, pool = tuple(range(1, 2_001)), 200
+    source_ended, release = asyncio.Event(), asyncio.Event()
+    end_source = ReferenceScheduler._end_source  # noqa: SLF001 - the seam observed
+
+    async def observed_end(self: ReferenceScheduler, admission: object) -> None:
+        await end_source(self, admission)  # type: ignore[arg-type]
+        source_ended.set()
+
+    monkeypatch.setattr(ReferenceScheduler, "_end_source", observed_end)
+    answer = _answer({"p0": ids})
+
+    async def held(method: str, query: Query) -> Envelope:
+        if ended:
+            await reached(source_ended)
+        return answer(method, query)
+
+    async def bindings() -> AsyncIterator[Binding[object]]:
+        yield _parent("p0")
+        if not ended:
+            await reached(release)
+
+    async with client_for(BatchPortal(held), policy=ExecutionPolicy(max_buffered_rows=pool)) as client:
+        stream = client.iter_reference_outcomes(_base(), bindings(), traversal=_traversal(_auto()))
+        completes: list[ReferenceComplete[object]] = []
+        async with stream:
+            async for outcome in stream:
+                if isinstance(outcome, ReferenceComplete):
+                    completes.append(outcome)
+                    release.set()
+
+    assert len(completes) == 1
+    evidence = completes[0].keyset_execution
+    assert evidence is not None
+    assert leases.granted == [(0, pool // 2)]
+    assert leases.planned == {0: pool if ended else pool // 2}
+    assert _cost(evidence) == _cost(await _flat_oracle(ids, _auto(), leases.planned[0]))
+    assert _cost(evidence) != _cost(await _flat_oracle(ids, _auto(), pool if not ended else pool // 2))
+
+
 @pytest.mark.asyncio
 async def test_a_sufficient_pool_runs_two_auto_bindings_to_the_flat_oracle(leases: _Leases) -> None:
     ids = DISTRIBUTIONS["dense"]
@@ -1284,7 +1369,7 @@ async def test_a_sufficient_pool_runs_two_auto_bindings_to_the_flat_oracle(lease
     completes = _completes(outcomes)
     assert len(completes) == 2
     assert all(complete.exhausted for complete in completes.values())
-    grants = dict(leases.granted)
+    grants = leases.planned
     for index, name in enumerate(("p0", "p1")):
         evidence = completes[name].keyset_execution
         assert evidence is not None

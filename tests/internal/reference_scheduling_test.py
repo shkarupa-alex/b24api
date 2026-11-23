@@ -9,6 +9,7 @@ the queue counts as coalescing potential until it arrives, and a fast keyset lea
 from __future__ import annotations
 import asyncio
 import contextlib
+import functools
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -53,6 +54,7 @@ from b24api.references.dispatch import (
     _FailureEvent,
     _PendingBatch,
     _ProducerState,
+    _Producing,
     _RowBuffer,
 )
 from b24api.references.scheduler import ReferenceScheduler
@@ -120,7 +122,7 @@ async def _parked_page_dispatcher() -> tuple[_BatchPageDispatcher, BatchPortal, 
     executor = Executor(portal)
     context = executor.context(ExecutionPolicy(max_pages=100, max_pages_per_reference=100))
     await context.start()
-    state = _ProducerState({"a", "x", "c"}, {"a": 0, "x": 1, "c": 2})
+    state = _ProducerState({"a": 0, "x": 1, "c": 2}, dict.fromkeys(("a", "x", "c"), _Producing.RUNNABLE))
     buffer = _RowBuffer(100, context, producer_state=state)
     first, leftovers, late = _dispatcher_page("a"), [_dispatcher_page("x") for _ in range(5)], _dispatcher_page("c")
     injected = False
@@ -140,7 +142,6 @@ async def _parked_page_dispatcher() -> tuple[_BatchPageDispatcher, BatchPortal, 
         KernelBatchDispatch(batch_size=2, concurrency=1, coalesce_wait=UNREACHABLE_COALESCE_WAIT),
         producer_state=state,
         buffer=buffer,
-        page_cap=1,
         wait=state_changes_first,
     )
     dispatcher._queue.put_nowait(first)  # noqa: SLF001
@@ -150,6 +151,11 @@ async def _parked_page_dispatcher() -> tuple[_BatchPageDispatcher, BatchPortal, 
     for _ in range(5):
         await asyncio.sleep(0)
     return dispatcher, portal, [first, *leftovers], late
+
+
+def _now(dispatcher: _BatchPageDispatcher, keys: set[str]) -> bool:
+    """Return whether the assembler's coalescing read projects a page joining a chunk of ``keys``, no wave landing."""
+    return dispatcher._potential(keys)[0]  # noqa: SLF001 - the assembler's coalescing read
 
 
 @pytest.mark.asyncio
@@ -187,7 +193,7 @@ async def test_a_page_on_its_way_to_the_queue_is_potential_until_it_arrives() ->
     executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
     context = executor.context(ExecutionPolicy(max_pages=1, max_pages_per_reference=1))
     await context.start()
-    state = _ProducerState(set(), {"r0": 0})
+    state = _ProducerState({"r0": 0})
     buffer = _RowBuffer(10, context, producer_state=state)
     dispatcher = _BatchPageDispatcher(
         executor,
@@ -195,13 +201,12 @@ async def test_a_page_on_its_way_to_the_queue_is_potential_until_it_arrives() ->
         KernelBatchDispatch(batch_size=2, coalesce_wait=UNREACHABLE_COALESCE_WAIT),
         producer_state=state,
         buffer=buffer,
-        page_cap=1,
     )
-    potential = dispatcher._potential  # noqa: SLF001 - the assembler's coalescing read
+    potential = functools.partial(_now, dispatcher)
     assert potential(set()) == 0
 
     reserved = state.depart("r0", page_reserved=True)
-    assert potential({"r0"}) == 1
+    assert potential({"r0"})
     reserved.arrive()
     reserved.arrive()
     assert potential(set()) == 0
@@ -246,7 +251,7 @@ async def test_a_pending_refill_is_potential_whatever_the_chunk_carries(*, ready
     executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
     context = executor.context(ExecutionPolicy(max_pages=100, max_pages_per_reference=100))
     await context.start()
-    state = _ProducerState(set(), {"r0": 0, "r1": 1})
+    state = _ProducerState({"r0": 0, "r1": 1})
     buffer = _RowBuffer(10, context, producer_state=state, ordered=not ready)
     dispatcher = _BatchPageDispatcher(
         executor,
@@ -254,17 +259,16 @@ async def test_a_pending_refill_is_potential_whatever_the_chunk_carries(*, ready
         KernelBatchDispatch(batch_size=2, coalesce_wait=UNREACHABLE_COALESCE_WAIT),
         producer_state=state,
         buffer=buffer,
-        page_cap=1,
         pending_continuations_can_progress=ready,
     )
-    potential = dispatcher._potential  # noqa: SLF001 - the assembler's coalescing read
-    state.pending_refills["r1"] = None
-    assert potential({"r1"}) == 1
-    state.pending_refills["r0"] = None
-    assert potential({"r0", "r1"}) == len(state.pending_refills)
-    state.pending_continuations.add("r0")
-    state.pending_refills.clear()
-    assert potential({"r0"}) == 0
+    potential = functools.partial(_now, dispatcher)
+    state.move("r1", _Producing.REFILLING)
+    assert potential({"r1"})
+    state.move("r0", _Producing.REFILLING)
+    assert potential({"r0", "r1"})
+    state.move("r0", _Producing.AWAITING_CONSUMER)
+    state.move("r1", _Producing.WAITING)
+    assert not potential({"r0"})
     await buffer.close()
 
 
@@ -278,7 +282,7 @@ async def test_an_input_page_behind_the_frontier_leaves_room_for_the_bindings_ne
     executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
     context = executor.context(ExecutionPolicy())
     await context.start()
-    state = _ProducerState(set(), {"r0": 0, "r1": 1, "r3": 3}, caps={"r0": 2, "r1": 2, "r3": 2})
+    state = _ProducerState({"r0": 0, "r1": 1, "r3": 3}, caps={"r0": 2, "r1": 2, "r3": 2})
     buffer = _RowBuffer(10, context, head_reserve=2, producer_state=state, ordered=True)
     held = await buffer.reserve(2, 5)
     # Five rows free: the frontier's page and r1's page stay free, so r3's page does not fit.
@@ -297,7 +301,7 @@ async def test_the_input_drain_passes_the_bindings_that_add_no_page() -> None:
     executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
     context = executor.context(ExecutionPolicy())
     await context.start()
-    state = _ProducerState(set(), {"r2": 2}, caps={"r2": 2}, admitted=3)
+    state = _ProducerState({"r2": 2}, caps={"r2": 2}, admitted=3)
     buffer = _RowBuffer(10, context, head_reserve=2, producer_state=state, ordered=True)
     reservations = [await buffer.reserve(index, amount) for index, amount in ((0, 3), (1, 2), (2, 2))]
     for reservation, rows in zip(reservations, (3, 2, 1), strict=True):
@@ -320,17 +324,18 @@ async def test_the_input_drain_passes_the_bindings_that_add_no_page() -> None:
 
 
 def _producers(*indexes: int, cap: int = 2) -> _ProducerState:
-    state = _ProducerState(set(), {})
+    state = _ProducerState({})
     for index in indexes:
         state.register(f"r{index}", index, cap)
     return state
 
 
 @pytest.mark.asyncio
-async def test_an_ordered_pool_wakes_the_waiting_pages_nearest_the_frontier_and_no_further() -> None:
+async def test_an_ordered_pool_wakes_the_waiting_pages_nearest_the_frontier_first() -> None:
     """Rows coming back go to the waiting page nearest the frontier that fits.
 
-    A page behind it that does not fit ends the pass, since every page after it keeps more room free.
+    A binding ahead that holds its page already, here one woken for its rows, keeps no further room: its rows
+    come back to it before its next page.
     """
     executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
     context = executor.context(ExecutionPolicy())
@@ -345,19 +350,37 @@ async def test_an_ordered_pool_wakes_the_waiting_pages_nearest_the_frontier_and_
 
     await buffer.release(frontier, 2)
     granted = await waiting[1]
-    # Two rows free once r1's page took the others: r2 must leave r1's room free as well.
-    await buffer.release(frontier, 2)
     await asyncio.sleep(0)
     assert not waiting[2].done()
     await buffer.release(frontier, 2)
     assert (await waiting[2]).amount == page
     await asyncio.sleep(0)
     assert not waiting[3].done()
+    await buffer.release(frontier, 2)
+    assert (await waiting[3]).amount == page
 
     await buffer.close()
-    with pytest.raises(asyncio.CancelledError):
-        await waiting[3]
     assert granted.amount == 0
+
+
+@pytest.mark.asyncio
+async def test_an_ordered_pool_keeps_the_room_of_a_binding_ahead_that_holds_no_page() -> None:
+    """A producer between the frontier and a page that holds no rows keeps its next page's room free."""
+    executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
+    context = executor.context(ExecutionPolicy())
+    await context.start()
+    buffer = _RowBuffer(10, context, head_reserve=2, producer_state=_producers(0, 1, 2), ordered=True)
+    frontier = await buffer.reserve(0, 10)
+    await buffer.accept(frontier, 10)
+    page = 2
+    waiting = asyncio.create_task(buffer.reserve(2, page))
+    await buffer.release(frontier, page)
+    await asyncio.sleep(0)
+    # Two rows are free, but r1, nearer the frontier, holds nothing: they stay its room.
+    assert not waiting.done()
+    await buffer.release(frontier, page)
+    assert (await waiting).amount == page
+    await buffer.close()
 
 
 @pytest.mark.asyncio
@@ -590,7 +613,7 @@ async def test_a_refill_counts_the_rows_its_consumer_returns_first() -> None:
     executor = Executor(BatchPortal(lambda _method, _query: {"result": []}))
     context = executor.context(ExecutionPolicy(max_pages=100, max_pages_per_reference=100))
     await context.start()
-    state = _ProducerState(set(), {"r0": 0})
+    state = _ProducerState({"r0": 0}, default_cap=2)
     buffer = _RowBuffer(2, context, producer_state=state)
     dispatcher = _BatchPageDispatcher(
         executor,
@@ -598,19 +621,18 @@ async def test_a_refill_counts_the_rows_its_consumer_returns_first() -> None:
         KernelBatchDispatch(batch_size=2, coalesce_wait=UNREACHABLE_COALESCE_WAIT),
         producer_state=state,
         buffer=buffer,
-        page_cap=2,
     )
-    potential = dispatcher._potential  # noqa: SLF001 - the assembler's coalescing read
+    potential = functools.partial(_now, dispatcher)
     held = await buffer.reserve(0, 2)
-    state.pending_refills["r0"] = None
-    assert potential({"r0"}) == 0
-    state.pending_refills["r0"] = held
-    assert potential({"r0"}) == 1
+    state.move("r0", _Producing.REFILLING)
+    assert not potential({"r0"})
+    state.move("r0", _Producing.REFILLING, returns=held)
+    assert potential({"r0"})
     page = await context.reserve_page(reference="r0")
-    assert potential({"r0"}) == 1
+    assert potential({"r0"})
     pages = [await context.reserve_page(reference="r0") for _ in range(99)]
     # The page budget is spent: the refill could not reserve its logical page.
-    assert potential({"r0"}) == 0
+    assert not potential({"r0"})
     for reservation in (page, *pages):
         context.release_page(reservation)
     await buffer.abort(held)
@@ -738,7 +760,7 @@ async def test_a_failed_counted_binding_closes_its_tail_before_its_terminal_even
     def observing(self: ReferenceScheduler, run: _ReferenceRun, error: Exception) -> object:
         observed.append(
             (
-                run.producer_key in self.producer_state.pending_refills,
+                self.producer_state.status.get(run.producer_key) is _Producing.REFILLING,
                 set(run.completion._reserved),  # noqa: SLF001 - pages the binding has not settled
             )
         )
@@ -947,6 +969,7 @@ def _grant(pool: int, free: int) -> int | None:
         _source_ended=True,
         _fast_active={0, 1},
     )
+    scheduler._share = functools.partial(ReferenceScheduler._share, cast("ReferenceScheduler", scheduler))  # noqa: SLF001
     grant = ReferenceScheduler._lease_size  # noqa: SLF001
     return grant(cast("ReferenceScheduler", scheduler), cast("FastKeysetProgram", fast), 1, free)
 
@@ -971,6 +994,508 @@ def test_a_fast_lease_is_the_free_rows_clamped_between_the_floor_and_the_share(
     assert _grant(pool, free) == granted
 
 
+# Leases of the fast bindings, the one that plans, the bindings active, the delivery order, and its lease once grown.
+# A pool of 100 keeps 10 for the INPUT frontier; every source has been read.
+_LEASE_GROWTH = {
+    # The second binding's share is (100 - 10) // 2 = 45: it may take 15 more, but only 10 are free beside the reserve.
+    "behind_the_frontier": ((50, 30), 1, 2, ReferenceOutputOrder.INPUT, 30 + (100 - 50 - 30 - 10)),
+    # The frontier keeps no reserve for itself: its share is 100 // 2.
+    "the_frontier": ((30, 20), 0, 2, ReferenceOutputOrder.INPUT, 50),
+    # A lone binding of a source read out keeps nothing free: the whole pool, in either order.
+    "lone_input": ((30,), 0, 1, ReferenceOutputOrder.INPUT, 100),
+    "lone_ready": ((30,), 0, 1, ReferenceOutputOrder.READY, 100),
+}
+
+
+@pytest.mark.parametrize("case", list(_LEASE_GROWTH))
+@pytest.mark.asyncio
+async def test_a_lease_grows_as_its_binding_plans_to_the_share_the_facts_then_known_give(case: str) -> None:
+    """A lease grows to its share of the free rows, never into the reserve of a frontier it is not."""
+    leases, index, active, order, expected = _LEASE_GROWTH[case]
+    buffer = _RowBuffer(
+        100, cast("ExecutionContext", None), head_reserve=10, ordered=order is ReferenceOutputOrder.INPUT
+    )
+    held = [
+        await buffer.lease(binding, functools.partial(lambda amount, _free: amount, amount))
+        for binding, amount in enumerate(leases)
+    ]
+    scheduler = SimpleNamespace(
+        buffer=buffer,
+        output_order=order,
+        _admission=SimpleNamespace(tasks=dict.fromkeys(range(active))),
+        _source_ended=True,
+        _fast_active=set(range(len(leases))),
+    )
+    scheduler._share = functools.partial(ReferenceScheduler._share, cast("ReferenceScheduler", scheduler))  # noqa: SLF001
+    fast = SimpleNamespace(automatic=False, floor=20, quota=30, effective_page_cap=10)
+    run = SimpleNamespace(work=SimpleNamespace(index=index))
+
+    grown = ReferenceScheduler.grow_lease(
+        cast("ReferenceScheduler", scheduler), cast("_ReferenceRun", run), cast("FastKeysetProgram", fast), held[index]
+    )
+
+    assert grown == held[index].amount == expected
+
+
+@pytest.mark.parametrize("ordered", [True, False], ids=["ordered", "unordered"])
+@pytest.mark.asyncio
+async def test_an_ordered_pool_grows_no_lease_while_an_earlier_binding_waits_for_one(*, ordered: bool) -> None:
+    """Rows an ordered pool holds back for an earlier lease waiter are not a later lease's to grow into."""
+    buffer = _RowBuffer(100, cast("ExecutionContext", None), ordered=ordered)
+    lease = await buffer.lease(1, lambda _free: 30)
+    waiting = asyncio.create_task(buffer.lease(0, lambda _free: None))
+    for _turn in range(3):
+        await asyncio.sleep(0)
+
+    buffer.grow_lease(lease, lambda free: free)
+
+    assert lease.amount == (30 if ordered else 100)
+    waiting.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await waiting
+
+
+async def _pool_context() -> ExecutionContext:
+    context = Executor(BatchPortal(lambda _method, _query: {"result": []})).context(ExecutionPolicy())
+    await context.start()
+    return context
+
+
+async def _turns(count: int = 5) -> None:
+    for _turn in range(count):
+        await asyncio.sleep(0)
+
+
+# A pool of 100 rows; a page reserves its cap and is answered with more.
+POOL, CAP, ANSWER, PAGE = 100, 40, 60, 10
+
+
+@pytest.mark.asyncio
+async def test_a_page_waiting_to_grow_takes_the_rows_that_come_back_before_any_page_reserves() -> None:
+    """While a page waits to grow, no page reserves rows: the rows another page's landing returns are its first.
+
+    Two pages hold 80 rows; the page answered with 30 more waits, and a page that would fit the 20 free waits too.
+    """
+    buffer = _RowBuffer(POOL, await _pool_context())
+    longer = await buffer.reserve(0, CAP)
+    landing = await buffer.reserve(1, CAP)
+    growing = asyncio.create_task(buffer.grow(longer, CAP + 30))
+    await _turns()
+    reserving = asyncio.create_task(buffer.reserve(2, PAGE))
+    await _turns()
+
+    assert not growing.done()
+    assert not reserving.done()
+    await buffer.accept(landing, 0)
+    await _turns()
+
+    assert growing.result() is None
+    assert longer.amount == CAP + 30
+    assert reserving.result().amount == PAGE
+
+
+@pytest.mark.asyncio
+async def test_an_ordered_pool_grows_only_the_frontier_and_serves_it_while_a_page_behind_waits() -> None:
+    """A page behind the INPUT frontier waits for the frontier to reach it: the frontier still reserves, no one else.
+
+    Its rows reach the consumer only after the frontier's, so it takes none the frontier could need meanwhile, however
+    many are free.
+    """
+    buffer = _RowBuffer(POOL, await _pool_context(), ordered=True)
+    behind = await buffer.reserve(1, CAP)
+    growing = asyncio.create_task(buffer.grow(behind, ANSWER))
+    await _turns()
+    frontier = asyncio.create_task(buffer.reserve(0, PAGE))
+    reserving = asyncio.create_task(buffer.reserve(2, PAGE))
+    await _turns()
+
+    assert frontier.result().amount == PAGE
+    assert not growing.done()
+    assert not reserving.done()
+    await buffer.advance_head(1, 0)
+    await _turns()
+
+    assert growing.result() is None
+    assert behind.amount == ANSWER
+    assert reserving.result().amount == PAGE
+
+
+@pytest.mark.asyncio
+async def test_a_frontier_page_waiting_to_grow_holds_back_the_frontier_s_next_page_too() -> None:
+    """The frontier's own next page takes no row the frontier's page waiting to grow needs."""
+    buffer = _RowBuffer(POOL, await _pool_context(), ordered=True)
+    longer = await buffer.reserve(0, CAP)
+    landing = await buffer.reserve(1, CAP)
+    growing = asyncio.create_task(buffer.grow(longer, ANSWER + PAGE))
+    await _turns()
+    reserving = asyncio.create_task(buffer.reserve(0, PAGE))
+    await _turns()
+
+    assert not reserving.done()  # 20 rows are free, but the frontier's page lacks 30
+    await buffer.accept(landing, 0)
+    await _turns()
+
+    assert growing.result() is None
+    assert reserving.result().amount == PAGE
+
+
+@pytest.mark.parametrize("ordered", [True, False], ids=["input", "ready"])
+@pytest.mark.asyncio
+async def test_a_page_waiting_to_grow_waits_for_its_own_binding_s_earlier_rows(*, ordered: bool) -> None:
+    """The consumer takes a binding's earlier pages before its later one, whatever the order of delivery."""
+    buffer = _RowBuffer(POOL, await _pool_context(), ordered=ordered)
+    earlier = await buffer.reserve(0, POOL - CAP - PAGE)
+    await buffer.accept(earlier, earlier.amount)
+    longer = await buffer.reserve(0, CAP)
+    growing = asyncio.create_task(buffer.grow(longer, ANSWER))
+    await _turns()
+
+    assert not growing.done()
+    await buffer.release(earlier, earlier.amount)
+    await _turns()
+    assert growing.result() is None
+
+
+@pytest.mark.parametrize("ordered", [True, False], ids=["input", "ready"])
+@pytest.mark.asyncio
+async def test_a_page_waits_to_grow_only_for_rows_the_consumer_takes_without_it(*, ordered: bool) -> None:
+    """Rows read ahead behind the INPUT frontier come back only after it; under READY the consumer takes them anyway.
+
+    The frontier's page lacks 20 rows and only 10 are free. Under INPUT the rest is held by a page of the binding
+    behind it, waiting for the consumer, so the frontier's result never fits and is dropped at once with the most it
+    could hold. Under READY the consumer takes those rows whatever the frontier does, so it waits for them.
+    """
+    buffer = _RowBuffer(POOL, await _pool_context(), ordered=ordered)
+    frontier = await buffer.reserve(0, CAP)
+    read_ahead = await buffer.reserve(1, POOL - CAP - PAGE)
+    await buffer.accept(read_ahead, read_ahead.amount)
+    growing = asyncio.create_task(buffer.grow(frontier, ANSWER))
+    await _turns()
+
+    if ordered:
+        assert growing.result() == CAP + PAGE
+        assert frontier.amount == CAP
+        return
+    assert not growing.done()
+    await buffer.release(read_ahead, read_ahead.amount)
+    await _turns()
+    assert growing.result() is None
+    assert frontier.amount == ANSWER
+
+
+@pytest.mark.parametrize("ordered", [True, False], ids=["input", "ready"])
+@pytest.mark.asyncio
+async def test_a_planned_lease_returns_rows_to_a_page_waiting_to_grow_only_under_ready(*, ordered: bool) -> None:
+    """A planned lease returns its rows when its binding ends, which under INPUT comes only after the frontier."""
+    buffer = _RowBuffer(POOL, await _pool_context(), ordered=ordered)
+    frontier = await buffer.reserve(0, CAP)
+    lease = await buffer.lease(1, lambda _free: POOL - CAP - PAGE)
+    await buffer.settle_lease(lease, lease.amount)
+    growing = asyncio.create_task(buffer.grow(frontier, ANSWER))
+    await _turns()
+
+    assert growing.done() is ordered
+    if ordered:
+        assert growing.result() == CAP + PAGE
+        return
+    await buffer.abort(lease)
+    await _turns()
+    assert growing.result() is None
+
+
+@pytest.mark.asyncio
+async def test_a_page_waiting_to_grow_counts_no_row_of_its_own_binding_in_flight() -> None:
+    """The binding's other pages in flight land after this page is admitted: they return nothing it can wait for."""
+    buffer = _RowBuffer(POOL, await _pool_context())
+    longer = await buffer.reserve(0, CAP)
+    await buffer.reserve(0, POOL - CAP - PAGE)
+    growing = asyncio.create_task(buffer.grow(longer, ANSWER))
+    await _turns()
+
+    assert growing.result() == CAP + PAGE
+
+
+@pytest.mark.parametrize("ordered", [True, False], ids=["input", "ready"])
+@pytest.mark.asyncio
+async def test_a_page_starting_to_grow_takes_the_rows_just_promised_to_a_waiting_page(*, ordered: bool) -> None:
+    """Rows the pool has promised to a woken page are free for a page that starts to grow before it resumes.
+
+    The woken page is held back as soon as the growth starts: resuming, it finds it does not fit and waits again.
+    """
+    half = POOL // 2
+    buffer = _RowBuffer(POOL, await _pool_context(), ordered=ordered)
+    longer = await buffer.reserve(0, half)
+    landing = await buffer.reserve(1, half)
+    waiting = asyncio.create_task(buffer.reserve(2, half))
+    await _turns()
+    await buffer.accept(landing, 0)  # its 50 rows are promised to binding 2's page, whose task has not resumed
+
+    # The growth starts before the woken page's task resumes, as when another binding's task lands in between.
+    grown = asyncio.Task(buffer.grow(longer, POOL - PAGE), loop=asyncio.get_running_loop(), eager_start=True)
+    await _turns()
+    assert grown.result() is None
+    assert longer.amount == POOL - PAGE
+    assert not waiting.done()
+    await buffer.abort(longer)
+    await _turns()
+    assert waiting.result().amount == half
+
+
+@pytest.mark.asyncio
+async def test_a_page_waits_to_grow_only_while_every_row_it_lacks_may_come_back() -> None:
+    """A page whose missing rows are held by a page waiting to grow is dropped at once; the other keeps waiting.
+
+    Two results of 80 rows each reserved 40; 10 rows are free and a third page holds 10 in flight. The first waits for
+    the second's landing; once the second starts to grow, it is dropped at once with the 50 rows it could hold, and the
+    first then waits for its reservation, given back as it ends.
+    """
+    buffer = _RowBuffer(POOL, await _pool_context())
+    first = await buffer.reserve(0, CAP)
+    second = await buffer.reserve(1, CAP)
+    slow = await buffer.reserve(2, PAGE)
+    growing = asyncio.create_task(buffer.grow(first, 2 * CAP))
+    await _turns()
+
+    dropped = asyncio.create_task(buffer.grow(second, 2 * CAP))
+    await _turns()
+    assert dropped.result() == CAP + PAGE
+    assert not growing.done()
+    await buffer.abort(second)
+    await _turns()
+    assert growing.result() is None
+    assert first.amount == 2 * CAP
+    await buffer.abort(slow)
+
+
+@pytest.mark.parametrize("ordered", [True, False], ids=["input", "ready"])
+@pytest.mark.asyncio
+async def test_a_result_as_long_as_the_pool_waits_for_exactly_the_rows_it_lacks(*, ordered: bool) -> None:
+    """Only a result longer than the pool never fits; one that needs every row that may come back waits for them.
+
+    Two pages hold the whole pool; the first is answered with the pool's 100 rows and lacks exactly the 50 the second
+    returns as it lands empty.
+    """
+    half = POOL // 2
+    buffer = _RowBuffer(POOL, await _pool_context(), ordered=ordered)
+    whole = await buffer.reserve(0, half)
+    landing = await buffer.reserve(1, half)
+    growing = asyncio.create_task(buffer.grow(whole, POOL))
+    await _turns()
+
+    assert not growing.done()
+    await buffer.accept(landing, 0)
+    await _turns()
+    assert growing.result() is None
+    assert whole.amount == POOL
+
+
+@pytest.mark.asyncio
+async def test_a_page_behind_the_input_frontier_waits_to_grow_only_while_every_row_it_lacks_may_come_back() -> None:
+    """Behind the frontier, the rows the bindings before a page hold come back to it, those behind it do not.
+
+    The frontier holds 10 rows in flight; two results of 80 rows behind it reserved 40 each, and 10 rows are free. The
+    first waits while the second is in flight; once the second waits to grow as well, its rows come back only after
+    the first, which is dropped at once. The second counts the first's rows, which come back before it, and grows once
+    the frontier reaches it.
+    """
+    buffer = _RowBuffer(POOL, await _pool_context(), ordered=True)
+    frontier = await buffer.reserve(0, PAGE)
+    first = await buffer.reserve(1, CAP)
+    second = await buffer.reserve(2, CAP)
+    first_growing = asyncio.create_task(buffer.grow(first, 2 * CAP))
+    await _turns()
+    assert not first_growing.done()
+
+    second_growing = asyncio.create_task(buffer.grow(second, 2 * CAP))
+    await _turns()
+
+    assert first_growing.result() == CAP + PAGE
+    assert not second_growing.done()
+    await buffer.abort(first)
+    await buffer.abort(frontier)
+    await buffer.advance_head(2, 0)
+    await _turns()
+    assert second_growing.result() is None
+    assert second.amount == 2 * CAP
+
+
+@pytest.mark.asyncio
+async def test_the_input_frontier_waiting_to_grow_is_dropped_once_the_page_it_waits_for_starts_to_grow() -> None:
+    """The frontier waits for a page behind it to land; once that page starts to grow, its rows never come back.
+
+    The page behind waits for the frontier to move on, so the frontier must decide again at once, not wait for it.
+    """
+    buffer = _RowBuffer(POOL, await _pool_context(), ordered=True)
+    frontier = await buffer.reserve(0, CAP)
+    behind = await buffer.reserve(1, CAP)
+    growing = asyncio.create_task(buffer.grow(frontier, POOL - PAGE))
+    await _turns()
+    assert not growing.done()
+
+    behind_growing = asyncio.create_task(buffer.grow(behind, ANSWER))
+    await _turns()
+
+    assert growing.result() == POOL - CAP
+    await buffer.abort(frontier)
+    await buffer.advance_head(1, 0)
+    await _turns()
+    assert behind_growing.result() is None
+
+
+@pytest.mark.asyncio
+async def test_a_page_waiting_to_grow_waits_for_an_unplanned_lease_and_no_lease_is_granted_meanwhile() -> None:
+    """An unplanned lease returns rows as its binding plans; meanwhile no lease takes the rows that come back."""
+    half = POOL // 2
+    buffer = _RowBuffer(POOL, await _pool_context())
+    lease = await buffer.lease(1, lambda _free: half)
+    page = await buffer.reserve(0, half)
+    growing = asyncio.create_task(buffer.grow(page, POOL - PAGE))
+    await _turns()
+    leasing = asyncio.create_task(buffer.lease(2, lambda free: free or None))
+    await _turns()
+
+    assert not growing.done()
+    assert not leasing.done()
+    await buffer.settle_lease(lease, PAGE)
+    await _turns()
+    assert growing.result() is None
+    assert page.amount == POOL - PAGE
+    leasing.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await leasing
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ordered", [False, True])
+async def test_the_pool_projects_no_page_fitting_while_a_page_waits_to_grow(*, ordered: bool) -> None:
+    """The dispatcher's projection follows the pool: while a page waits to grow, no other page fits.
+
+    A page that needs no rows of the pool, one charged to a lease or holding its rows already, still comes.
+    """
+    buffer = _RowBuffer(POOL, await _pool_context(), ordered=ordered)
+    longer = await buffer.reserve(0, CAP)
+    await buffer.reserve(1, CAP)
+    assert buffer.fits_any([(2, PAGE)])
+    growing = asyncio.create_task(buffer.grow(longer, ANSWER + PAGE))
+    await _turns()
+
+    assert not growing.done()
+    assert not buffer.can_reserve(2, PAGE)
+    assert not buffer.fits_any([(2, PAGE)])
+    assert buffer.can_reserve(2, 0)
+    assert buffer.fits_any([(2, 0)])
+    growing.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await growing
+
+
+@pytest.mark.asyncio
+async def test_a_change_of_the_rooms_wakes_a_page_on_the_next_release_however_few_rows_it_frees() -> None:
+    """A pass records the free rows the next one needs, at a version of the rooms: once they change, any release serves.
+
+    A page of binding 3 needs its 10 rows, the frontier's 10 and the rooms of producers 1 and 2: 40, with 36 free. Once
+    producer 2 retires it needs 30, and the next release, of a single row, wakes it.
+    """
+    state = _ProducerState({})
+    buffer = _RowBuffer(POOL, await _pool_context(), head_reserve=PAGE, producer_state=state, ordered=True)
+    held = await buffer.reserve(5, POOL - 35)
+    await buffer.accept(held, held.amount)
+    for key, index in (("r1", 1), ("r2", 2), ("r3", 3)):
+        state.register(key, index, PAGE)
+    page = asyncio.create_task(buffer.reserve(3, PAGE))
+    await _turns()
+    await buffer.release(held, 1)
+    await _turns()
+    assert not page.done()
+
+    state.retire("r2")
+    await _turns()
+    await buffer.release(held, 1)
+    await _turns()
+
+    assert page.result().amount == PAGE
+
+
+@pytest.mark.asyncio
+async def test_rows_a_producer_takes_without_a_pass_lower_what_a_waiting_page_needs_on_the_next_release() -> None:
+    """A page reserved at once, with no pass, resets the free rows the next pass needs.
+
+    A page of binding 3 needs its 10 rows, the frontier's 10 and the rooms of producers 1 and 2: 40, with 36 free. Once
+    producer 1 reserves its page at once, it needs 30 with 26 free, and the release of 4 rows wakes it.
+    """
+    state = _ProducerState({})
+    buffer = _RowBuffer(POOL, await _pool_context(), head_reserve=PAGE, producer_state=state, ordered=True)
+    held = await buffer.reserve(5, POOL - 35)
+    await buffer.accept(held, held.amount)
+    for key, index in (("r1", 1), ("r2", 2), ("r3", 3)):
+        state.register(key, index, PAGE)
+    page = asyncio.create_task(buffer.reserve(3, PAGE))
+    await _turns()
+    await buffer.release(held, 1)
+    await _turns()
+    assert not page.done()
+
+    nearer = asyncio.create_task(buffer.reserve(1, PAGE))
+    await _turns()
+    assert nearer.result().amount == PAGE
+    await buffer.release(held, 4)
+    await _turns()
+
+    assert page.result().amount == PAGE
+
+
+@pytest.mark.asyncio
+async def test_rows_promised_to_the_frontier_count_as_its_own_for_the_pages_behind_it_in_the_same_pass() -> None:
+    """A pass that wakes the frontier's page lets a page behind it leave free only the reserve the frontier lacks.
+
+    Binding 3 holds 90 rows in flight; the frontier's reserve then grows to 20, and the frontier and binding 2 each
+    wait, for 20 and 10 rows. Binding 3's page lands 30 rows short: the frontier is promised 20 of the 40 free, which
+    cover its whole reserve, so binding 2 is woken for the other 20 in the same pass.
+    """
+    state = _ProducerState({})
+    buffer = _RowBuffer(POOL, await _pool_context(), head_reserve=PAGE, producer_state=state, ordered=True)
+    behind = await buffer.reserve(3, 60)
+    await buffer.reserve(3, 30)
+    buffer.raise_head_reserve(2 * PAGE)
+    state.register("r2", 2, PAGE)
+    frontier = asyncio.create_task(buffer.reserve(0, 2 * PAGE))
+    second = asyncio.create_task(buffer.reserve(2, PAGE))
+    await _turns()
+    assert not frontier.done()
+    assert not second.done()
+
+    await buffer.accept(behind, 30)
+    await _turns()
+
+    assert frontier.result().amount == 2 * PAGE
+    assert second.result().amount == PAGE
+
+
+@pytest.mark.asyncio
+async def test_a_lease_growing_as_its_binding_plans_leaves_the_rows_promised_to_a_woken_page() -> None:
+    """Rows promised to a woken page are its own until it resumes: a lease growing meanwhile is offered none of them."""
+    leased, page = 2, 3
+    buffer = _RowBuffer(10, await _pool_context())
+    held = await buffer.reserve(0, 8)
+    await buffer.accept(held, 8)
+    lease = await buffer.lease(2, lambda _free: leased)
+    woken = asyncio.create_task(buffer.reserve(1, page))
+    await _turns()
+    await buffer.release(held, page)
+    offered: list[int] = []
+
+    def take_every_free_row(free: int) -> int:
+        offered.append(free)
+        return free
+
+    buffer.grow_lease(lease, take_every_free_row)
+    await _turns()
+
+    assert offered == [0]
+    assert lease.amount == leased
+    assert woken.result().amount == page
+
+
 @pytest.mark.asyncio
 async def test_a_wave_leaves_without_a_page_whose_fetch_was_cancelled_while_it_coalesced(
     monkeypatch: pytest.MonkeyPatch,
@@ -981,7 +1506,7 @@ async def test_a_wave_leaves_without_a_page_whose_fetch_was_cancelled_while_it_c
     executor = Executor(portal)
     context = executor.context(ExecutionPolicy(max_pages=10, max_pages_per_reference=10))
     await context.start()
-    state = _ProducerState({"a", "b", "c"}, {"a": 0, "b": 1, "c": 2})
+    state = _ProducerState({"a": 0, "b": 1, "c": 2}, dict.fromkeys(("a", "b", "c"), _Producing.RUNNABLE))
     buffer = _RowBuffer(10, context, producer_state=state)
     dispatcher = _BatchPageDispatcher(
         executor,
@@ -989,7 +1514,6 @@ async def test_a_wave_leaves_without_a_page_whose_fetch_was_cancelled_while_it_c
         KernelBatchDispatch(batch_size=3, concurrency=1, coalesce_wait=UNREACHABLE_COALESCE_WAIT),
         producer_state=state,
         buffer=buffer,
-        page_cap=1,
     )
     kept = asyncio.create_task(dispatcher.fetch(Request("item.list", {"PARENT": "a"}, route=RouteKind.BARE), "a"))
     abandoned = asyncio.create_task(dispatcher.fetch(Request("item.list", {"PARENT": "b"}, route=RouteKind.BARE), "b"))
@@ -1018,7 +1542,7 @@ async def test_a_page_whose_wave_was_sent_when_the_deadline_passed_settles_unkno
     executor = Executor(ResponderTransport(blocker))
     context = executor.context(ExecutionPolicy(max_pages=10, max_pages_per_reference=10, max_elapsed=DEADLINE_BUDGET))
     await context.start()
-    state = _ProducerState({"a", "b"}, {"a": 0, "b": 1})
+    state = _ProducerState({"a": 0, "b": 1}, dict.fromkeys(("a", "b"), _Producing.RUNNABLE))
     buffer = _RowBuffer(10, context, producer_state=state)
     dispatcher = _BatchPageDispatcher(
         executor,
@@ -1026,7 +1550,6 @@ async def test_a_page_whose_wave_was_sent_when_the_deadline_passed_settles_unkno
         KernelBatchDispatch(batch_size=1, concurrency=1, coalesce_wait=0.0),
         producer_state=state,
         buffer=buffer,
-        page_cap=1,
     )
     sent = asyncio.create_task(dispatcher.fetch(Request("item.list", {"PARENT": "a"}, route=RouteKind.BARE), "a"))
     await reached(blocker.started)
@@ -1049,10 +1572,10 @@ def _three_producer_dispatcher(
     executor: Executor, context: ExecutionContext, *, batch_size: int = 1, coalesce_wait: float = 0.0
 ) -> tuple[_BatchPageDispatcher, _RowBuffer]:
     """A dispatcher of producers ``a``, ``b`` and ``c`` with one send slot."""
-    state = _ProducerState({"a", "b", "c"}, {"a": 0, "b": 1, "c": 2})
+    state = _ProducerState({"a": 0, "b": 1, "c": 2}, dict.fromkeys(("a", "b", "c"), _Producing.RUNNABLE))
     buffer = _RowBuffer(10, context, producer_state=state)
     shape = KernelBatchDispatch(batch_size=batch_size, concurrency=1, coalesce_wait=coalesce_wait)
-    return _BatchPageDispatcher(executor, context, shape, producer_state=state, buffer=buffer, page_cap=1), buffer
+    return _BatchPageDispatcher(executor, context, shape, producer_state=state, buffer=buffer), buffer
 
 
 def _page(parent: str) -> Request:

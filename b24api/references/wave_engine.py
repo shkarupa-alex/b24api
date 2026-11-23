@@ -17,7 +17,7 @@ from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
 from b24api.errors import CapabilityError
 from b24api.execution.context import Settled, spawn_settled
-from b24api.references.dispatch import _DecodeOptions, _failed_page
+from b24api.references.dispatch import _DecodeOptions, _failed_page, _Producing
 from b24api.traversal.keyset_context import FailedWavePage
 
 if TYPE_CHECKING:
@@ -103,8 +103,7 @@ class SharedWaveEngine:
         options = _DecodeOptions(advisory_totals, strict_envelope)
         errors: dict[int, BaseException] = {}
         key = self._run.producer_key
-        self._state.runnable.discard(key)
-        self._state.touch()
+        self._state.move(key, _Producing.WAITING)
         tasks = self._start(tuple(pages.values()), options, errors)
         try:
             await asyncio.wait(tasks)
@@ -119,8 +118,7 @@ class SharedWaveEngine:
             self._settle(tuple(pages), tasks, errors, error)
             raise
         # Only a wave the runtime receives may lead to another: a whole-envelope failure ends the binding.
-        self._state.runnable.add(key)
-        self._state.touch()
+        self._state.move(key, _Producing.RUNNABLE)
         return outcomes
 
     def _correlate(

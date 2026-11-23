@@ -17,7 +17,7 @@ from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
 from b24api.errors import B24ApiError, CapabilityError
 from b24api.execution.context import Settled, latch_escape, spawn_settled
-from b24api.references.dispatch import _BatchPageError, _failed_page, _SentPageError
+from b24api.references.dispatch import _BatchPageError, _failed_page, _Producing, _SentPageError
 from b24api.traversal.counted_io import HeadAttempt, TailReceipt
 
 if TYPE_CHECKING:
@@ -239,28 +239,32 @@ class ReferenceTailStream:
             ordinal += 1
             receipt = await self._receipt(slot)
             self._holding = True
-            self._publish_refill()
+            self._publish()
             yield receipt
             self._holding = False
             self._slot_freed = True
             self._window.release()
-            self._publish_refill()
+            self._publish()
 
-    def _publish_refill(self) -> None:
-        """Report whether the page in hand waits for nothing but the consumer.
+    def _publish(self) -> None:
+        """Report what the tail's next page waits for, from where the submitter and the consumer stand.
 
-        It has its slot, a slot is free for it, or the consumer holds a receipt whose release frees
-        one. While the consumer itself waits for an in-flight page, the tail adds nothing on its own.
+        With no page in hand the tail adds none. A page with its slot, or a free one, is runnable. A page whose
+        window is full waits for nothing but the consumer when the consumer has freed a slot the submitter has
+        not taken yet, or holds a receipt whose release frees one, its rows coming back to the pool first. While
+        the consumer itself waits for an in-flight page, the tail adds nothing on its own.
         """
         state, key = self._host.producer_state, self._run.producer_key
-        if self._in_hand and (self._slot_taken or self._slot_freed):
-            state.pending_refills[key] = None
-        elif self._in_hand and self._holding:
-            # The held receipt's rows come back to the pool before the page reserves its own.
-            state.pending_refills[key] = self._run.reservation
+        if not self._in_hand:
+            state.move(key, _Producing.WAITING)
+        elif self._slot_taken or not self._window.locked():
+            state.move(key, _Producing.RUNNABLE)
+        elif self._slot_freed:
+            state.move(key, _Producing.REFILLING)
+        elif self._holding:
+            state.move(key, _Producing.REFILLING, returns=self._run.reservation)
         else:
-            state.pending_refills.pop(key, None)
-        state.touch()
+            state.move(key, _Producing.WAITING)
 
     def _publish_window(self) -> None:
         """Report the pages the tail may still put in flight at once: an ordered pool keeps room for them."""
@@ -274,13 +278,10 @@ class ReferenceTailStream:
         try:
             for ordinal, item in enumerate(self._requests):
                 self._in_hand = True
-                if self._window.locked():
-                    state.runnable.discard(key)
-                self._publish_refill()
+                self._publish()
                 await self._window.acquire()
                 self._slot_taken, self._slot_freed = True, False
-                state.runnable.add(key)
-                self._publish_refill()
+                self._publish()
                 slot = _TailSlot(ordinal, run.completion.reserve(), host.take_page_sequence())
                 self._slots[ordinal] = slot
                 slot.reservation = await host.buffer.reserve(run.work.index, run.program.page_cap)
@@ -291,14 +292,13 @@ class ReferenceTailStream:
                 self._unsent -= 1
                 self._publish_window()
                 self._in_hand = self._slot_taken = False
-                self._publish_refill()
+                self._publish()
                 self._changed.set()
         finally:
             self._in_hand = self._slot_taken = False
             self._unsent = 0
             self._publish_window()
-            state.runnable.discard(key)
-            self._publish_refill()
+            self._publish()
             self._changed.set()
 
     async def _fetch(self, slot: _TailSlot, request: Request, transit: _Transit) -> _DispatchedPage:

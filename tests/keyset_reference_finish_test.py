@@ -293,6 +293,12 @@ def _shared(rows: int) -> ExecutionContext:
     return ExecutionContext(ExecutionPolicy(max_buffered_rows=rows), RateCoordinator(max_concurrency=1))
 
 
+def test_a_view_planning_after_its_pool_closed_keeps_its_lease() -> None:
+    """A lease only grows as its binding plans: a pool closed meanwhile has reclaimed its rows and grows none."""
+    view = BindingBudgetView.over(_shared(100), RowLease(80), grow=lambda: 0)
+    assert view.planning_rows() == view.lease.capacity == view.policy.max_buffered_rows == 80
+
+
 @pytest.mark.asyncio
 async def test_a_trimmed_view_names_its_capacity_and_never_drops_below_its_held_rows() -> None:
     view = BindingBudgetView.over(_shared(100), RowLease(80))

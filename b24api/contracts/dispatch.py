@@ -56,7 +56,10 @@ class BatchDispatch:
     concurrency limit, at most ``max_active_references``), so a wider ``concurrency`` gives each command a smaller
     result limit: 312 rows under ``batch_size=1, concurrency=8``. While the budget holds a full 50-row portal page per
     command of one batch, the limit never drops below a page: the row budget then holds back the batches beyond it, so
-    the defaults, ``concurrency=2`` and ``batch_size=20, concurrency=4`` all keep 50 rows.
+    the defaults, ``concurrency=2`` and ``batch_size=20, concurrency=4`` all keep 50 rows. ``coalesce_wait`` bounds
+    how long an underfilled batch waits for commands that fit; one whose commands fit only once a batch in flight
+    lands waits for that landing instead, which sends fewer, fuller batches at the cost of an idle slot.
+    ``coalesce_wait=0`` sends every batch at once.
     """
 
     batch_size: int = PORTAL_BATCH_CAP

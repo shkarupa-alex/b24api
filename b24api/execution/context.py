@@ -248,6 +248,10 @@ class ExecutionContext:
             self._record_refusal(REQUEST_BUDGET_EXHAUSTED)
             raise self.operation_refusal(REQUEST_BUDGET_EXHAUSTED)
 
+    def planning_rows(self) -> int:
+        """Return the buffered rows a keyset plan may use: the operation's whole row budget."""
+        return self.policy.max_buffered_rows
+
     async def start(self) -> None:
         """Start the operation clock exactly once when execution first begins, on the loop its client serves.
 

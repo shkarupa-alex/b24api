@@ -59,6 +59,24 @@ The 100,000-command generator retained a seven-command window and used no more p
 than the 10,000-command run. One hundred repeated traversals stayed below the 1 MiB retention-growth
 ceiling, and no stream or owned task remained after close.
 
+### Batched references under load
+
+A fake portal answering in 50 ms, 50 commands a batch, bindings of 0 or 7 rows alternately, under the
+default row budget. "Before" is the row pool that kept a whole room for every binding ahead of the
+`INPUT` frontier; "after" keeps only the part its pages in flight do not hold and asks the pool whether
+a page may still come. The ideal is one request per 50 bindings.
+
+| Load | Ideal | Requests before | Requests after | Wall before | Wall after |
+|---|---:|---:|---:|---:|---:|
+| 50,000 bindings, `READY` | 1,000 | 1,022 | 1,021 | 81.2 s | 79.8 s |
+| 50,000 bindings, `INPUT` | 1,000 | 1,929 | 1,246 | 143.6 s | 94.8 s |
+| 20,000 bindings, `concurrency=4`, `READY` | 400 | 698–798 | 408–409 | 31.6 s | 31.9 s |
+| 20,000 bindings, `concurrency=4`, `INPUT` | 400 | 801 | 502 | 56.9 s | 37.6 s |
+
+Before, `concurrency=4` under `READY` split the pool between half-empty waves by timing: 796 to 798
+requests on an idle machine, 698 on a loaded one. `INPUT` still sends more than `READY`: rows read ahead of the frontier wait for it, so its waves
+fill only as far as the pool the frontier leaves.
+
 Memray 1.20.0 measured a 5,121,452-byte peak for seven dense-10k counted samples after two warmups.
 Immutable JSON thawing was the largest cumulative client allocation site; no retention leak was
 observed.
@@ -141,10 +159,19 @@ harness-produced observations for that portal cell, not general latency promises
   an auto cost estimate. It never closes a lane or strengthens correctness evidence. Normal range/partition reports use caller-asserted bounds
   (`assurance_source=CALLER_ASSERTED_BOUNDS`); explicit verification is a separate operation,
   `verify_keyset_capability()`.
-- Reference `BatchDispatch` uses an absolute, capacity-aware coalescing deadline of 20 ms per
-  underfilled wave. Full waves and waves with no eligible producers leave immediately;
-  `coalesce_wait=0` is the low-latency opt-out. With multiple workers, only aggregate work
-  conservation—not an exact command split per physical batch—is guaranteed.
+- Reference `BatchDispatch` gives an underfilled wave an absolute, capacity-aware coalescing
+  deadline of 20 ms while a page that fits may still join it. A wave whose next pages wait only for
+  the rows a wave in flight holds waits for that wave to land instead, without a deadline, so the
+  pool is not split between half-empty waves. That trades wall time for requests: a send slot
+  stays idle while the rows it could use are still in flight. With a fake portal answering every batch in
+  100 ms and no rate limit, 2,000 one-row commands at `batch_size=20, concurrency=4` took 100
+  requests and 5.5 s (40 commands in flight), against 165 requests and 4.7 s with
+  `coalesce_wait=0`; 200 commands at `batch_size=10, concurrency=2` under 750 rows took 20
+  requests and 2.1 s, against 31 and 1.7 s. Under the portal's request rate limit the requests
+  saved are time saved. Full waves and waves with no eligible producers leave immediately;
+  `coalesce_wait=0` sends every wave at once, never waiting for a deadline or a landing. With
+  multiple workers, only aggregate work conservation—not an exact command split per physical
+  batch—is guaranteed.
 - Real portal latency, server work and network variance require a separately controlled live A/B.
 - Exact traversal retains identities for the operation lifetime under the hard
   `ExecutionPolicy.max_identity_keys` budget (100,000 by default); exceeding it fails the operation
