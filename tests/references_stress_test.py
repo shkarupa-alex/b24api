@@ -159,6 +159,8 @@ _TRAVERSALS: dict[str, tuple[str, Callable[[], TraversalSpec]]] = {
     "cursor": ("cursor.list", _cursor),
     "sequential_keyset": ("keyset.list", lambda: _keyset(SequentialKeysetExecution())),
     "range": ("keyset.list", lambda: _keyset(RangeKeysetExecution(_CONTRACT))),
+    # Windows a page of identity values wide, whatever the density: sparse rows take a window each.
+    "narrow-range": ("keyset.list", lambda: _keyset(RangeKeysetExecution(_CONTRACT, window_width=10))),
     "partitioned": ("keyset.list", lambda: _keyset(PartitionedKeysetExecution(_CONTRACT, target_lanes=4))),
     "auto": ("keyset.list", lambda: _keyset(AutoKeysetExecution(_CONTRACT, target_lanes=4))),
 }
@@ -306,12 +308,12 @@ async def test_a_binding_waiting_for_its_lease_never_holds_a_wave_back_to_coales
     """A fast binding parked until a lease frees cannot add a command, so waves do not wait for it.
 
     The first range binding holds the pool's only floor-sized lease and runs hundreds of
-    one-command waves. On a virtual clock every wave whose wait its deadline ended is counted, so a
+    one-command waves over narrow windows. On a virtual clock every wave whose wait its deadline ended is counted, so a
     wave held back for the parked neighbour fails the test however fast the host runs; the sources
     come on the event loop, whose turns are the clock's only pace.
     """
     clock = VirtualClock().install(monkeypatch)
-    sources = [_Source("range", "p0", tuple(range(123, 123 + 113 * 50, 113))), _Source("range", "p1", ())]
+    sources = [_Source("narrow-range", "p0", tuple(range(123, 123 + 113 * 50, 113))), _Source("range", "p1", ())]
     portal = BatchPortal(_portal(sources))
     async with client_for(portal, policy=ExecutionPolicy(max_buffered_rows=40)) as client:
         stream = client.iter_reference_source_outcomes(

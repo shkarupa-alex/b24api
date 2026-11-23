@@ -45,6 +45,8 @@ class KeysetSelectionReason(StrEnum):
     ADJACENT_BOUNDARIES = "adjacent_boundaries"
     SMALL_SELECTION = "small_selection"
     INSUFFICIENT_PREDICTED_GAIN = "insufficient_predicted_gain"
+    # AUTO took range windows before probing: the cheapest plan that pays off. The name is kept from the
+    # removed range wave budget, so reports keep their values.
     RANGE_WITHIN_WAVE_BUDGET = "range_within_wave_budget"
     WIDE_SPAN_PARTITIONING = "wide_span_partitioning"
     POST_PROBE_RANGE_PREFERRED = "post_probe_range_preferred"
@@ -54,6 +56,9 @@ class KeysetSelectionReason(StrEnum):
     PAGE_STOP = "page_stop"
     # AUTO settled on sequential direct pages: classic batch would not carry the request as a direct call does.
     BATCH_UNREPRESENTABLE = "batch_unrepresentable"
+    # Planning ended (its boundary wave failed, or the budget refused it) before any plan was chosen. A failed probe
+    # wave keeps the preselection's reason instead.
+    PLANNING_INCOMPLETE = "planning_incomplete"
 
 
 class KeysetAssuranceSource(StrEnum):
@@ -101,7 +106,6 @@ class KeysetExecutionJson(TypedDict, total=False):
     window_width: int
     range_window_width: int
     target_lanes: int
-    max_range_waves: int
     total_hint: Literal["ignore", "request_advisory"]
     endpoint_page_cap: int
 
@@ -183,7 +187,6 @@ class AutoKeysetExecution:
     batch_size: int | None = None
     target_lanes: int = 20
     range_window_width: int | None = None
-    max_range_waves: int = 2
     total_hint: TotalHintMode = TotalHintMode.IGNORE
 
     def __post_init__(self) -> None:
@@ -203,12 +206,6 @@ class AutoKeysetExecution:
             or self.range_window_width < MIN_WINDOW_WIDTH
         ):
             raise ValueError("range_window_width must be an integer of at least 2")
-        if (
-            not isinstance(self.max_range_waves, int)
-            or isinstance(self.max_range_waves, bool)
-            or self.max_range_waves < 1
-        ):
-            raise ValueError("max_range_waves must be a positive integer")
         if not isinstance(self.total_hint, TotalHintMode):
             raise TypeError("total_hint must be a TotalHintMode")
 

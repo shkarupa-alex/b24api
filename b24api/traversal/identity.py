@@ -178,9 +178,10 @@ def _request_with_controls(
         )
     try:
         parameters = request.copy_parameters()
-        for path in replace:
-            if path in updates:
-                _replace_owned_control(parameters, path, updates[path], allow_create=allow_create)
+        # In the order of ``updates``: a control missing from the request is created in that order.
+        for path, value in updates.items():
+            if path in replace:
+                _replace_owned_control(parameters, path, value, allow_create=allow_create)
         remaining = {path: value for path, value in updates.items() if path not in replace}
         parameters = inject_controls(parameters, remaining, allow_create=allow_create)
     except (KeyError, TypeError, ValueError) as error:
@@ -232,6 +233,34 @@ def _replace_owned_control(  # noqa: C901, PLR0912 - exact nested path replaceme
         if not isinstance(current, list) or final >= len(current):
             raise KeyError("control list index is missing")
         current[final] = replacement
+
+
+def _path_lookup(
+    parameters: object,
+    path: ParameterPath,
+    *,
+    case_sensitive: bool = False,
+) -> tuple[bool, object]:
+    current = parameters
+    for part in path.path:
+        if isinstance(part, str):
+            if not isinstance(current, dict):
+                return False, None
+            matches = (
+                [part]
+                if case_sensitive and part in current
+                else ([] if case_sensitive else [key for key in current if key.casefold() == part.casefold()])
+            )
+            if len(matches) > 1:
+                raise CapabilityError("request contains a case-insensitively ambiguous traversal control")
+            if not matches:
+                return False, None
+            current = current[matches[0]]
+        else:
+            if not isinstance(current, list) or part >= len(current):
+                return False, None
+            current = current[part]
+    return True, current
 
 
 def _child_path(parent: ParameterPath, child: str) -> ParameterPath:

@@ -21,7 +21,8 @@ from b24api.contracts.policy import (
 from b24api.contracts.request_summary import RouteKind
 from b24api.contracts.wire import BodyEncoding
 from b24api.errors import CapabilityError
-from b24api.traversal.identity import _child_path, _request_with_controls
+from b24api.traversal import keyset_step
+from b24api.traversal.identity import _child_path, _path_lookup, _request_with_controls
 
 if TYPE_CHECKING:
     from b24api.contracts.policy import ExecutionPolicy
@@ -34,35 +35,13 @@ BOUNDARY_WAVE_COMMANDS = 2
 """Commands of the boundary wave every fast keyset traversal opens with, in one physical batch."""
 
 
-def _path_lookup(
-    parameters: object,
-    path: ParameterPath,
-    *,
-    case_sensitive: bool = False,
-) -> tuple[bool, object]:
-    current = parameters
-    for part in path.path:
-        if isinstance(part, str):
-            if not isinstance(current, dict):
-                return False, None
-            matches = (
-                [part]
-                if case_sensitive and part in current
-                else ([] if case_sensitive else [key for key in current if key.casefold() == part.casefold()])
-            )
-            if len(matches) > 1:
-                raise CapabilityError("request contains a case-insensitively ambiguous traversal control")
-            if not matches:
-                return False, None
-            current = current[matches[0]]
-        else:
-            if not isinstance(current, list) or part >= len(current):
-                return False, None
-            current = current[part]
-    return True, current
+def _reject_owned_controls(request: Request, identity: IdentitySpec, keyset: KeysetSpec, page_size: int) -> None:
+    """Refuse caller values at the controls fast keyset owns, by the rule sequential keyset applies.
 
-
-def _reject_owned_controls(request: Request, identity: IdentitySpec, keyset: KeysetSpec) -> None:
+    A named request may leave the order, start and limit controls out or set them to what sequential
+    traversal writes on every page (``keyset_step.reject_caller_controls``); a fast command then
+    writes its own value there. A caller identity bound is never accepted: fast keyset owns them all.
+    """
     positional_arguments = request.positional
     positional = positional_arguments is not None
     parameters = positional_arguments.to_wire_slots() if positional_arguments is not None else request.copy_parameters()
@@ -76,14 +55,18 @@ def _reject_owned_controls(request: Request, identity: IdentitySpec, keyset: Key
         }
         if any(str(key).casefold() in forbidden for key in filter_value):
             raise CapabilityError("caller identity bounds conflict with fast keyset traversal")
+    if positional:
+        _reject_positional_controls(parameters, keyset)
+    else:
+        keyset_step.reject_caller_controls(request, keyset, identity, page_size)
+
+
+def _reject_positional_controls(parameters: object, keyset: KeysetSpec) -> None:
+    """Refuse any caller value at a positional slot fast keyset owns; an empty order object is none."""
     order_paths: tuple[ParameterPath | None, ...]
     if keyset.split_order is None:
-        if positional and keyset.order_path is not None:
-            order_exists, order_value = _path_lookup(
-                parameters,
-                keyset.order_path,
-                case_sensitive=True,
-            )
+        if keyset.order_path is not None:
+            order_exists, order_value = _path_lookup(parameters, keyset.order_path, case_sensitive=True)
             if order_exists and not isinstance(order_value, dict):
                 raise CapabilityError("keyset order path must contain an object")
             if order_exists and order_value:
@@ -94,7 +77,7 @@ def _reject_owned_controls(request: Request, identity: IdentitySpec, keyset: Key
     else:
         order_paths = (keyset.split_order.field_path, keyset.split_order.direction_path)
     for path in (*order_paths, keyset.start_suppression_path, keyset.limit_path):
-        if path is not None and _path_lookup(parameters, path, case_sensitive=positional)[0]:
+        if path is not None and _path_lookup(parameters, path, case_sensitive=True)[0]:
             raise CapabilityError("caller traversal control conflicts with fast keyset traversal")
 
 
@@ -108,7 +91,7 @@ def reject_unencodable_fast_request(request: Request) -> None:
     if obstacle is not None:
         raise CapabilityError(
             f"fast keyset traversal sends classic batch commands, which cannot carry {obstacle}; "
-            "use SequentialKeysetExecution"
+            "traverse it with SequentialKeysetExecution in direct requests (DirectDispatch for references)"
         )
 
 
@@ -174,7 +157,7 @@ def validate_fast_keyset(  # noqa: C901, PLR0912, PLR0913
     actual_order = OrderSemantics.ASCENDING if keyset.direction == "ascending" else OrderSemantics.DESCENDING
     if requested_order not in {OrderSemantics.UNORDERED, actual_order}:
         raise CapabilityError("fast keyset traversal cannot supply the requested order semantics")
-    _reject_owned_controls(request, identity, keyset)
+    _reject_owned_controls(request, identity, keyset, page_size)
     effective_cap = _effective_cap(execution, keyset, page_size)
     retained_anchors = execution.target_lanes if isinstance(execution, PartitionedKeysetExecution) else 0
     if (

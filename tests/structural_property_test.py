@@ -150,7 +150,7 @@ def test_anchor_lanes_own_every_fenced_identity_once_in_output_order(
 ) -> None:
     upper = lo + span + 1
     anchors = tuple(lo + value for value in offsets)
-    lanes = partition_lane_specs(lo=lo, upper_exclusive=upper, anchors=anchors, descending=descending)
+    lanes = partition_lane_specs(lo=lo, upper_exclusive=upper, anchors=anchors, descending=descending, empty_below={})
     retained = [lane.retained_upper_anchor for lane in lanes if lane.retained_upper_anchor is not None]
     windows = [value for lane in lanes for value in _owned(lane.bounds.lower_exclusive, lane.bounds.upper_exclusive)]
 

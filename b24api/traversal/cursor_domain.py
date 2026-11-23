@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 from b24api.contracts.json import _freeze_json
 from b24api.contracts.traversal import CursorDomain
 from b24api.errors import CapabilityError, PaginationError
-from b24api.traversal.keyset_eligibility import _path_lookup
+from b24api.traversal.identity import _path_lookup
 from b24api.traversal.values import _coerce_identity
 
 if TYPE_CHECKING:

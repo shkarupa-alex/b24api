@@ -19,8 +19,6 @@ report.
 """
 
 from __future__ import annotations
-import asyncio
-import contextlib
 import contextvars
 import functools
 import threading
@@ -35,10 +33,13 @@ from b24api.execution.context import (
     CleanupResult,
     Settled,
     await_cleanup_resistant,
+    finish_in_thread,
     spawn_settled,
 )
 
 if TYPE_CHECKING:
+    import asyncio
+
     from b24api.contracts.report import Violation
 
 
@@ -100,21 +101,6 @@ class _InContext[R](Generator[object, object, R]):
 @types.coroutine
 def _in_context[R](step: Awaitable[R], context: contextvars.Context) -> Generator[object, object, R]:
     return (yield from _InContext(step, context))
-
-
-async def _finish_in_thread[R](call: Callable[[], R]) -> R:
-    """Run ``call`` in a worker thread that a cancellation waits for instead of abandoning.
-
-    The cancelled call's failure is dropped. An escape (``is_escape``) it ends in is not: its task returns it
-    (``settle``) in the operation's context, so the operation's latch has it (``OperationLatch``).
-    """
-    work = spawn_settled(asyncio.to_thread(call))
-    try:
-        return (await asyncio.shield(work)).unwrap()
-    except asyncio.CancelledError:
-        with contextlib.suppress(asyncio.CancelledError):
-            await work
-        raise
 
 
 class OwnedSource[T](AsyncIterator[T]):
@@ -209,7 +195,7 @@ class OwnedSource[T](AsyncIterator[T]):
             return await self._run_step(anext(iterator, EXHAUSTED))
         if self._inline:
             return _next_or_exhausted(iterator)
-        return await _finish_in_thread(
+        return await finish_in_thread(
             functools.partial(self._run_in_context, WORK_OWNERS.get(), _next_or_exhausted, iterator)
         )
 
@@ -226,7 +212,7 @@ class OwnedSource[T](AsyncIterator[T]):
                 if isinstance(iterator, AsyncClosable):
                     await self._run_step(iterator.aclose())
             elif isinstance(iterator, SyncClosable):
-                await _finish_in_thread(functools.partial(self._run_in_context, WORK_OWNERS.get(), iterator.close))
+                await finish_in_thread(functools.partial(self._run_in_context, WORK_OWNERS.get(), iterator.close))
         except Exception as error:
             # The caller's close failing is its source failing, mapped as a failed pull is.
             if self._failure is None:

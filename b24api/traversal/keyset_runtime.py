@@ -25,7 +25,7 @@ from b24api.traversal.keyset_page_validation import LaneCommandPlan, LaneReceipt
 from b24api.traversal.keyset_plan import FastKeysetPlan, KeysetPlanner
 from b24api.traversal.keyset_reporting import build_keyset_report
 from b24api.traversal.keyset_transaction_contract import KeysetTransactionState
-from b24api.traversal.keyset_transactions import execute_body_wave, execute_finish_page, execute_wave
+from b24api.traversal.keyset_transactions import close_empty_lanes, execute_body_wave, execute_finish_page, execute_wave
 
 if TYPE_CHECKING:
     from b24api.completion.fast_recorder import FastPageLedger
@@ -222,7 +222,6 @@ class KeysetRuntime:
             self.transactions.lane_identities,
             self.transactions.lane_commands,
             self._admit_receipt,
-            self.trace.admit,
             self._range_geometry,
         )
 
@@ -296,17 +295,16 @@ class KeysetRuntime:
         self.transactions.lane_rows = {lane.spec.ordinal: [] for lane in self.transactions.lanes}
         self.transactions.lane_identities = {lane.spec.ordinal: [] for lane in self.transactions.lanes}
         self.transactions.lane_commands = {lane.spec.ordinal: [] for lane in self.transactions.lanes}
+        close_empty_lanes(self)
 
-    def _admit_receipt(self, receipt: LaneReceipt) -> None:
+    def _admit_receipt(self, receipt: LaneReceipt, owners: tuple[tuple[str, int], ...] | None = None) -> None:
+        """Admit ``receipt`` into output order; ``owners`` are the commands that read its rows, by default its own."""
         commit = self.admission.validate_and_commit(receipt)
-        self.trace.admit(receipt.command_id, len(commit.rows))
-        if receipt.command_id.startswith("body-admit-"):
-            owners = tuple(self.transactions.lane_commands[receipt.lane_ordinal])
-        else:
-            owners = ((receipt.command_id, len(commit.rows)),)
+        owners = ((receipt.command_id, len(commit.rows)),) if owners is None else owners
         if sum(count for _, count in owners) != len(commit.rows):
             raise RuntimeError("fast admission lost page provenance")
         for command_id, count in owners:
+            self.trace.admit(command_id, count)
             self.completion_recorder.admit(command_id, count)
         if commit.rows:
             self.transactions.pending.append(commit.rows)

@@ -631,7 +631,9 @@ for every keyset traversal. A `page_stop` callback needs the ordered page stream
 `EXPLICIT_SEQUENTIAL`. Fast execution sends classic batch commands, so for a request that classic batch
 cannot carry (see [Logical batch and correlation](#logical-batch-and-correlation)) auto reports `AUTO`,
 `SEQUENTIAL`, `BATCH_UNREPRESENTABLE` and sends its pages directly, while an explicit fast execution
-raises `CapabilityError` before any request. The detailed `keyset_execution` report is present only when the fast path ran.
+raises `CapabilityError` before any request. A fast or automatic reference binding fails with that
+error before its first request: under `BatchDispatch` its sequential pages would travel in classic
+batch too, so such a binding needs `SequentialKeysetExecution()` under `DirectDispatch`. The detailed `keyset_execution` report is present only when the fast path ran.
 
 Use `await client.verify_keyset_capability(...)` as a development/CI/staging guard on a stable
 representative fixture. It performs five strict-bound checks and returns only a `VERIFIED` report;

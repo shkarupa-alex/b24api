@@ -21,11 +21,13 @@ def drain_complete_lanes(  # noqa: PLR0913
     rows_by_lane: dict[int, list[FrozenJson]],
     identities_by_lane: dict[int, list[int]],
     commands_by_lane: dict[int, list[tuple[str, int]]],
-    admit: Callable[[LaneReceipt], None],
-    trace_admit: Callable[[str, int], None],
+    admit: Callable[[LaneReceipt, tuple[tuple[str, int], ...]], None],
     lazy_range: LazyRangePlan | None,
 ) -> int:
-    """Drain only complete frontier lanes and advance lazy range geometry."""
+    """Drain only complete frontier lanes and advance lazy range geometry.
+
+    A lane's rows are admitted as one receipt owned by the commands that read them, in read order.
+    """
     while lane_index < len(lanes):
         lane = lanes[lane_index]
         identities, rows, commands = (
@@ -43,9 +45,8 @@ def drain_complete_lanes(  # noqa: PLR0913
                     witness=lane.witness,
                     warnings=(),
                 ),
+                tuple(commands),
             )
-            for command_id, count in commands:
-                trace_admit(command_id, count)
             rows.clear()
             identities.clear()
             commands.clear()

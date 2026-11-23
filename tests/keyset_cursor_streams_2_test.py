@@ -464,7 +464,7 @@ class VerifierTransport:
         if (
             self.batch_ordinal == 2
             and self.mutation == "extra"
-            and filters.get(">ID") == "10"
+            and filters.get(">ID") == "9"
             and filters.get("<ID") == "16"
         ):
             selected = (*selected, 13)
@@ -518,10 +518,46 @@ async def test_keyset_verifier_verified_and_unsupported_cost_and_safe_error() ->
     assert len(error.report.violations) == 5
 
 
+class _TextOrderTransport(VerifierTransport):
+    """A portal that compares identity bounds as text, so ``"11" > "9"`` is false."""
+
+    def _rows(self, parameters: dict[str, JsonValue]) -> list[dict[str, int]]:
+        filters = parameters.get("filter", {})
+        assert isinstance(filters, dict)
+        lower, upper = filters.get(">ID"), filters.get("<ID")
+        selected = [
+            value
+            for value in self.identities
+            if (lower is None or str(value) > str(lower)) and (upper is None or str(value) < str(upper))
+        ]
+        order = parameters.get("order", {})
+        descending = isinstance(order, dict) and order.get("id") == "DESC"
+        limit = parameters.get("limit", 50)
+        assert isinstance(limit, int | str)
+        return [{"id": value} for value in sorted(selected, reverse=descending)[: int(limit)]]
+
+
+@pytest.mark.asyncio
+async def test_keyset_verifier_compares_identities_across_a_decimal_width_even_when_none_was_observed() -> None:
+    # No two observed identities differ in width; the two-row checks reach down to the widest value one
+    # digit shorter than the smallest, so a portal comparing identities as text cannot pass them.
+    verified = await _verify(VerifierTransport((11, 15, 19, 20)))
+    assert verified.verdict is KeysetCapabilityVerdict.VERIFIED
+    assert verified.cross_digit_pair_exercised is True
+
+    with pytest.raises(KeysetCapabilityError) as raised:
+        await _verify(_TextOrderTransport((11, 15, 19, 20)))
+    failed = {check.name: check.outcome for check in raised.value.report.checks}
+    assert raised.value.verdict is KeysetCapabilityVerdict.INCONCLUSIVE
+    assert {failed[KeysetCapabilityCheckName.TWO_ROW_ASC], failed[KeysetCapabilityCheckName.TWO_ROW_DESC]} == {
+        KeysetCapabilityCheckOutcome.CROSS_CANARY_CONTRADICTION
+    }
+
+
 @pytest.mark.asyncio
 async def test_keyset_verifier_rejects_owned_controls_before_io_and_detects_hidden_cap() -> None:
     blocked_transport = VerifierTransport((1, 2, 3, 4))
-    with pytest.raises(CapabilityError, match="control conflicts"):
+    with pytest.raises(CapabilityError, match="conflict with required traversal controls"):
         await _client(blocked_transport).verify_keyset_capability(
             Request("item.list", {"limit": 2}, route=RouteKind.BARE),
             selector=ResultSelector.root(),

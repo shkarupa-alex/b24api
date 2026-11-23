@@ -741,6 +741,21 @@ def spawn_settled[T](work: Awaitable[T], *, context: contextvars.Context | None 
     return task
 
 
+async def finish_in_thread[R](call: Callable[[], R]) -> R:
+    """Run ``call`` in a worker thread that a cancellation waits for instead of abandoning.
+
+    The cancelled call's failure is dropped. An escape (``is_escape``) it ends in is not: its task returns it
+    (``settle``) in the operation's context, so the operation's latch has it (``OperationLatch``).
+    """
+    work = spawn_settled(asyncio.to_thread(call))
+    try:
+        return (await asyncio.shield(work)).unwrap()
+    except asyncio.CancelledError:
+        with contextlib.suppress(asyncio.CancelledError):
+            await work
+        raise
+
+
 def own_failure[T](task: asyncio.Task[Settled[T]]) -> Exception | None:
     """Return the failure a settled task has already ended in on its own: not cancelled, not a source's end.
 

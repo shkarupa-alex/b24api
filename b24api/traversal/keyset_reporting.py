@@ -62,7 +62,13 @@ def build_keyset_report(  # noqa: PLR0913 - the report joins planner evidence wi
         probe_rows_discarded=counters.probe_rows_discarded,
         boundary_overlap_rows=counters.boundary_overlap_rows,
         head_page_admitted=head_admitted,
-        sequential_requests_estimate=(facts.preselection.sequential_estimate.requests if facts.preselection else None),
+        sequential_requests_estimate=(
+            facts.final.sequential.requests
+            if facts.final is not None
+            else facts.preselection.sequential_estimate.requests
+            if facts.preselection
+            else None
+        ),
         selected_requests_estimate=facts.selected_estimate,
         head_rows=facts.head_rows,
         tail_rows=facts.tail_rows,

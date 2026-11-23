@@ -85,7 +85,7 @@ def test_keyset_execution_json_is_closed_and_routes_all_fast_modes() -> None:
     )
     partitioned = parse_keyset_execution({"kind": "partitioned", "target_lanes": 3})
     automatic = parse_keyset_execution(
-        {"kind": "auto", "range_window_width": 9, "max_range_waves": 4, "total_hint": "request_advisory"},
+        {"kind": "auto", "range_window_width": 9, "total_hint": "request_advisory"},
     )
 
     assert isinstance(range_execution, RangeKeysetExecution)
@@ -93,6 +93,8 @@ def test_keyset_execution_json_is_closed_and_routes_all_fast_modes() -> None:
     assert isinstance(automatic, AutoKeysetExecution)
     with pytest.raises(CliUsageError):
         parse_keyset_execution({"kind": "range", "window_width": 1})
+    with pytest.raises(CliUsageError):  # removed: range windows are priced by the wave model, not capped
+        parse_keyset_execution({"kind": "auto", "max_range_waves": 4})
     with pytest.raises(CliUsageError):
         parse_keyset_execution({"kind": "auto", "unknown": 1})
     with pytest.raises(CliUsageError, match="must be a string"):
