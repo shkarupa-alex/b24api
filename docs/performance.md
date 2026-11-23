@@ -83,7 +83,9 @@ harness-produced observations for that portal cell, not general latency promises
   carries, for large dense selections. Pricing runs in a worker thread, off the event loop, and takes
   about 0.3 µs per page the plans it prices read: Auto prices a 353,000-request plan of 10.8
   million pages in about 2.5 s before its probes and again after them, a third time when it weighs a
-  requested advisory total, and the first row waits for all of them. Physical requests
+  requested advisory total, and the first row waits for all of them. Reference bindings that plan at
+  once share a batch only when their pricing ends within `BatchDispatch.coalesce_wait`; a binding
+  still pricing then sends its next wave in a later batch. Physical requests
   at page 50, the default 2,500 buffered rows and default batch size, on a deterministic fixture:
 
   | Selection | Sequential | Auto | Range | Partitioned | Auto, 2.6.2 | Range, 2.6.2 |

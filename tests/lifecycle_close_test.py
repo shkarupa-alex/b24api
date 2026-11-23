@@ -2840,7 +2840,9 @@ async def test_the_page_budget_ends_a_keyset_reference_operation_without_drainin
     execution: KeysetExecution,
 ) -> None:
     # Keyset traversal reserves its page waves at once: a wave the committed pages leave no room for is the
-    # operation's page budget refusing work, which ends the operation as a spent budget does.
+    # operation's page budget refusing work, which ends the operation as a spent budget does. Bindings are
+    # admitted while others plan (Auto prices in a worker thread), so the admission bound, well below
+    # UNDRAINED, keeps the count of pulled bindings independent of how fast that thread runs.
     pulled: list[int] = []
 
     async def bindings() -> AsyncIterator[Binding[int]]:
@@ -2855,7 +2857,8 @@ async def test_the_page_budget_ends_a_keyset_reference_operation_without_drainin
         keyset=KeysetSpec(limit_path=ParameterPath(("limit",))),
         execution=execution,
     )
-    async with client_for(BatchPortal(_keyset_page), policy=ExecutionPolicy(max_pages=6)) as client:
+    policy = ExecutionPolicy(max_pages=6, max_active_references=10)
+    async with client_for(BatchPortal(_keyset_page), policy=policy) as client:
         stream = client.iter_reference_outcomes(
             _listing(), bindings(), traversal=traversal, dispatch=BatchDispatch(batch_size=5)
         )

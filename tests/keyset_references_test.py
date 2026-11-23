@@ -88,7 +88,14 @@ from b24api.references.dispatch import _RowBuffer
 from b24api.transport import WireResponse
 from b24api.traversal.keyset_runtime import KeysetRuntime
 from b24api.traversal.keyset_waves import wave_room
-from tests.scripting import HANG_BOUND, BatchPortal, ResponderTransport, client_for, on_loop
+from tests.scripting import (
+    HANG_BOUND,
+    UNREACHABLE_COALESCE_WAIT,
+    BatchPortal,
+    ResponderTransport,
+    client_for,
+    on_loop,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -1571,7 +1578,7 @@ async def _indexed(
             request,
             on_loop([_parent(f"p{index}") for index in range(parents)]),
             traversal=_traversal(execution),
-            dispatch=BatchDispatch(),
+            dispatch=BatchDispatch(coalesce_wait=UNREACHABLE_COALESCE_WAIT),
         )
         outcomes, report = await _drain(stream)
     assert not any(isinstance(outcome, ReferenceFailure | ReferenceOutcomeUnknown) for outcome in outcomes)
@@ -1718,7 +1725,7 @@ async def test_a_rejected_keyset_reference_page_records_its_index_in_the_shared_
             _base(),
             on_loop([_parent(f"p{index}") for index in range(4)]),
             traversal=_traversal(AutoKeysetExecution(_CONTRACT)),
-            dispatch=BatchDispatch(),
+            dispatch=BatchDispatch(coalesce_wait=UNREACHABLE_COALESCE_WAIT),
         )
         outcomes, report = await _drain(stream)
 
@@ -1847,7 +1854,7 @@ async def test_a_reference_descending_boundary_below_the_ascending_head_fails_it
             _base(),
             on_loop([_parent(f"p{index}") for index in range(3)]),
             traversal=_descending(AutoKeysetExecution(_CONTRACT)),
-            dispatch=BatchDispatch(),
+            dispatch=BatchDispatch(coalesce_wait=UNREACHABLE_COALESCE_WAIT),
         )
         outcomes, report = await _drain(stream)
 
@@ -1923,7 +1930,7 @@ async def test_a_shared_keyset_batch_that_fails_as_a_whole_traces_each_page_the_
             _base(),
             on_loop([_parent(f"p{index}") for index in range(3)]),
             traversal=_traversal(AutoKeysetExecution(_CONTRACT)),
-            dispatch=BatchDispatch(),
+            dispatch=BatchDispatch(coalesce_wait=UNREACHABLE_COALESCE_WAIT),
         )
         outcomes, report = await _drain(stream)
 
@@ -1951,7 +1958,7 @@ async def test_a_shared_keyset_wave_split_over_two_batches_traces_its_answered_p
             _base(),
             on_loop([_parent(f"p{index}") for index in range(3)]),
             traversal=_traversal(AutoKeysetExecution(_CONTRACT)),
-            dispatch=BatchDispatch(batch_size=5),
+            dispatch=BatchDispatch(batch_size=5, coalesce_wait=UNREACHABLE_COALESCE_WAIT),
         )
         outcomes, report = await _drain(stream)
 

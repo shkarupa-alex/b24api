@@ -22,6 +22,7 @@ from b24api import Bitrix24, ExecutionPolicy, Settings
 from b24api.encoding import encode_php_query
 from b24api.references import dispatch as dispatch_module
 from b24api.transport import WireResponse
+from b24api.traversal import keyset_plan
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable, Mapping
@@ -134,11 +135,18 @@ class Blocker:
             raise
 
 
+async def _price_on_loop[R](call: Callable[[], R]) -> R:
+    """Run a keyset plan's pricing on the event loop, where it takes no loop turn."""
+    return call()
+
+
 class VirtualClock:
     """Coalescing clock in loop turns: a wait ends by an event within ``turns`` turns, else its timer fires.
 
     Installed over the batch dispatcher's clock and timed wait, it makes coalescing structural: no
-    wall time is read, and ``timer_firings`` counts every wait that ended by its deadline.
+    wall time is read, and ``timer_firings`` counts every wait that ended by its deadline. Auto keyset
+    plans are priced on the event loop, as sources are fed with ``on_loop``: a worker thread could
+    outlast a virtual wait and fire its timer.
     """
 
     def __init__(self, turns: int = 64) -> None:
@@ -151,6 +159,7 @@ class VirtualClock:
         """Replace the dispatcher's clock and timed wait for the rest of the test."""
         monkeypatch.setattr(dispatch_module, "_loop_time", self.time)
         monkeypatch.setattr(dispatch_module, "_wait_first", self.wait)
+        monkeypatch.setattr(keyset_plan, "finish_in_thread", _price_on_loop)
         return self
 
     def time(self) -> float:
