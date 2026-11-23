@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from b24api.batch.engine import BatchExecutor, BatchProgress
 from b24api.batch.outcome import BatchSuccess
 from b24api.contracts.report import PageDispatch
+from b24api.execution import WorkClass
 from b24api.execution.facts import settlement
 from b24api.traversal.keyset_context import FailedWavePage
 
@@ -72,9 +73,12 @@ class FlatWaveEngine:
             raise
 
     async def execute_page(self, request: Request, *, command_id: str, context: ExecutionContext) -> BatchOutcome:
-        """Execute one finish page as a direct request; its failure, raised by the executor, settles the page."""
+        """Execute one finish page as a direct traversal request; its failure, raised by the executor, settles the page.
+
+        It is a page of the traversal, admitted in the traversal work class as every sequential keyset page is.
+        """
         try:
-            response = await self._executor.execute(request, context=context)
+            response = await self._executor.execute(request, context=context, work_class=WorkClass.TRAVERSAL_DIRECT)
         except BaseException as error:
             page = FailedWavePage(settlement(error), None)
             self._ledger.settle(command_id, page.settlement)

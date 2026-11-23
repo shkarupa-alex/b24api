@@ -56,6 +56,11 @@ _RECHECK_LIMIT = 8
 _MINIMUM_PAIR_ROWS = 2
 
 
+def _crosses_width(plans: tuple[_CheckPlan, ...]) -> bool:
+    """Return whether a check compared identities across a decimal width: its bounds differ in digits."""
+    return any(len(str(abs(plan.lower))) != len(str(abs(plan.upper))) for plan in plans)
+
+
 @dataclass(frozen=True, slots=True)
 class _CheckPlan:
     name: KeysetCapabilityCheckName
@@ -117,8 +122,7 @@ class _Verifier:
                 reason=reason,
                 cross_digit=False,
             )
-        pair = self._pair(asc, desc)
-        if pair is None:
+        if not self._has_pair(asc, desc):
             return await self._report(
                 KeysetCapabilityVerdict.INCONCLUSIVE,
                 self._not_executed(),
@@ -137,7 +141,7 @@ class _Verifier:
                 KeysetCapabilityVerdict.UNSUPPORTED,
                 checks,
                 reason=None,
-                cross_digit=self._cross_digit(pair),
+                cross_digit=_crosses_width(plans),
             )
         checks = self._mark_contradictions(plans, responses, checks)
         drifting = tuple(
@@ -154,14 +158,14 @@ class _Verifier:
                 KeysetCapabilityVerdict.VERIFIED,
                 checks,
                 reason=None,
-                cross_digit=self._cross_digit(pair),
+                cross_digit=_crosses_width(plans),
             )
         checks, reason = await self._recheck(checks)
         return await self._report(
             KeysetCapabilityVerdict.INCONCLUSIVE,
             checks,
             reason=reason,
-            cross_digit=self._cross_digit(pair),
+            cross_digit=_crosses_width(plans),
         )
 
     def _request(self, direction: str, lower: int | None, upper: int | None) -> Request:
@@ -308,16 +312,9 @@ class _Verifier:
         return None
 
     @staticmethod
-    def _pair(asc: tuple[int, ...], desc: tuple[int, ...]) -> tuple[int, int] | None:
-        ascending_desc = tuple(reversed(desc))
-        candidates = tuple(itertools.pairwise(asc)) + tuple(itertools.pairwise(ascending_desc))
-        increasing = tuple((left, right) for left, right in candidates if left < right)
-        fallback = increasing[0] if increasing else None
-        return next((_pair for _pair in increasing if _Verifier._cross_digit(_pair)), fallback)
-
-    @staticmethod
-    def _cross_digit(pair: tuple[int, int]) -> bool:
-        return len(str(abs(pair[0]))) != len(str(abs(pair[1])))
+    def _has_pair(asc: tuple[int, ...], desc: tuple[int, ...]) -> bool:
+        candidates = (*itertools.pairwise(asc), *itertools.pairwise(tuple(reversed(desc))))
+        return any(left < right for left, right in candidates)
 
     @staticmethod
     def _plans(
@@ -537,7 +534,7 @@ async def verify_keyset_capability(  # noqa: PLR0913
         raise CapabilityError(f"keyset verifier sends classic batch probes, which cannot carry {obstacle}")
     if identity.coercion not in {IdentityCoercion.EXACT_INTEGER, IdentityCoercion.DECIMAL_STRING_INTEGER}:
         raise CapabilityError("keyset verifier requires integer identity coercion")
-    _reject_owned_controls(request, identity, keyset)
+    _reject_owned_controls(request, identity, keyset, page_size)
     verifier = _Verifier(
         executor,
         request,

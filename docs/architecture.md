@@ -632,7 +632,13 @@ range and partition plans are caller-asserted and retain positive bound validati
 The separate verifier owns diagnostic canaries and never changes runtime mode. Advisory totals are isolated from
 completion and admission. A planner (`keyset_plan.py`) owns boundary analysis, automatic selection
 and anchor probing, and freezes a plan of kind, reason and bounds; the pure integer geometry behind
-it lives in `keyset_geometry.py`. One runtime (`keyset_runtime.py`) owns wave correlation, ordered
+it lives in `keyset_geometry.py`. The body-wave rule (which open lanes a wave advances, within the
+batch capacity and the row buffer left) lives in `keyset_waves.py`: the runtime builds its waves
+with it and the cost model runs it over lanes of estimated rows, so a plan is priced on the waves it
+will send. The cost model steps through every wave, taking at once only the waves the frontier reads
+alone, so its estimate is exact; its work follows the requests of the plans it prices, and stops past
+the cheaper one's. The planner runs it in a worker thread (`execution.context.finish_in_thread`), so the
+event loop is never held for it; a cancelled planning waits for it to finish. One runtime (`keyset_runtime.py`) owns wave correlation, ordered
 admission, row-buffer deltas, finishing continuation, cleanup, and the immutable selection report.
 The planner and the stateless transaction functions reach the runtime only through the
 `KeysetTransactionHost` protocol and define no persistent state of their own.

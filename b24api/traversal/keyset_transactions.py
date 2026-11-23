@@ -26,7 +26,6 @@ from b24api.traversal.keyset_fast_plan import (
     LaneSpec,
     LaneState,
     LaneStatus,
-    fit_wave,
 )
 from b24api.traversal.keyset_geometry import descending_closure_witness
 from b24api.traversal.keyset_observation import stage_or_record_observation
@@ -42,6 +41,7 @@ from b24api.traversal.keyset_transaction_contract import (
     build_controlled_request,
     build_lane_plan,
 )
+from b24api.traversal.keyset_waves import wave_members, wave_room
 
 if TYPE_CHECKING:
     from b24api.batch.outcome import BatchOutcome
@@ -63,7 +63,6 @@ def build_anchor_plans(
         upper_exclusive=min(desc.identities),
         target_lanes=target,
         page_cap=host.effective_page_cap,
-        writable_limit=host.keyset.limit_path is not None,
     )
     return build_capability_plans(
         commands,
@@ -330,27 +329,22 @@ async def execute_body_wave(host: KeysetTransactionHost) -> None:
     if not open_lanes:
         host.drain_admission_frontier()
         return
-    frontier = open_lanes[0]
-    candidates_lanes = [
-        lane
-        for lane in open_lanes
-        if lane is frontier or not host.transactions.lane_rows[lane.spec.ordinal] or lane.rounds <= frontier.rounds
-    ][: host.batch_capacity]
-    plan_candidates = tuple(_body_plan(host, lane) for lane in candidates_lanes)
-    plans = fit_wave(
-        plan_candidates,
-        reserves=tuple(plan.reserved_rows for plan in plan_candidates),
-        commands=host.batch_capacity,
-        rows=host.context.policy.max_buffered_rows - host.transactions.buffer_balance,
+    members = wave_members(
+        open_lanes,
+        room=wave_room(
+            capacity=host.batch_capacity,
+            free_rows=host.context.policy.max_buffered_rows - host.transactions.buffer_balance,
+            reserve=host.effective_page_cap,
+        ),
     )
-    if not plans:
+    if not members:
         raise BudgetExceededError("fast keyset body wave has no available row capacity")
-    receipts = await host.execute_wave(plans)
+    receipts = await host.execute_wave(tuple(_body_plan(host, lane) for lane in members))
     retained = sum(len(receipt.rows) for receipt in receipts)
     await host.adjust_buffer(retained)
     host.admission.record_raw(retained)
     by_ordinal = {receipt.lane_ordinal: receipt for receipt in receipts}
-    for lane in candidates_lanes[: len(plans)]:
+    for lane in members:
         receipt = by_ordinal[lane.spec.ordinal]
         lane.rounds += 1
         lane.received_rows += len(receipt.rows)
@@ -390,6 +384,19 @@ def _body_plan(host: KeysetTransactionHost, lane: LaneState) -> LaneCommandPlan:
         limit=host.effective_page_cap,
     )
     return build_lane_plan(host, lane, phase=KeysetPhase.BODY, request=request)
+
+
+def close_empty_lanes(host: KeysetTransactionHost) -> None:
+    """Close, without a request, every open lane known to hold no identity.
+
+    Its fences leave no identity value between them, or an anchor probe found none there. Its whole
+    lattice (nothing) is already known; a partition lane still takes back its retained anchor.
+    """
+    for lane in host.transactions.lanes:
+        lower, upper = lane.spec.bounds.lower_exclusive, lane.spec.bounds.upper_exclusive
+        no_values = lower is not None and upper is not None and upper - lower <= 1
+        if lane.status is LaneStatus.OPEN and (lane.spec.known_empty or no_values):
+            _close_lane(host, lane, ClosureWitness.LATTICE_FULL)
 
 
 def _close_lane(host: KeysetTransactionHost, lane: LaneState, witness: ClosureWitness) -> None:
@@ -563,6 +570,7 @@ def _reject_finish_receipt(
 
 __all__ = [
     "build_anchor_plans",
+    "close_empty_lanes",
     "execute_body_wave",
     "execute_finish_page",
     "execute_wave",

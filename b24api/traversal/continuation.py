@@ -18,8 +18,7 @@ from b24api.contracts.page import PageView
 from b24api.contracts.reference import ParameterUpdate
 from b24api.contracts.response import result_snapshot
 from b24api.errors import CapabilityError, ContinuationError
-from b24api.traversal.identity import _request_with_controls
-from b24api.traversal.keyset_eligibility import _path_lookup
+from b24api.traversal.identity import _path_lookup, _request_with_controls
 from b24api.traversal.strategy_context import PageStop, PageVerdict
 
 if TYPE_CHECKING:

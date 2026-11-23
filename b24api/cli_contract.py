@@ -257,7 +257,7 @@ def parse_keyset_execution(payload: Mapping[str, JsonValue] | None) -> KeysetExe
         "sequential": {"kind"},
         "range": common | {"window_width"},
         "partitioned": common | {"target_lanes"},
-        "auto": common | {"target_lanes", "range_window_width", "max_range_waves", "total_hint"},
+        "auto": common | {"target_lanes", "range_window_width", "total_hint"},
     }
     _closed(payload, allowed[kind], label="execution")
     if kind == "sequential":
@@ -287,7 +287,6 @@ def parse_keyset_execution(payload: Mapping[str, JsonValue] | None) -> KeysetExe
             batch_size=batch_size,
             target_lanes=cast("int", payload.get("target_lanes", 20)),
             range_window_width=cast("int | None", payload.get("range_window_width")),
-            max_range_waves=cast("int", payload.get("max_range_waves", 2)),
             total_hint=TotalHintMode(payload.get("total_hint", TotalHintMode.IGNORE.value)),
         )
     except (TypeError, ValueError) as error:

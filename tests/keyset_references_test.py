@@ -86,8 +86,8 @@ from b24api.references import wave_engine
 from b24api.references.budget_view import BindingBudgetView, RowLease
 from b24api.references.dispatch import _RowBuffer
 from b24api.transport import WireResponse
-from b24api.traversal.keyset_fast_plan import fit_wave
 from b24api.traversal.keyset_runtime import KeysetRuntime
+from b24api.traversal.keyset_waves import wave_room
 from tests.scripting import HANG_BOUND, BatchPortal, ResponderTransport, client_for, on_loop
 
 if TYPE_CHECKING:
@@ -341,6 +341,36 @@ async def test_a_binding_that_writes_a_fast_owned_bound_fails_closed_before_any_
     assert isinstance(terminal["good"], ReferenceComplete)
     assert isinstance(terminal["bad"], ReferenceNotExecuted | ReferenceFailure)
     assert "bad" not in _rows_by_parent(outcomes)
+    assert all(query.get("filter[=parent]") != "bad" for query in portal.queries)
+
+
+@pytest.mark.parametrize("execution", [_range(), _auto()], ids=["range", "auto"])
+@pytest.mark.asyncio
+async def test_a_binding_classic_batch_cannot_carry_fails_before_any_request_and_names_direct_dispatch(
+    execution: Execution,
+) -> None:
+    # An automatic binding does not fall back to sequential pages as a flat traversal does: under
+    # batch dispatch those pages would travel in classic batch too.
+    portal = BatchPortal(_answer({"good": DISTRIBUTIONS["dense"], "bad": DISTRIBUTIONS["dense"]}))
+    bad = Binding(
+        "bad",
+        (
+            ParameterUpdate(ParameterPath(("filter", "=parent")), "bad"),
+            ParameterUpdate(ParameterPath(("filter", "ASSIGNED_BY_ID")), None),
+        ),
+        "bad",
+    )
+    async with client_for(portal) as client:
+        outcomes, _report = await _drain(
+            client.iter_reference_outcomes(_base(), [_parent("good"), bad], traversal=_traversal(execution))
+        )
+
+    terminal = {outcome.correlation: outcome for outcome in outcomes if not isinstance(outcome, ReferenceItem)}
+    assert isinstance(terminal["good"], ReferenceComplete)
+    failure = terminal["bad"]
+    assert isinstance(failure, ReferenceFailure)
+    assert isinstance(failure.error, CapabilityError)
+    assert "DirectDispatch" in str(failure.error)
     assert all(query.get("filter[=parent]") != "bad" for query in portal.queries)
 
 
@@ -739,7 +769,7 @@ async def test_fast_reference_bindings_cancelled_mid_run_settle_each_page_from_w
     async def respond(request: Request) -> WireResponse:
         commands = request.copy_parameters()["cmd"]
         assert isinstance(commands, dict)
-        if end == "on_the_wire" and len(answered) == 1:
+        if end == "on_the_wire" and len(answered) == 3:
             on_the_wire.append(len(commands))
             held.set()
             await asyncio.Future()
@@ -1148,12 +1178,7 @@ async def test_retained_rows_shrink_the_fitted_wave_and_the_charge_equals_the_fi
     view: KeysetContext = BindingBudgetView.over(_shared(), lease)
     await view.adjust_buffered_rows(held)
     candidates = ("first", "second")
-    wave = fit_wave(
-        candidates,
-        reserves=(10, 10),
-        commands=2,
-        rows=view.policy.max_buffered_rows - lease.held,
-    )
+    wave = candidates[: wave_room(capacity=2, free_rows=view.policy.max_buffered_rows - lease.held, reserve=10)]
     assert len(wave) == fitted
     await view.adjust_buffered_rows(10 * len(wave))
     assert lease.held == held + 10 * len(wave) <= lease.capacity == 50
@@ -1170,7 +1195,7 @@ async def test_one_free_page_runs_two_candidates_as_two_atomic_one_command_waves
     remaining: tuple[str, ...] = ("a", "b")
     waves: list[tuple[str, ...]] = []
     while remaining:
-        wave = fit_wave(remaining, reserves=(10,) * len(remaining), commands=2, rows=30 - lease.held)
+        wave = remaining[: wave_room(capacity=2, free_rows=30 - lease.held, reserve=10)]
         assert wave
         await view.adjust_buffered_rows(10)
         waves.append(wave)
@@ -1370,7 +1395,7 @@ def test_an_interrupt_a_wave_send_raises_leaves_the_loop_with_no_task_behind(cal
         (_range, "dense", 2),
         (_partitioned, "dense", 7),
         (_auto, "dense", 1),
-        (_range, "sparse", 28),
+        (_range, "sparse", 3),
     ],
     ids=["range", "partitioned", "auto", "range-sparse"],
 )
@@ -1399,13 +1424,14 @@ async def test_a_keyset_binding_finish_the_request_budget_refuses_ends_with_the_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("spent_at", [4, 6, 7, 10, 11, 13, 16, 19, 25, 32])
+@pytest.mark.parametrize("spent_at", list(range(1, 16)))
 async def test_keyset_bindings_the_deadline_ends_record_no_failed_command(
     monkeypatch: pytest.MonkeyPatch, spent_at: int
 ) -> None:
-    # The deadline passes while the spent_at-th request is answered. Another binding's admission or page reservation
-    # is refused first, and every keyset command refused after it names other work (its permit, its dispatch): each
-    # is the same operation's end, so none is a failed command.
+    # Windows of 39 values give the three bindings 16 waves; the deadline passes while the spent_at-th of the first
+    # 15 is answered. Another binding's admission or page reservation is refused first, and every keyset command
+    # refused after it names other work (its permit, its dispatch): each is the same operation's end, so none is a
+    # failed command.
     skew = [0.0]
 
     def context(executor: Executor, policy: ExecutionPolicy | None = None) -> ExecutionContext:
@@ -1425,7 +1451,10 @@ async def test_keyset_bindings_the_deadline_ends_record_no_failed_command(
     portal = BatchPortal(spending)
     async with client_for(portal, policy=ExecutionPolicy(max_elapsed=600.0)) as client:
         stream = client.iter_reference_outcomes(
-            _base(), [_parent(name) for name in data], traversal=_traversal(_range()), dispatch=BatchDispatch()
+            _base(),
+            [_parent(name) for name in data],
+            traversal=_traversal(RangeKeysetExecution(_CONTRACT, window_width=40)),
+            dispatch=BatchDispatch(),
         )
         # Which work the deadline refuses first (an admission, a page's rows, a send) depends on the interleaving.
         with pytest.raises(BudgetExceededError):

@@ -60,6 +60,8 @@ class LaneSpec:
     bounds: LaneBounds
     descending: bool
     retained_upper_anchor: Identity | None
+    # An anchor probe found no identity between the fences: the lane closes without a request.
+    known_empty: bool = False
 
 
 @dataclass(slots=True)
@@ -224,18 +226,6 @@ def plan_lanes_from_anchors(
     return tuple(lanes)
 
 
-def fit_wave[T](plans: tuple[T, ...], *, reserves: tuple[int, ...], commands: int, rows: int) -> tuple[T, ...]:
-    """Return the largest deterministic prefix fitting both capacities."""
-    selected = 0
-    reserved = 0
-    for reserve in reserves[:commands]:
-        if reserved + reserve > rows:
-            break
-        selected += 1
-        reserved += reserve
-    return plans[:selected]
-
-
 __all__ = [
     "Identity",
     "LaneBounds",
@@ -244,7 +234,6 @@ __all__ = [
     "LaneState",
     "LaneStatus",
     "LazyRangePlan",
-    "fit_wave",
     "plan_lanes_from_anchors",
     "plan_windows",
     "window_count",
