@@ -69,7 +69,8 @@ _QUERY_PARAMETERS = MappingProxyType({"plain": "a b", "outer": {"items": ["x"]}}
 _QUERY_PATH = "/rest/1/token/conformance.test"
 # Decoded as PHP reads a query: ``+`` and ``%20`` alike are a space, and the order of distinct keys is no matter.
 _QUERY_PAIRS = sorted([("plain", "a b"), ("outer[items][0]", "x")])
-_RAW_CONTENT = RawContent(b"\x00chunk\xff", "application/octet-stream")
+# Not octet-stream, the type a transport might send by default: the case checks the declared one goes out.
+_RAW_CONTENT = RawContent(b"\x00chunk\xff", "image/svg+xml")
 
 
 @dataclass(frozen=True, slots=True)

@@ -91,7 +91,11 @@ async def test_a_query_string_request_without_parameters_has_no_query() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("chunk", [_CHUNK, RawContent(b"", "application/octet-stream")], ids=["bytes", "empty"])
+@pytest.mark.parametrize(
+    "chunk",
+    [_CHUNK, RawContent(b"", "application/octet-stream"), RawContent(b"<svg/>", "text/plain; charset=utf-8")],
+    ids=["bytes", "empty", "declared_type"],
+)
 async def test_raw_content_is_posted_byte_for_byte_with_its_type_and_the_parameters_in_the_query(
     chunk: RawContent,
 ) -> None:
@@ -119,7 +123,7 @@ async def test_raw_content_is_posted_byte_for_byte_with_its_type_and_the_paramet
     assert wire.method == "POST"
     assert wire.url.raw_path == b"/rest/1/token/crm.site.fileuploader.upload?controller=crm.fileUploader&token=t"
     assert wire.content == chunk.data
-    assert wire.headers["content-type"] == "application/octet-stream"
+    assert wire.headers["content-type"] == chunk.content_type
     assert wire.headers["content-length"] == str(len(chunk.data))
     assert wire.headers["x-upload-content-name"] == "chunk.bin"
 
@@ -450,6 +454,7 @@ async def test_conformance_fails_a_transport_that_declares_query_strings_but_pos
 _URL_FLAWS: dict[str, Callable[[httpx.URL], httpx.URL]] = {
     "no_query": lambda url: url.copy_with(query=None),
     "other_nested_key": lambda url: url.copy_with(query=url.query.replace(b"items", b"item")),
+    "other_value": lambda url: url.copy_with(query=url.query.replace(b"a+b", b"a%2Bb")),
     "space_as_percent": lambda url: url.copy_with(query=url.query.replace(b"+", b"%20")),
     "keys_reordered": lambda url: url.copy_with(query=b"&".join(reversed(url.query.split(b"&")))),
     "other_path": lambda url: url.copy_with(path=url.path + "x"),
@@ -507,6 +512,7 @@ class _Tampered(HttpxTransport):
         ("other_path", (False, False)),
         ("other_method", (False, False)),
         ("other_nested_key", (False, False)),
+        ("other_value", (False, False)),
         ("get_with_body", (False, True)),
         ("other_bytes", (True, False)),
         ("bytes_as_text", (True, False)),
@@ -539,6 +545,27 @@ class _BodiesOnly(HttpxTransport):
     """A wire transport that declares only the body encodings."""
 
     capabilities = TransportCapabilities(encodings=frozenset({BodyEncoding.JSON, BodyEncoding.FORM_URLENCODED}))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", [None, _CHUNK], ids=["get", "raw_content"])
+async def test_a_wire_transport_that_does_not_declare_query_strings_refuses_one_before_any_send(
+    content: RawContent | None,
+) -> None:
+    sent: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json={"result": True})
+
+    transport = _BodiesOnly(_WEBHOOK, client=httpx.AsyncClient(transport=httpx.MockTransport(respond)))
+    request = Request.bare("x.download", {"a": 1}, encoding=BodyEncoding.QUERY_STRING, content=content)
+
+    with pytest.raises(CapabilityError, match="does not support query_string requests"):
+        await Executor(transport).execute(request)
+    await transport.aclose()
+
+    assert sent == []
 
 
 @pytest.mark.asyncio
