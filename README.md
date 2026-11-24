@@ -1248,9 +1248,11 @@ make qc
 git diff --check
 ```
 
-`make qc` runs the lint, type and default test checks that CI blocks on. It leaves out the internal
-benches (the pytest marker `slow`: the evidence harness contracts and the 50k/100k-scale runs, which
-take several minutes). `make bench` runs them, and so does the blocking CI job `slow`.
+`make qc` runs the lint, type and default test checks that CI blocks on. The tests run in parallel, one
+worker process per CPU: `make qc PYTEST_WORKERS=2` bounds them, `PYTEST_WORKERS=0` runs them in one
+process. It leaves out the internal benches (the pytest marker `slow`: the evidence harness contracts and
+the 50k/100k-scale runs, which take several minutes). `make bench` runs them, in one process, and so does
+the blocking CI job `slow`.
 
 The wheel regression installs into an isolated environment, executes the `b24api` entry point and
 checks that tests, live/evidence tooling and credentials are excluded.
