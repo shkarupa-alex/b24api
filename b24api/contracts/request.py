@@ -20,7 +20,7 @@ from b24api.contracts.json import (
 from b24api.contracts.policy import IdentityCoercion
 from b24api.contracts.positional import PositionalArguments
 from b24api.contracts.request_summary import RequestSummary, RouteKind
-from b24api.contracts.wire import BodyEncoding, RequestHeaders
+from b24api.contracts.wire import BodyEncoding, RawContent, RequestHeaders
 from b24api.encoding import BracketObstacle, bracket_obstacle
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
 
@@ -69,6 +69,7 @@ class _OptionalRequestSpec(TypedDict, total=False):
     replay_safety: ReplaySafety
     encoding: BodyEncoding
     headers: RequestHeaders
+    content: RawContent
     result_error: ResultErrorSpec
 
 
@@ -227,6 +228,7 @@ class Request:
     replay_safety: ReplaySafety
     encoding: BodyEncoding
     headers: RequestHeaders
+    content: RawContent | None
     result_error: ResultErrorSpec | None
     _parameters: FrozenMapping = field(repr=False)
     _positional: PositionalArguments | None = field(repr=False)
@@ -242,10 +244,15 @@ class Request:
         *,
         encoding: BodyEncoding = BodyEncoding.JSON,
         headers: RequestHeaders = _NO_HEADERS,
+        content: RawContent | None = None,
         result_error: ResultErrorSpec | None = None,
         route: RouteKind,
     ) -> None:
-        """Initialize instance state."""
+        """Initialize instance state.
+
+        ``content`` is a raw body for a ``QUERY_STRING`` request, whose parameters then travel in the query of
+        a POST; such a request without it is a GET.
+        """
         if not _METHOD_RE.fullmatch(method):
             raise ValueError("method must be dot-separated names of letters, digits, and underscores")
         if method.endswith(".json"):
@@ -260,6 +267,7 @@ class Request:
             raise TypeError("encoding and headers must use their declared contract types")
         if result_error is not None and not isinstance(result_error, ResultErrorSpec):
             raise TypeError("result_error must be a ResultErrorSpec")
+        _check_content(content, encoding)
         positional = parameters if isinstance(parameters, PositionalArguments) else None
         if positional is not None and encoding is not BodyEncoding.JSON:
             raise ValueError("positional arguments require JSON body encoding")
@@ -273,6 +281,7 @@ class Request:
         object.__setattr__(self, "replay_safety", replay_safety)
         object.__setattr__(self, "encoding", encoding)
         object.__setattr__(self, "headers", headers)
+        object.__setattr__(self, "content", content)
         object.__setattr__(self, "result_error", result_error)
         object.__setattr__(self, "_parameters", frozen)
         object.__setattr__(self, "_positional", positional)
@@ -282,10 +291,11 @@ class Request:
         object.__setattr__(
             self, "_batch_obstacle", None if positional is not None else bracket_obstacle(frozen, batch=True)
         )
-        if encoding is BodyEncoding.FORM_URLENCODED:
+        if encoding is not BodyEncoding.JSON:
             obstacle = bracket_obstacle(frozen, batch=False)
             if obstacle is not None:
-                raise ValueError(f"form-encoded parameters cannot carry {obstacle}; use JSON encoding")
+                place = "form-encoded" if encoding is BodyEncoding.FORM_URLENCODED else "query-string"
+                raise ValueError(f"{place} parameters cannot carry {obstacle}; use JSON encoding")
 
     @classmethod
     def bare(  # noqa: PLR0913 - mirrors the canonical constructor's arguments except route
@@ -296,6 +306,7 @@ class Request:
         *,
         encoding: BodyEncoding = BodyEncoding.JSON,
         headers: RequestHeaders = _NO_HEADERS,
+        content: RawContent | None = None,
         result_error: ResultErrorSpec | None = None,
     ) -> Request:
         """Build a classic REST request: the constructor with ``route=RouteKind.BARE`` fixed."""
@@ -305,6 +316,7 @@ class Request:
             replay_safety,
             encoding=encoding,
             headers=headers,
+            content=content,
             result_error=result_error,
             route=RouteKind.BARE,
         )
@@ -377,6 +389,7 @@ class Request:
             self.replay_safety,
             encoding=self.encoding,
             headers=self.headers,
+            content=self.content,
             result_error=self.result_error,
             route=self.route,
         )
@@ -401,6 +414,16 @@ class Request:
         return f"Request(summary={self.summary!r}, replay_safety={self.replay_safety!r})"
 
 
+def _check_content(content: object, encoding: BodyEncoding) -> None:
+    """Refuse raw content of another type, or for parameters that do not travel in the query."""
+    if content is None:
+        return
+    if not isinstance(content, RawContent):
+        raise TypeError("content must be a RawContent")
+    if encoding is not BodyEncoding.QUERY_STRING:
+        raise ValueError("raw content requires QUERY_STRING encoding, which sends the parameters in the query")
+
+
 def diagnostic_context(request: Request) -> DiagnosticContext:
     """Derive the private diagnostic context bound to this one canonical request.
 
@@ -421,7 +444,16 @@ def canonical_request(raw: RequestLike) -> Request:
         return raw
     if not isinstance(raw, Mapping):
         raise TypeError("request must be a Request or closed request mapping")
-    unknown = set(raw) - {"method", "parameters", "replay_safety", "encoding", "headers", "result_error", "route"}
+    unknown = set(raw) - {
+        "method",
+        "parameters",
+        "replay_safety",
+        "encoding",
+        "headers",
+        "content",
+        "result_error",
+        "route",
+    }
     if unknown:
         raise ValueError(f"unknown request fields: {sorted(unknown)}")
     method = raw.get("method")
@@ -429,6 +461,7 @@ def canonical_request(raw: RequestLike) -> Request:
     safety = raw.get("replay_safety", ReplaySafety.UNKNOWN)
     encoding = raw.get("encoding", BodyEncoding.JSON)
     headers = raw.get("headers", RequestHeaders())
+    content = raw.get("content")
     result_error = raw.get("result_error")
     route = raw.get("route")
     if not isinstance(method, str):
@@ -449,6 +482,7 @@ def canonical_request(raw: RequestLike) -> Request:
         replay_safety=safety,
         encoding=encoding,
         headers=headers,
+        content=content,
         result_error=result_error,
         route=route,
     )

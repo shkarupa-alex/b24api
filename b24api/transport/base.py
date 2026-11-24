@@ -9,7 +9,7 @@ from b24api.contracts.json import FrozenMapping, JsonValue, thaw_json
 from b24api.contracts.request import ReplaySafety, Request, ResultErrorSpec
 from b24api.contracts.request_summary import RequestSummary, RouteKind
 from b24api.contracts.response import _safe_media_type
-from b24api.contracts.wire import BodyEncoding, RequestHeaders
+from b24api.contracts.wire import BodyEncoding, RawContent, RequestHeaders
 from b24api.contracts.wire_body import V3_BATCH_METHOD, V3BatchBody
 from b24api.errors import CapabilityError
 
@@ -63,6 +63,8 @@ class WireResponse:
 class TransportCapabilities:
     """Advanced request features explicitly honored by a transport."""
 
+    # A transport that declares ``QUERY_STRING`` sends such a request's parameters in the URL's query, as a GET,
+    # or as a POST of its raw ``content`` byte for byte, with the declared content type, when it has one.
     encodings: frozenset[BodyEncoding] = frozenset({BodyEncoding.JSON})
     scoped_headers: bool = False
     positional_json: bool = False
@@ -106,6 +108,7 @@ class WireRequest:
     replay_safety: ReplaySafety
     encoding: BodyEncoding
     headers: RequestHeaders
+    content: RawContent | None
     result_error: ResultErrorSpec | None
     _parameters: FrozenMapping = field(repr=False)
     _positional: PositionalArguments | None = field(repr=False)
@@ -120,6 +123,7 @@ class WireRequest:
         object.__setattr__(self, "replay_safety", request.replay_safety)
         object.__setattr__(self, "encoding", request.encoding)
         object.__setattr__(self, "headers", request.headers)
+        object.__setattr__(self, "content", request.content)
         object.__setattr__(self, "result_error", request.result_error)
         object.__setattr__(self, "_parameters", request._parameters)  # noqa: SLF001 - canonical immutable handoff
         object.__setattr__(self, "_positional", request.positional)
@@ -143,6 +147,7 @@ class WireRequest:
         object.__setattr__(wire, "replay_safety", replay_safety)
         object.__setattr__(wire, "encoding", BodyEncoding.JSON)
         object.__setattr__(wire, "headers", RequestHeaders())
+        object.__setattr__(wire, "content", None)
         object.__setattr__(wire, "result_error", None)
         object.__setattr__(wire, "_parameters", FrozenMapping({}))
         object.__setattr__(wire, "_positional", None)
@@ -260,7 +265,7 @@ def preflight_transport(transport: WireTransport | None, request: Request) -> No
     if request.route not in capabilities.routes:
         raise CapabilityError(f"transport does not build the {request.route.value} route")
     if request.encoding not in capabilities.encodings:
-        raise CapabilityError(f"transport does not support {request.encoding.value} request bodies")
+        raise CapabilityError(f"transport does not support {request.encoding.value} requests")
     if request.headers.items and not capabilities.scoped_headers:
         raise CapabilityError("transport does not support scoped request headers")
 

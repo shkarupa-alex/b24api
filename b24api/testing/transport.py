@@ -10,10 +10,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from functools import partial
 from types import MappingProxyType
+from urllib.parse import parse_qsl, urlsplit
 
 from b24api.contracts.request import Request
 from b24api.contracts.request_summary import RouteKind
-from b24api.contracts.wire import BodyEncoding, RequestHeaders
+from b24api.contracts.wire import BodyEncoding, RawContent, RequestHeaders
 from b24api.errors import ResponseTooLargeError
 from b24api.testing._isolation import (
     IsolationAbortError,
@@ -46,6 +47,8 @@ class ConformanceCase(StrEnum):
     CANCELLATION_PROPAGATES = "cancellation_propagates"
     ROUTE_JSON_SUFFIX = "route_json_suffix"
     ROUTE_API_V3_REBASE = "route_api_v3_rebase"
+    QUERY_STRING_GET = "query_string_get"
+    QUERY_STRING_RAW_CONTENT = "query_string_raw_content"
 
 
 # A declared route must reach its own endpoint on the conformance webhook ``/rest/1/token/``.
@@ -61,6 +64,12 @@ _ROUTE_PATHS = MappingProxyType(
         RouteKind.API_V3: "/rest/api/1/token/conformance.test",
     }
 )
+_QUERY_CASES = frozenset({ConformanceCase.QUERY_STRING_GET, ConformanceCase.QUERY_STRING_RAW_CONTENT})
+_QUERY_PARAMETERS = MappingProxyType({"plain": "a b", "outer": {"items": ["x"]}})
+_QUERY_PATH = "/rest/1/token/conformance.test"
+# Decoded as PHP reads a query: ``+`` and ``%20`` alike are a space, and the order of distinct keys is no matter.
+_QUERY_PAIRS = sorted([("plain", "a b"), ("outer[items][0]", "x")])
+_RAW_CONTENT = RawContent(b"\x00chunk\xff", "application/octet-stream")
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,7 +204,7 @@ async def _run_owned_case(  # noqa: C901, PLR0912 - preserve the first lifecycle
     failure: BaseException | None = None
     try:
         outcome = await _await_bounded(
-            _run_case(case, transport, captures),
+            (_run_query_case if case in _QUERY_CASES else _run_case)(case, transport, captures),
             seconds=max(0.0, deadline - asyncio.get_running_loop().time()),
             detail="CaseDeadlineExceeded",
         )
@@ -396,6 +405,42 @@ async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915
     elif case in _CASE_ROUTES:
         passed = passed and capture.request_line.split(" ")[1] == _ROUTE_PATHS[route]
     return ConformanceOutcome(case, passed=passed)
+
+
+async def _run_query_case(
+    case: ConformanceCase,
+    transport: Transport,
+    captures: asyncio.Queue[_Capture],
+) -> ConformanceOutcome:
+    """Check that a query-string request is a GET, or a POST of its raw content, with its parameters in the query."""
+    if not isinstance(transport, WireTransport) or BodyEncoding.QUERY_STRING not in transport.capabilities.encodings:
+        return ConformanceOutcome(case, passed=True, skipped=True)
+    content = _RAW_CONTENT if case is ConformanceCase.QUERY_STRING_RAW_CONTENT else None
+    request = Request(
+        "conformance.test",
+        parameters=_QUERY_PARAMETERS,
+        encoding=BodyEncoding.QUERY_STRING,
+        content=content,
+        route=RouteKind.BARE,
+    )
+    response = await transport.send_wire(WireRequest(request), attempt_timeout=5, max_response_bytes=1024)
+    capture = await captures.get()
+    if content is None:
+        sent = _sent_query(capture, "GET") and capture.body == b""
+    else:
+        sent = (
+            _sent_query(capture, "POST")
+            and capture.body == content.data
+            and capture.headers.get("content-type") == content.content_type
+        )
+    return ConformanceOutcome(case, passed=response.status_code == _HTTP_OK and sent)
+
+
+def _sent_query(capture: _Capture, method: str) -> bool:
+    """Return whether ``capture`` is a ``method`` request for the case's path, its parameters in the query."""
+    verb, target, *_ = [*capture.request_line.split(" "), "", ""]
+    parts = urlsplit(target)
+    return verb == method and parts.path == _QUERY_PATH and sorted(parse_qsl(parts.query)) == _QUERY_PAIRS
 
 
 def _discard_capture(captures: asyncio.Queue[_Capture]) -> None:

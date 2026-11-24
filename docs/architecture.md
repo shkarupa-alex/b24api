@@ -639,7 +639,10 @@ payload conventions, public low-level execution plans or mutable global registri
 ## Wire, traversal, and evidence boundaries
 
 `Request` owns an explicit route, immutable body encoding, scoped headers, replay safety, and an optional
-declarative embedded-result error contract. Legacy transports continue to support ordinary JSON requests;
+declarative embedded-result error contract. The encoding says where the parameters travel: a JSON or form
+body, or the URL's query (`QUERY_STRING`), sent as a GET or, with the request's `RawContent`, as a POST of
+those bytes; the HTTP method follows from the request and is never chosen apart from it, so no GET carries a
+body. Legacy transports continue to support ordinary JSON requests;
 advanced request representations require an advertised `WireTransport` capability and fail before
 I/O otherwise. No ordinary wire value can name an absolute destination. Native REST 3.0 batch commands travel as
 an internal JSON-array envelope that the transport must advertise; one physical-attempt classifier
