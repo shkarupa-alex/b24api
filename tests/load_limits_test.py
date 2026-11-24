@@ -19,15 +19,23 @@ from b24api.batch.engine import BatchExecutor
 from b24api.batch.outcome import BatchFailure, BatchSuccess
 from b24api.contracts import ResultErrorSpec, ResultSelector
 from b24api.contracts.policy import ExecutionPolicy, RetryPolicy
-from b24api.errors import ApiResponseError, B24ApiError, BudgetExceededError, HTTPGatewayError
-from b24api.execution import Executor, RateCoordinator, WireResponse
+from b24api.errors import (
+    ApiResponseError,
+    B24ApiError,
+    BudgetExceededError,
+    ClientClosedError,
+    FailurePhase,
+    HTTPGatewayError,
+    TransportError,
+)
+from b24api.execution import Executor, RateCoordinator, WireResponse, WorkClass
 from b24api.execution.executor import _Pause, _plan_round, _SendPlan
 from b24api.execution.facts import Execution, execution
 from b24api.testing import ScriptedTransport
 from tests.scripting import ResponderTransport, replies
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Coroutine
 
     from b24api.transport import WireRequest
 
@@ -35,8 +43,16 @@ _JSON = (("content-type", "application/json"),)
 _POLICY = ExecutionPolicy(retry=RetryPolicy(jitter=0))
 
 
+# Loop turns the coordinator's wait lets pass before it moves the clock: every send it granted leaves first.
+_SETTLE_TURNS = 64
+
+
 class _Time:
-    """A virtual clock: the retry sleep (recorded) and the coordinator's wait for a hold (not) advance it."""
+    """A virtual clock: the retry sleep (recorded) and the coordinator's wait for a hold (not) advance it.
+
+    The coordinator's wait moves the clock once the work it let go has run (``_SETTLE_TURNS``), so a send granted as
+    a hold ends leaves at that end, not at the next.
+    """
 
     def __init__(self) -> None:
         self.now = 0.0
@@ -51,6 +67,8 @@ class _Time:
         await asyncio.sleep(0)
 
     async def hold(self, seconds: float) -> None:
+        for _ in range(_SETTLE_TURNS):
+            await asyncio.sleep(0)
         self.now += seconds
         await asyncio.sleep(0)
 
@@ -131,9 +149,10 @@ async def test_a_quota_refusal_without_a_hint_holds_the_host_for_every_request()
 
 
 @pytest.mark.asyncio
-async def test_a_burst_of_quota_refusals_pauses_the_host_once_and_a_refusal_after_the_pause_doubles_it() -> None:
+async def test_a_burst_of_quota_refusals_paces_the_host_once_and_a_refusal_after_the_pause_doubles_the_gap() -> None:
     # Three sends leave together and are all refused: one burst, one pause of the initial delay, counted once in
-    # the cooldown. Refused again after that pause, the next pause doubles; an answer ends the streak.
+    # the cooldown, and the host is paced that gap apart. The first retry after the pause is refused again: the gap
+    # and the pause double. The sends after it go one gap apart, and each answer quickens the pace.
     time = _Time()
     sent_at: list[float] = []
     answers = iter([_refusal("QUERY_LIMIT_EXCEEDED")] * 4 + [{"result": 1}] * 3)
@@ -143,12 +162,13 @@ async def test_a_burst_of_quota_refusals_pauses_the_host_once_and_a_refusal_afte
 
     await asyncio.gather(*(executor.execute(_get(f"crm.item.get{index}"), context=context) for index in range(3)))
     snapshot = await context.snapshot()
+    paced = await executor.coordinator.snapshot()
     await executor.coordinator.close()
 
-    # The fourth send, the first retry after the burst's pause, is refused again: the host waits twice as long.
-    assert sent_at == [0.0, 0.0, 0.0, 0.5, 0.5, 0.5, 1.5]
+    step = 1 / 32 / 0.5  # the rate an answer adds: a 32nd of the initial gap's
+    assert sent_at == pytest.approx([0.0, 0.0, 0.0, 0.5, 1.5, 2.5, 2.5 + 1 / (1 + step)])
     assert snapshot.cooldown_seconds == pytest.approx(1.5)
-    assert executor.coordinator.limit_streak(None, sent_at=2.0) == 1
+    assert paced.pace_gap == pytest.approx(1 / (1 + 3 * step))
 
 
 @pytest.mark.asyncio
@@ -741,6 +761,20 @@ _V3_RATE_LIMIT = WireResponse(
 )
 
 
+def _answer_every_command(wire: WireRequest) -> WireResponse:
+    """Answer a lone call, or each command of an envelope of either dialect, with a success."""
+    if wire.array_body is not None:
+        return WireResponse(
+            200, _JSON, json.dumps({"result": [{"item": 1} for _ in wire.array_body.commands]}).encode()
+        )
+    if wire.method == "batch":
+        commands = wire.parameters["cmd"]
+        assert isinstance(commands, dict)
+        body = {"result": {"result": dict.fromkeys(commands, 1), "result_error": []}}
+        return WireResponse(200, _JSON, json.dumps(body).encode())
+    return WireResponse(200, _JSON, b'{"result":1}')
+
+
 class _BurstThenAnswers(ScriptedTransport):
     """Refuse a burst of sends, all in flight at once, one answer after another as the clock moves; then answer."""
 
@@ -757,49 +791,38 @@ class _BurstThenAnswers(ScriptedTransport):
         self.sent.append(self.time.now)
         number = len(self.sent)
         if number > _BURST:
-            return self._answer(wire)
+            return _answer_every_command(wire)
         if number == _BURST:
             self.turns[0].set()
         await self.turns[number - 1].wait()
         self.time.now += _ANSWER_LAG
         if number < _BURST:
             self.turns[number].set()
-        return self._refusal(wire)
+        return _rate_refusal(self.dialect, wire)
 
-    def _refusal(self, wire: WireRequest) -> WireResponse:
-        if self.dialect in {"call", "classic"}:
-            return _refusal("QUERY_LIMIT_EXCEEDED")
-        if self.dialect == "v3":
-            return _V3_RATE_LIMIT
-        if wire.array_body is not None:
-            elements = [{"error": {"code": "QUERY_LIMIT_EXCEEDED"}} for _ in wire.array_body.commands]
-            return WireResponse(200, _JSON, json.dumps({"result": elements}).encode())
-        commands = wire.parameters["cmd"]
-        assert isinstance(commands, dict)
-        errors = {key: {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "x"} for key in commands}
-        return WireResponse(200, _JSON, json.dumps({"result": {"result": [], "result_error": errors}}).encode())
 
-    @staticmethod
-    def _answer(wire: WireRequest) -> WireResponse:
-        if wire.array_body is not None:
-            return WireResponse(
-                200, _JSON, json.dumps({"result": [{"item": 1} for _ in wire.array_body.commands]}).encode()
-            )
-        if wire.method == "batch":
-            commands = wire.parameters["cmd"]
-            assert isinstance(commands, dict)
-            body = {"result": {"result": dict.fromkeys(commands, 1), "result_error": []}}
-            return WireResponse(200, _JSON, json.dumps(body).encode())
-        return WireResponse(200, _JSON, b'{"result":1}')
+def _rate_refusal(dialect: str, wire: WireRequest, *, code: str = "QUERY_LIMIT_EXCEEDED") -> WireResponse:
+    """A request-rate refusal by the route ``dialect`` names: of a call, of a whole envelope, or of each entry."""
+    if dialect in {"call", "classic"}:
+        return _refusal("QUERY_LIMIT_EXCEEDED")
+    if dialect == "v3":
+        return _V3_RATE_LIMIT
+    if wire.array_body is not None:
+        elements = [{"error": {"code": code}} for _ in wire.array_body.commands]
+        return WireResponse(200, _JSON, json.dumps({"result": elements}).encode())
+    commands = wire.parameters["cmd"]
+    assert isinstance(commands, dict)
+    errors = {key: {"error": code, "error_description": "x"} for key in commands}
+    return WireResponse(200, _JSON, json.dumps({"result": {"result": [], "result_error": errors}}).encode())
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("dialect", ["call", "classic", "v3", "classic_entry", "v3_entry"])
 async def test_a_burst_refused_while_the_clock_moves_pauses_the_host_once(dialect: str) -> None:
     # Three sends leave together and are refused one after another as the clock moves: each refusal is read after the
-    # first began the pause, but every send left before it. The streak counts when a send left, not when its refusal
-    # came back, so the burst never grows it, on every route a refusal comes by: each refusal holds the host for the
-    # initial delay from when it came back, and the pause ends that long after the last.
+    # first began the pause, but every send left before it. The gap widens by when a send left, not when its refusal
+    # came back, so the burst never widens it twice, on every route a refusal comes by: each refusal holds the host
+    # for the initial delay from when it came back, and the pause ends that long after the last.
     time = _Time()
     transport = _BurstThenAnswers(time, dialect)
     executor = _executor(transport, time, max_concurrency=_BURST)
@@ -857,9 +880,9 @@ async def test_a_request_queued_for_a_permit_waits_for_the_hold_the_refusal_that
 
 
 @pytest.mark.asyncio
-async def test_an_answer_to_a_send_that_left_before_the_pause_keeps_the_streak() -> None:
-    # A and B leave together; A is refused, then B is answered. B left before the pause began, so its answer says
-    # nothing of the limit after it: C, refused after the pause, doubles it.
+async def test_an_answer_to_a_send_that_left_before_the_pause_leaves_the_pace_alone() -> None:
+    # A and B leave together; A is refused, then B is answered. B left before the gap widened, so its answer says
+    # nothing of the pace after it: C, refused after the pause, doubles the gap.
     time = _Time()
     sent_at: dict[str, list[float]] = {}
     refused = asyncio.Event()
@@ -957,9 +980,9 @@ async def test_a_time_limit_with_a_hint_holds_its_method_for_the_hint_not_until_
 
 
 @pytest.mark.asyncio
-async def test_a_methods_time_limit_streak_is_its_own_not_the_hosts() -> None:
-    # The host was refused by quota and still counts that streak; the method's first time limit is the first of its
-    # own streak, held for the initial delay.
+async def test_a_methods_time_limit_streak_is_its_own_not_the_hosts_pace() -> None:
+    # The host was refused by quota and is still paced; the method's first time limit is the first of its own
+    # streak, held for the initial delay.
     time = _Time()
     sent_at: list[float] = []
     answers = replies(_refusal("QUERY_LIMIT_EXCEEDED"), _refusal("OPERATION_TIME_LIMIT"), {"result": 1})
@@ -997,22 +1020,26 @@ async def test_a_rest_v3_rate_limit_holds_the_host_by_its_code(status: int) -> N
     assert sent_at == [0.0, 0.5]
 
 
+# The initial gap of 0.5 s, quickened by one answer (a 32nd of its rate), then doubled.
+_QUICKENED = 2 / (1 / 0.5 + 1 / 32 / 0.5)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("status", "code", "held"),
     [
-        (400, "ERROR_ARGUMENT", 0.5),
-        (403, "ACCESS_DENIED", 0.5),
-        (500, "INTERNAL_SERVER_ERROR", 0.5),
+        (400, "ERROR_ARGUMENT", _QUICKENED),
+        (403, "ACCESS_DENIED", _QUICKENED),
+        (500, "INTERNAL_SERVER_ERROR", _QUICKENED),
         (503, "BUSY", 1.0),
     ],
 )
-async def test_a_direct_answer_that_fails_about_anything_but_the_load_ends_the_hosts_streak(
+async def test_a_direct_answer_that_fails_about_anything_but_the_load_quickens_the_hosts_pace(
     status: int, code: str, held: float
 ) -> None:
     # A quota refusal, then a request sent after its pause answered with an ordinary failure, then a quota refusal
-    # again: the failure answered the request, as a command's entry does, so the second refusal starts a new streak
-    # and holds the host for the first backoff. A 503 is about the load: it ends nothing, and the streak doubles.
+    # again: the failure answered the request, so it quickened the pace a step, and the second refusal doubles the
+    # quickened gap. A 503 is about the load: it quickens nothing, and the gap doubles from the initial delay.
     time = _Time()
     executor = _executor(
         ResponderTransport(
@@ -1246,14 +1273,14 @@ _ENVELOPE_REFUSALS = {
 @pytest.mark.parametrize(
     ("code", "scope", "held"),
     [
-        # The envelope's own failure is an answer from the host: it ends the host's streak, so the next quota
-        # refusal holds for the first backoff again.
-        ("QUERY_LIMIT_EXCEEDED", frozenset[str](), _FIRST_BACKOFF),
+        # The envelope's own failure is an answer from the host: it quickens the host's pace a step, so the next
+        # quota refusal doubles the quickened gap.
+        ("QUERY_LIMIT_EXCEEDED", frozenset[str](), 2 / (1 / _FIRST_BACKOFF + 1 / 32 / _FIRST_BACKOFF)),
         # It answers about no command's method: the method's time-limit streak goes on to the second backoff.
         ("OPERATION_TIME_LIMIT", frozenset({"crm.item.get"}), _SECOND_BACKOFF),
     ],
 )
-async def test_an_envelope_refused_whole_for_no_load_limit_ends_the_hosts_streak_and_no_methods(
+async def test_an_envelope_refused_whole_for_no_load_limit_quickens_the_hosts_pace_and_ends_no_methods_streak(
     code: str, scope: frozenset[str], held: float, route: RouteKind
 ) -> None:
     time = _Time()
@@ -1283,9 +1310,9 @@ async def test_an_envelope_refused_whole_for_no_load_limit_ends_the_hosts_streak
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route", [RouteKind.BARE, RouteKind.API_V3])
-async def test_an_envelope_refused_whole_with_a_load_status_keeps_the_hosts_streak(route: RouteKind) -> None:
-    # A 503 that names no limit is still an answer about the load, for an envelope as for a lone request: it ends
-    # no streak, so the quota refusal after it holds the host for the second backoff.
+async def test_an_envelope_refused_whole_with_a_load_status_leaves_the_hosts_pace_alone(route: RouteKind) -> None:
+    # A 503 that names no limit is still an answer about the load, for an envelope as for a lone request: it
+    # quickens nothing, so the quota refusal after it doubles the gap to the second backoff.
     time = _Time()
     transport = _InTurn(
         _refusal("QUERY_LIMIT_EXCEEDED"), _refusal("BUSY", status=503), _refusal("QUERY_LIMIT_EXCEEDED")
@@ -1372,3 +1399,637 @@ async def test_a_command_held_out_after_its_load_answer_keeps_what_its_earlier_s
     assert isinstance(outcome, BatchFailure)
     assert execution(outcome.error) is Execution.POSSIBLY_RUN
     assert isinstance(outcome.error.__cause__, HTTPGatewayError)
+
+
+# --- The host's pace ---------------------------------------------------------------------------------------------
+
+
+_GAP = 0.5
+_UNPACED_AFTER = 480  # answers: the rate climbs from 1 / 0.5 by 1 / (0.5 * 32) per answer to 16 / 0.5
+
+
+def _paced(time: _Time) -> RateCoordinator:
+    coordinator = RateCoordinator(clock=time.clock, sleep=time.hold)
+    assert coordinator.slow_host(sent_at=0.0, initial=_GAP, factor=2.0, maximum=4.0) == _GAP
+    return coordinator
+
+
+@pytest.mark.asyncio
+async def test_a_paced_host_grants_one_permit_per_gap_and_its_wake_task_grants_the_next() -> None:
+    # Each permit is released at once, so no release is left to grant the next one: the wake task grants each when the
+    # gap since the one before has passed.
+    time = _Time()
+    coordinator = _paced(time)
+    granted: list[float] = []
+
+    async def send() -> None:
+        permit = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"crm.item.get"}))
+        granted.append(time.now)
+        await permit.release()
+
+    await asyncio.gather(*(send() for _ in range(4)))
+    await coordinator.close()
+
+    assert granted == [0.0, 0.5, 1.0, 1.5]
+
+
+def test_a_quota_refusal_widens_the_gap_once_per_burst_by_the_backoff_up_to_its_maximum() -> None:
+    # A refusal of a send that left before the gap last widened belongs to the burst that widening answers.
+    time = _Time()
+    coordinator = _paced(time)
+    assert coordinator.slow_host(sent_at=0.0, initial=_GAP, factor=2.0, maximum=4.0) == _GAP
+    gaps = []
+    for sent_at in (0.5, 1.0, 1.5, 2.0, 2.5):
+        time.now = sent_at + 0.1
+        gaps.append(coordinator.slow_host(sent_at=sent_at, initial=_GAP, factor=2.0, maximum=4.0))
+        gaps.append(coordinator.slow_host(sent_at=sent_at, initial=_GAP, factor=2.0, maximum=4.0))
+
+    assert gaps == [1.0, 1.0, 2.0, 2.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0]
+
+
+@pytest.mark.asyncio
+async def test_answers_after_the_gap_widened_quicken_the_pace_until_the_host_is_unpaced() -> None:
+    # Each answer raises the rate the gap allows by a step; an answer to a send that left before the gap widened says
+    # nothing of the pace it set.
+    time = _Time()
+    coordinator = _paced(time)
+    coordinator.speed_host(sent_at=0.0)
+    assert (await coordinator.snapshot()).pace_gap == _GAP
+
+    coordinator.speed_host(sent_at=0.1)
+    assert (await coordinator.snapshot()).pace_gap == pytest.approx(1 / (1 / _GAP + 1 / (_GAP * 32)))
+    for _ in range(_UNPACED_AFTER - 10):
+        coordinator.speed_host(sent_at=0.1)
+    assert (await coordinator.snapshot()).pace_gap > 0
+    for _ in range(10):
+        coordinator.speed_host(sent_at=0.1)
+    assert (await coordinator.snapshot()).pace_gap == 0
+    await coordinator.close()
+
+
+class _AnswersEveryCommand(ScriptedTransport):
+    """Answer every send, a lone call or an envelope of either dialect, with a success for each of its commands."""
+
+    def __init__(self) -> None:
+        super().__init__(())
+
+    async def send_wire(self, wire: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        del attempt_timeout, max_response_bytes
+        return _answer_every_command(wire)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", [RouteKind.BARE, RouteKind.API_V3])
+async def test_a_batch_answered_whole_quickens_the_pace_once_not_once_per_command(route: RouteKind) -> None:
+    # The portal counts a batch as one request: its commands' entries are no sends of their own.
+    time = _Time()
+    executor = _executor(_AnswersEveryCommand(), time)
+    executor.coordinator.slow_host(sent_at=0.0, initial=_GAP, factor=2.0, maximum=4.0)
+    time.now = 1.0
+    chunk = tuple(
+        _Command(
+            index, f"c{index:012d}", Request(f"crm.item.get{index}", {"id": 1}, ReplaySafety.SAFE, route=route), None
+        )
+        for index in range(3)
+    )
+
+    outcomes = await BatchExecutor(executor).execute_chunk(chunk, context=executor.context(_POLICY), halt=False)
+    paced = await executor.coordinator.snapshot()
+    await executor.coordinator.close()
+
+    assert all(isinstance(outcome, BatchSuccess) for outcome in outcomes)
+    assert paced.pace_gap == pytest.approx(1 / (1 / _GAP + 1 / (_GAP * 32)))
+
+
+@pytest.mark.asyncio
+async def test_a_permit_whose_send_never_left_gives_its_pace_slot_back() -> None:
+    # The pace spaces sends, not permits: the permit after one whose send was refused goes at once.
+    time = _Time()
+    coordinator = _paced(time)
+    unsent = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"crm.item.get"}))
+    unsent.unsent()
+    await unsent.release()
+
+    sent = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"crm.item.get"}))
+    granted_at = time.now
+    await sent.release()
+    held = coordinator.admission_delay(frozenset())
+    await coordinator.close()
+
+    assert granted_at == 0.0
+    assert held == _GAP
+
+
+@pytest.mark.asyncio
+async def test_a_policy_with_no_initial_delay_paces_nothing_even_after_one_that_did() -> None:
+    # Policies are per call: a refusal under one with no initial delay unpaces the host, and answers then quicken
+    # nothing.
+    time = _Time()
+    coordinator = _paced(time)
+    time.now = 1.0
+
+    assert coordinator.slow_host(sent_at=0.5, initial=0.0, factor=2.0, maximum=30.0) == 0.0
+    coordinator.speed_host(sent_at=0.5)
+    assert coordinator.admission_delay(frozenset()) == 0.0
+    assert (await coordinator.snapshot()).pace_gap == 0.0
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_a_paced_host_keeps_the_batch_share_of_the_work_class_cycle() -> None:
+    # One interactive and one batch worker, each queued again as soon as its permit is released: the pace holds every
+    # grant between gaps, and a held grant takes no turn, so batches keep their third of the sends it lets through.
+    time = _Time()
+    coordinator = _paced(time)
+    order: list[WorkClass] = []
+    grants = 30
+
+    async def worker(work_class: WorkClass) -> None:
+        while len(order) < grants:
+            permit = await coordinator.acquire(work_class, methods=frozenset({"crm.item.get"}))
+            order.append(work_class)
+            await permit.release()
+
+    await asyncio.gather(worker(WorkClass.INTERACTIVE_DIRECT), worker(WorkClass.BATCH))
+    await coordinator.close()
+
+    assert order[:grants].count(WorkClass.BATCH) == grants // 3
+
+
+@pytest.mark.asyncio
+async def test_a_host_unpaced_after_a_grant_holds_nothing_for_the_gap_it_had_set() -> None:
+    # A grant at 0 set the next one a gap later; a refusal under a policy with no initial delay then unpaces the host,
+    # and that deadline no longer holds anything.
+    time = _Time()
+    coordinator = _paced(time)
+    await (await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"crm.item.get"}))).release()
+    time.now = 0.1
+
+    assert coordinator.slow_host(sent_at=0.05, initial=0.0, factor=2.0, maximum=30.0) == 0.0
+    assert coordinator.admission_delay(frozenset({"crm.item.get"})) == 0.0
+    await (await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"crm.item.get"}))).release()
+    assert time.now == pytest.approx(0.1)
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_a_paced_waiter_is_granted_at_the_gap_while_the_wake_task_sleeps_for_a_later_method_hold() -> None:
+    # The wake task sleeps until a method's hold ends at 10; a permit the pace holds back must wake it at 0.5 instead.
+    time = _Time()
+    coordinator = _paced(time)
+    coordinator.hold_method("crm.item.list", 10.0)
+    held = asyncio.create_task(coordinator.acquire(WorkClass.TRAVERSAL_DIRECT, methods=frozenset({"crm.item.list"})))
+    await asyncio.sleep(0)
+    await (await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"crm.item.get"}))).release()
+
+    await (await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"crm.item.get"}))).release()
+
+    assert time.now == pytest.approx(0.5)
+    assert not held.done()
+    held.cancel()
+    await asyncio.gather(held, return_exceptions=True)
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_a_send_its_transport_refuses_for_good_before_it_leaves_gives_its_pace_slot_back() -> None:
+    # A closed transport refuses the first send before it leaves the process: the next send takes that send's slot at
+    # once, as the pace spaces what leaves, not what it grants.
+    time = _Time()
+    sent_at: list[float] = []
+    answers: list[object] = [ClientClosedError("transport is closed"), {"result": True}]
+
+    def respond(_request: Request) -> object:
+        sent_at.append(time.now)
+        return answers.pop(0)
+
+    executor = Executor(
+        ResponderTransport(respond),
+        coordinator=_paced(time),
+        clock=time.clock,
+        sleep=time.sleep,
+        random_source=lambda: 0.5,
+    )
+    with pytest.raises(ClientClosedError):
+        await executor.execute(Request.bare("crm.item.get", replay_safety=ReplaySafety.SAFE))
+    await executor.execute(Request.bare("crm.item.get", replay_safety=ReplaySafety.SAFE))
+
+    assert sent_at == [0.0, 0.0]
+
+
+@pytest.mark.asyncio
+async def test_an_unsent_permit_gives_back_no_slot_a_later_grant_took() -> None:
+    # A is granted at 0 and B at 0.5, a gap later; A's send then never leaves. B's slot stands: the next permit waits
+    # a gap after B, not after nothing.
+    time = _Time()
+    coordinator = _paced(time)
+    first = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"crm.item.get"}))
+    time.now = 0.5
+    second = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"crm.item.get"}))
+    first.unsent()
+    await first.release()
+    held = coordinator.admission_delay(frozenset())
+    await second.release()
+    await coordinator.close()
+
+    assert held == _GAP
+
+
+async def _never(_seconds: float) -> None:
+    """A coordinator's wake that never ends: only releases grant permits."""
+    await asyncio.get_running_loop().create_future()
+
+
+@pytest.mark.asyncio
+async def test_a_permit_granted_to_a_waiter_cancelled_before_it_woke_gives_its_slot_back() -> None:
+    # The pace holds a waiter; a release grants it its permit, and it is cancelled before it wakes to take it. The
+    # permit goes back with its slot, so the next one is not held a gap for a send that never left.
+    time = _Time()
+    coordinator = RateCoordinator(clock=time.clock, sleep=_never)
+    coordinator.slow_host(sent_at=0.0, initial=_GAP, factor=2.0, maximum=4.0)
+    held = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"crm.item.get"}))
+    waiter = asyncio.create_task(coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"crm.item.get"})))
+    await asyncio.sleep(0)
+    time.now = 0.6
+    held.release_now()
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    delay = coordinator.admission_delay(frozenset())
+    await coordinator.close()
+
+    assert delay == 0.0
+
+
+class _RefusesEverySend(ScriptedTransport):
+    """Refuse every send for a limit (the request rate by default), by the route ``dialect`` names."""
+
+    def __init__(self, dialect: str, code: str = "QUERY_LIMIT_EXCEEDED") -> None:
+        super().__init__(())
+        self.dialect = dialect
+        self.code = code
+
+    async def send_wire(self, wire: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        del attempt_timeout, max_response_bytes
+        return _rate_refusal(self.dialect, wire, code=self.code)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dialect", ["call", "classic", "v3", "classic_entry", "v3_entry"])
+async def test_a_send_refused_for_the_rate_widens_the_gap_by_the_factor_on_every_route(dialect: str) -> None:
+    # One send, after the gap widened, refused for the request rate: a batch envelope is one send and its answer one
+    # answer, so a refusal in its entries makes the whole answer one about the load. It never quickens the pace first.
+    time = _Time()
+    executor = _executor(_RefusesEverySend(dialect), time)
+    executor.coordinator.slow_host(sent_at=0.0, initial=_GAP, factor=2.0, maximum=4.0)
+    time.now = 1.0
+    retry = RetryPolicy(initial_delay=_GAP, backoff=2.0, maximum_delay=4.0, jitter=0)
+    context = executor.context(ExecutionPolicy(max_attempts_per_request=1, retry=retry))
+    route = RouteKind.API_V3 if dialect.startswith("v3") else RouteKind.BARE
+    spec = ResultErrorSpec(ResultSelector(("error",)), ("code",)) if dialect == "v3_entry" else None
+    request = Request("crm.item.get", {"id": 1}, ReplaySafety.SAFE, route=route, result_error=spec)
+
+    if dialect == "call":
+        with pytest.raises(B24ApiError):
+            await executor.execute(request, context=context)
+    else:
+        chunk = (_Command(0, "c000000000000", request, None),)
+        (outcome,) = await BatchExecutor(executor).execute_chunk(chunk, context=context, halt=False)
+        assert isinstance(outcome, BatchFailure)
+    paced = await executor.coordinator.snapshot()
+    await executor.coordinator.close()
+
+    assert paced.pace_gap == 2 * _GAP
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dialect", ["classic_entry", "v3_entry"])
+async def test_a_batch_whose_entries_hit_a_methods_time_limit_leaves_the_hosts_pace_alone(dialect: str) -> None:
+    # A time limit holds its method, not the host; it is still an answer about the load, so it quickens nothing.
+    time = _Time()
+    executor = _executor(_RefusesEverySend(dialect, "OPERATION_TIME_LIMIT"), time)
+    executor.coordinator.slow_host(sent_at=0.0, initial=_GAP, factor=2.0, maximum=4.0)
+    time.now = 1.0
+    context = executor.context(ExecutionPolicy(max_attempts_per_request=1, retry=RetryPolicy(jitter=0)))
+    route = RouteKind.API_V3 if dialect.startswith("v3") else RouteKind.BARE
+    spec = ResultErrorSpec(ResultSelector(("error",)), ("code",)) if dialect == "v3_entry" else None
+    request = Request("crm.item.get", {"id": 1}, ReplaySafety.SAFE, route=route, result_error=spec)
+
+    (outcome,) = await BatchExecutor(executor).execute_chunk(
+        (_Command(0, "c000000000000", request, None),), context=context, halt=False
+    )
+    paced = await executor.coordinator.snapshot()
+    await executor.coordinator.close()
+
+    assert isinstance(outcome, BatchFailure)
+    assert paced.pace_gap == _GAP
+
+
+class _AnswersWithNoEntries(ScriptedTransport):
+    """Answer every envelope of either dialect with a success whose entries cannot be read."""
+
+    def __init__(self) -> None:
+        super().__init__(())
+
+    async def send_wire(self, wire: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        del wire, attempt_timeout, max_response_bytes
+        return WireResponse(200, _JSON, b'{"result":"no entries"}')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", [RouteKind.BARE, RouteKind.API_V3])
+async def test_an_envelope_answer_whose_entries_cannot_be_read_quickens_the_pace_once(route: RouteKind) -> None:
+    # It is still the send's answer, and none about the load.
+    time = _Time()
+    executor = _executor(_AnswersWithNoEntries(), time)
+    executor.coordinator.slow_host(sent_at=0.0, initial=_GAP, factor=2.0, maximum=4.0)
+    time.now = 1.0
+    request = Request("crm.item.get", {"id": 1}, ReplaySafety.SAFE, route=route)
+    context = executor.context(ExecutionPolicy(max_attempts_per_request=1, retry=RetryPolicy(jitter=0)))
+
+    (outcome,) = await BatchExecutor(executor).execute_chunk(
+        (_Command(0, "c000000000000", request, None),), context=context, halt=False
+    )
+    paced = await executor.coordinator.snapshot()
+    await executor.coordinator.close()
+
+    assert isinstance(outcome, BatchFailure)
+    assert paced.pace_gap == pytest.approx(1 / (1 / _GAP + 1 / (_GAP * 32)))
+
+
+class _FirstEntryAnswered(ScriptedTransport):
+    """Answer an envelope of either dialect: its first command with a success, the rest with ``ERROR_NOT_FOUND``."""
+
+    def __init__(self) -> None:
+        super().__init__(())
+
+    async def send_wire(self, wire: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        del attempt_timeout, max_response_bytes
+        if wire.array_body is not None:
+            elements = [{"item": 1}] + [{"error": {"code": "ERROR_NOT_FOUND"}}] * (len(wire.array_body.commands) - 1)
+            return WireResponse(200, _JSON, json.dumps({"result": elements}).encode())
+        commands = wire.parameters["cmd"]
+        assert isinstance(commands, dict)
+        first, *rest = commands
+        errors = {key: {"error": "ERROR_NOT_FOUND", "error_description": "x"} for key in rest}
+        body = {"result": {"result": {first: 1}, "result_error": errors}}
+        return WireResponse(200, _JSON, json.dumps(body).encode())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", [RouteKind.BARE, RouteKind.API_V3])
+async def test_a_batch_whose_entry_fails_about_no_load_quickens_the_pace_once(route: RouteKind) -> None:
+    # A failed entry is an answer of its own command, not a send: the envelope's answer is still read once.
+    time = _Time()
+    executor = _executor(_FirstEntryAnswered(), time)
+    executor.coordinator.slow_host(sent_at=0.0, initial=_GAP, factor=2.0, maximum=4.0)
+    time.now = 1.0
+    spec = ResultErrorSpec(ResultSelector(("error",)), ("code",)) if route is RouteKind.API_V3 else None
+    chunk = tuple(
+        _Command(
+            index,
+            f"c{index:012d}",
+            Request(f"crm.item.get{index}", {"id": 1}, ReplaySafety.SAFE, route=route, result_error=spec),
+            None,
+        )
+        for index in range(2)
+    )
+    context = executor.context(ExecutionPolicy(max_attempts_per_request=1, retry=RetryPolicy(jitter=0)))
+
+    outcomes = await BatchExecutor(executor).execute_chunk(chunk, context=context, halt=False)
+    paced = await executor.coordinator.snapshot()
+    await executor.coordinator.close()
+
+    assert [type(outcome) for outcome in outcomes] == [BatchSuccess, BatchFailure]
+    assert paced.pace_gap == pytest.approx(1 / (1 / _GAP + 1 / (_GAP * 32)))
+
+
+@pytest.mark.asyncio
+async def test_a_classic_batch_of_a_batch_command_reads_its_envelopes_answer_once() -> None:
+    # The command's method shares the envelope's name: the envelope is still the batch's, its answer its commands'.
+    time = _Time()
+    executor = _executor(_AnswersEveryCommand(), time)
+    executor.coordinator.slow_host(sent_at=0.0, initial=_GAP, factor=2.0, maximum=4.0)
+    time.now = 1.0
+    nested = Request("batch", {"cmd": {"a": "crm.item.get?id=1"}}, ReplaySafety.SAFE, route=RouteKind.BARE)
+
+    (outcome,) = await BatchExecutor(executor).execute_chunk(
+        (_Command(0, "c000000000000", nested, None),), context=executor.context(_POLICY), halt=False
+    )
+    paced = await executor.coordinator.snapshot()
+    await executor.coordinator.close()
+
+    assert isinstance(outcome, BatchSuccess)
+    assert paced.pace_gap == pytest.approx(1 / (1 / _GAP + 1 / (_GAP * 32)))
+
+
+@pytest.mark.asyncio
+async def test_waiters_held_by_the_pace_start_one_wake_task_not_one_each(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The wake task reads every deadline when it first runs: a waiter queued before then needs no task of its own.
+    time = _Time()
+    coordinator = _paced(time)
+    started: list[str] = []
+    create_task = asyncio.create_task
+
+    def counted(coroutine: Coroutine[object, object, object], *, name: str | None = None) -> asyncio.Task[object]:
+        started.append(name or "")
+        return create_task(coroutine, name=name)
+
+    first = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"crm.item.get"}))
+    await first.release()
+    monkeypatch.setattr(asyncio, "create_task", counted)
+
+    async def send() -> None:
+        permit = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"crm.item.get"}))
+        await permit.release()
+
+    await asyncio.gather(*(send() for _ in range(4)))
+    monkeypatch.undo()
+    await coordinator.close()
+
+    assert started.count("b24api-rate-wake") == 1
+
+
+@pytest.mark.asyncio
+async def test_a_permit_handed_back_for_a_method_held_before_its_waiter_woke_gives_its_slot_back() -> None:
+    # A release grants the first waiter its permit; its method is held before it wakes, so it hands the permit back and
+    # waits again. The permit goes back with its slot: the waiter behind it, for another method, goes at once.
+    time = _Time()
+    coordinator = RateCoordinator(clock=time.clock, sleep=_never)
+    coordinator.slow_host(sent_at=0.0, initial=_GAP, factor=2.0, maximum=4.0)
+    held = await coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"crm.item.get"}))
+    first = asyncio.create_task(coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"crm.item.list"})))
+    behind = asyncio.create_task(coordinator.acquire(WorkClass.INTERACTIVE_DIRECT, methods=frozenset({"crm.deal.get"})))
+    await asyncio.sleep(0)
+    released_at = time.now = 0.6
+    held.release_now()
+    coordinator.hold_method("crm.item.list", 10.0)
+    permit = await behind
+
+    assert time.now == released_at
+    assert not first.done()
+    permit.release_now()
+    first.cancel()
+    await asyncio.gather(first, return_exceptions=True)
+    await coordinator.close()
+
+
+def _paced_executor(time: _Time, respond: Callable[[Request], object]) -> Executor:
+    return Executor(
+        ResponderTransport(respond),
+        coordinator=_paced(time),
+        clock=time.clock,
+        sleep=time.sleep,
+        random_source=lambda: 0.5,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_send_cancelled_after_it_left_keeps_its_pace_slot() -> None:
+    # The first send leaves and hangs, and its caller cancels it: it may have reached the portal, so the next send
+    # waits a gap after it.
+    time = _Time()
+    sent_at: list[float] = []
+    left = asyncio.Event()
+    hang = asyncio.get_running_loop().create_future()
+
+    async def respond(_request: Request) -> object:
+        sent_at.append(time.now)
+        if len(sent_at) == 1:
+            left.set()
+            await hang
+        return {"result": True}
+
+    executor = _paced_executor(time, respond)
+    first = asyncio.create_task(executor.execute(Request.bare("crm.item.get", replay_safety=ReplaySafety.SAFE)))
+    await left.wait()
+    time.now = 0.1
+    first.cancel()
+    await asyncio.gather(first, return_exceptions=True)
+    await executor.execute(Request.bare("crm.item.get", replay_safety=ReplaySafety.SAFE))
+    await executor.coordinator.close()
+
+    assert sent_at == [0.0, _GAP]
+
+
+@pytest.mark.asyncio
+async def test_a_send_its_operations_request_budget_refuses_gives_its_pace_slot_back() -> None:
+    # Five reads of an operation allowed three requests pass its budget as they queue, before any is spent; the pace
+    # grants them one per gap, so the last two are refused after their permits took a slot. Both slots come back:
+    # another operation's read goes at once, not two gaps later.
+    time = _Time()
+    sent: list[tuple[str, float]] = []
+
+    def respond(request: Request) -> object:
+        sent.append((request.method, time.now))
+        return {"result": True}
+
+    executor = _paced_executor(time, respond)
+    budgeted = executor.context(ExecutionPolicy(max_requests=3, retry=RetryPolicy(jitter=0)))
+
+    reads = [(f"crm.{name}.get", budgeted) for name in "abcde"] + [("crm.x.get", executor.context(_POLICY))]
+
+    outcomes = await asyncio.gather(
+        *(
+            executor.execute(Request.bare(method, replay_safety=ReplaySafety.SAFE), context=context)
+            for method, context in reads
+        ),
+        return_exceptions=True,
+    )
+    await executor.coordinator.close()
+
+    assert [type(outcome) for outcome in outcomes[3:5]] == [BudgetExceededError, BudgetExceededError]
+    assert [method for method, _ in sent] == ["crm.a.get", "crm.b.get", "crm.c.get", "crm.x.get"]
+    # One gap after the last send, as quickened by the answer before it, not three.
+    assert sent[3][1] == pytest.approx(sent[2][1] + 1 / (1 / _GAP + 1 / (_GAP * 32)))
+
+
+@pytest.mark.asyncio
+async def test_a_refused_connection_is_a_send_and_keeps_its_pace_slot() -> None:
+    # A retryable failure before dispatch spends its attempt as any send does, and the pace spaces it as one.
+    time = _Time()
+    sent_at: list[float] = []
+
+    def respond(_request: Request) -> object:
+        sent_at.append(time.now)
+        if len(sent_at) == 1:
+            return TransportError("connection refused", phase=FailurePhase.NOT_DISPATCHED, retryable=True)
+        return {"result": True}
+
+    executor = _paced_executor(time, respond)
+    once = ExecutionPolicy(max_attempts_per_request=1, retry=RetryPolicy(jitter=0))
+    with pytest.raises(BudgetExceededError):
+        await executor.execute(Request.bare("crm.item.get", replay_safety=ReplaySafety.SAFE), policy=once)
+    await executor.execute(Request.bare("crm.item.get", replay_safety=ReplaySafety.SAFE))
+    await executor.coordinator.close()
+
+    assert sent_at == [0.0, _GAP]
+
+
+@pytest.mark.asyncio
+async def test_an_answer_quickens_the_pace_by_a_step_of_the_initial_delay_that_last_paced_the_host() -> None:
+    # Policies are per call: a host one policy paced and answers unpaced is paced again by another, whose initial
+    # delay is the step's measure from then on.
+    time = _Time()
+    coordinator = _paced(time)
+    while (await coordinator.snapshot()).pace_gap:
+        coordinator.speed_host(sent_at=0.1)
+    time.now = 10.0
+    coordinator.slow_host(sent_at=9.9, initial=2.0, factor=2.0, maximum=30.0)
+    coordinator.speed_host(sent_at=10.1)
+    paced = await coordinator.snapshot()
+    await coordinator.close()
+
+    assert paced.pace_gap == pytest.approx(1 / (1 / 2.0 + 1 / (2.0 * 32)))
+
+
+# The portal's request-rate limit, a leaky bucket (2 requests a second, 50 at once), in time 20 times faster.
+_SCALE = 20.0
+_LEAK = 2.0 * _SCALE
+_BUCKET = 50
+_READS = 120
+
+
+class _LeakyBucket:
+    def __init__(self) -> None:
+        self.level = 0.0
+        self.at = wall.monotonic()
+
+    def admits(self) -> bool:
+        now = wall.monotonic()
+        self.level = max(0.0, self.level - (now - self.at) * _LEAK)
+        self.at = now
+        if self.level + 1 > _BUCKET:
+            return False
+        self.level += 1
+        return True
+
+
+@pytest.mark.asyncio
+async def test_safe_reads_over_a_saturated_rate_limit_all_succeed_at_its_rate() -> None:
+    # T-2: ten workers send more SAFE reads than the bucket holds, and the portal refuses with HTTP 503
+    # QUERY_LIMIT_EXCEEDED and no hint. A pause alone let every waiter send again at once, so most were refused
+    # again and spent their attempts; paced, the client finds the portal's rate: every read succeeds, and few sends
+    # are refused.
+    bucket = _LeakyBucket()
+
+    async def respond(_request: Request) -> object:
+        await asyncio.sleep(0.1 / _SCALE)
+        return {"result": 1} if bucket.admits() else _refusal("QUERY_LIMIT_EXCEEDED")
+
+    transport = ResponderTransport(respond)
+    executor = Executor(transport, coordinator=RateCoordinator())
+    policy = ExecutionPolicy(retry=RetryPolicy(initial_delay=0.5 / _SCALE, maximum_delay=30 / _SCALE))
+    context = executor.context(policy)
+    reads = list(range(_READS))
+
+    async def worker() -> None:
+        while reads:
+            reads.pop()
+            await executor.execute(_get(), context=context)
+
+    await asyncio.gather(*(worker() for _ in range(10)))
+    await executor.coordinator.close()
+
+    # A few sends are refused while the pace finds the rate.
+    assert len(transport.requests) <= _READS * 5 / 4

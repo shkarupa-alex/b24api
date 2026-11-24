@@ -22,6 +22,13 @@ _HTTP_STATUS_MAXIMUM = 599
 _RETRY_AFTER_CAP_SECONDS = 3_600.0
 _METHOD_LIMIT_CAP = 1_024
 _WAKE_TASK_NAME = "b24api-rate-wake"
+# An answer raises the rate the host's send gap allows by this fraction of the initial gap's rate: the pace finds the
+# portal's rate again in a few dozen answers after a refusal. With the default half-second initial gap, answers at the
+# pace unpace the host in about a minute from a one-second gap and about two from a thirty-second one; a step relative
+# to the gap would take a quarter of an hour.
+# Past ``_PACE_UNPACED_RATE`` times the initial gap's rate the host is no longer paced.
+_PACE_STEP = 1 / 32
+_PACE_UNPACED_RATE = 16
 FOREIGN_LOOP = "a Bitrix24 client serves the one event loop it was first used in; create a client per event loop"
 
 
@@ -45,11 +52,20 @@ class CoordinatorBudgetError(TimeoutError):
     """Admission could not finish before its monotonic deadline."""
 
 
+@dataclass(frozen=True, slots=True)
+class _Slot:
+    """The pace slot a permit was granted in: when the grant set the next permit's earliest moment."""
+
+    next_at: float
+
+
 @dataclass(slots=True)
 class _Waiter:
     future: asyncio.Future[None]
     methods: frozenset[str]
     arrival: int
+    # The pace slot of the permit granted to it, if the host was paced.
+    slot: _Slot | None = None
 
 
 def _requeue(queue: deque[_Waiter], waiter: _Waiter) -> None:
@@ -85,11 +101,15 @@ class CoordinatorSnapshot:
     active_permits: int
     queued: tuple[tuple[WorkClass, int], ...]
     method_cooldowns: int = 0
+    # The seconds between the host's sends while a request-rate refusal paces it; 0 when it is not paced.
+    pace_gap: float = 0.0
 
 
 class _Permit:
-    def __init__(self, coordinator: RateCoordinator) -> None:
+    def __init__(self, coordinator: RateCoordinator, slot: _Slot | None) -> None:
         self._coordinator = coordinator
+        self._slot = slot
+        self._unsent = False
         self._released = False
 
     async def __aenter__(self) -> Self:
@@ -101,20 +121,46 @@ class _Permit:
     async def release(self) -> None:
         self.release_now()
 
+    def unsent(self) -> None:
+        """Mark the permit's send as never left: its release gives its pace slot back.
+
+        The pace spaces the sends, not the permits: a send refused after its permit (by the deadline, the retry window
+        or the attempt budget) takes no slot from the one behind it.
+        """
+        self._unsent = True
+
     def release_now(self) -> None:
         """Return capacity synchronously and only then mark the permit released."""
         if self._released:
             return
-        self._coordinator._release_now()  # noqa: SLF001
+        self._coordinator._release_now(self._slot if self._unsent else None)  # noqa: SLF001
         self._released = True
 
 
 @dataclass(slots=True)
 class _Streak:
-    """Consecutive limit refusals of one scope (the host, or a method), and when the latest pause for them began."""
+    """Consecutive operating-time refusals of one method, and when the latest pause for them began."""
 
     count: int
     since: float
+
+
+@dataclass(slots=True)
+class _Pace:
+    """The host's send pace under its request-rate limit: at most one permit granted per ``gap`` seconds.
+
+    The portal limits the requests of a webhook by rate (a leaky bucket), so pausing alone sends the waiting requests
+    in a burst that is refused again. A refusal widens the gap; the answers narrow it again, a little each, until
+    the host is no longer paced (``gap == 0``).
+    """
+
+    gap: float = 0.0
+    # The gap a refusal of an unpaced host sets: the answers quicken the pace in steps of its rate.
+    initial: float = 0.0
+    # The earliest moment the next permit may be granted.
+    next_at: float = -math.inf
+    # When the gap last widened: a refusal of a send that left before then belongs to the burst it answers.
+    since: float = -math.inf
 
 
 def _check_admission(work_class: WorkClass, methods: frozenset[str], budget: DeadlineBudget | None) -> None:
@@ -158,8 +204,11 @@ class RateCoordinator:
         self._method_until: dict[str, float] = {}
         # The monotonic moment each method's operating time resets, as its latest answer gave it.
         self._method_reset: dict[str, float] = {}
-        # Limit refusals in a row, by scope: ``None`` for the host, a method name for that method.
-        self._streaks: dict[str | None, _Streak] = {}
+        # Operating-time refusals in a row, by method.
+        self._streaks: dict[str, _Streak] = {}
+        self._pace = _Pace()
+        # When the wake task wakes next, as it last read its deadlines; ``None`` once it has none left.
+        self._wake_at: float | None = None
         self._host: str | None = None
         self._retry_turn = False
         self._cycle_index = 0
@@ -210,21 +259,21 @@ class RateCoordinator:
                     await waiter.future
                     if self._closed():
                         # Closed between the grant and this wake-up: the send is refused as a queued one is.
-                        self._return_granted()
+                        self._return_granted(waiter)
                         raise ClientClosedError("rate coordinator is closed")
                     if self._still_admits(methods):
-                        return _Permit(self)
+                        return _Permit(self, waiter.slot)
                     # The answer that freed this permit held the host or a method of ``methods`` before this waiter
                     # woke: the permit goes back, and the waiter keeps the place its arrival gave it, ahead of
                     # every waiter that queued after it.
-                    self._return_granted()
+                    self._return_granted(waiter)
                     waiter = _Waiter(loop.create_future(), methods, waiter.arrival)
                     _requeue(queue, waiter)
         except (asyncio.CancelledError, TimeoutError) as error:
             future = waiter.future
             was_granted = future.done() and not future.cancelled() and future.exception() is None
             if was_granted:
-                self._return_granted()
+                self._return_granted(waiter)
             else:
                 with contextlib.suppress(ValueError):
                     queue.remove(waiter)
@@ -284,31 +333,65 @@ class RateCoordinator:
         if method in self._method_reset or len(self._method_reset) < _METHOD_LIMIT_CAP:
             self._method_reset[method] = now + min(delay, _RETRY_AFTER_CAP_SECONDS)
 
-    def limit_streak(self, scope: str | None, *, sent_at: float) -> int:
-        """Count a limit refusal of ``scope`` (``None``: the host) for a send that left at ``sent_at``.
+    def limit_streak(self, method: str, *, sent_at: float) -> int:
+        """Count an operating-time refusal of ``method`` for a send that left at ``sent_at``.
 
-        A send that left after the latest pause of its scope began was refused again after that pause: the
+        A send that left after the latest pause of the method began was refused again after that pause: the
         streak grows. One that left before it, or as it began, belongs to the burst that pause answers: the
         streak stays.
         """
-        streak = self._streaks.get(scope)
+        streak = self._streaks.get(method)
         if streak is not None and sent_at <= streak.since:
             return streak.count
-        if streak is None and scope is not None and len(self._streaks) >= _METHOD_LIMIT_CAP:
-            del self._streaks[next(name for name in self._streaks if name is not None)]
+        if streak is None and len(self._streaks) >= _METHOD_LIMIT_CAP:
+            del self._streaks[next(iter(self._streaks))]
         count = 1 if streak is None else streak.count + 1
-        self._streaks[scope] = _Streak(count, self._clock())
+        self._streaks[method] = _Streak(count, self._clock())
         return count
 
+    def slow_host(self, *, sent_at: float, initial: float, factor: float, maximum: float) -> float:
+        """Widen the host's send gap for a request-rate refusal of a send that left at ``sent_at``; return the gap.
+
+        A send that left after the gap last widened was refused at the pace it set: the gap grows by ``factor``,
+        from ``initial`` up to ``maximum``. One that left before it belongs to the burst that widening answers: the
+        gap stays. The caller holds the host for the gap, so the refused burst waits as the pace would have.
+        """
+        pace = self._pace
+        if sent_at > pace.since:
+            # A policy with no initial delay retries at once: it paces nothing.
+            pace.gap = min(maximum, max(initial, pace.gap * factor)) if initial > 0 else 0.0
+            pace.initial = initial
+            pace.since = self._clock()
+        return pace.gap
+
     def observe_answer(self, methods: frozenset[str], *, sent_at: float) -> None:
-        """End the limit streaks of the host and ``methods`` that a send left after the latest pause of ended."""
-        for scope in (None, *methods):
-            streak = self._streaks.get(scope)
+        """End the streaks of ``methods`` that an answer about anything but the load, sent at ``sent_at``, ends.
+
+        A send that left after the latest pause of a method began was answered after it: the method's streak ends.
+        """
+        for method in methods:
+            streak = self._streaks.get(method)
             if streak is not None and sent_at > streak.since:
-                del self._streaks[scope]
+                del self._streaks[method]
+
+    def speed_host(self, *, sent_at: float) -> None:
+        """Narrow the host's send gap for its answer, about anything but the load, to a send that left at ``sent_at``.
+
+        Only a send that left after the gap last widened proves the portal takes that pace; each such answer
+        raises the rate the gap allows by a step (``_PACE_STEP`` of the initial gap's rate), and past
+        ``_PACE_UNPACED_RATE`` times that rate the host is no longer paced. A batch is one send: its commands'
+        entries narrow nothing.
+        """
+        pace = self._pace
+        if pace.gap and sent_at > pace.since:
+            rate = 1 / pace.gap + _PACE_STEP / pace.initial
+            pace.gap = 0.0 if rate > _PACE_UNPACED_RATE / pace.initial else 1 / rate
 
     def admission_delay(self, methods: frozenset[str]) -> float:
-        """Return how long the host cooldown and the cooldowns of ``methods`` still hold a permit for them."""
+        """Return how long the host cooldown, its pace and the cooldowns of ``methods`` still hold a permit for them.
+
+        The pace holds the next permit until a gap after the latest one granted (``slow_host``).
+        """
         return self.admission_delays((methods,))[0]
 
     def admission_delays(self, scopes: tuple[frozenset[str], ...]) -> tuple[float, ...]:
@@ -325,6 +408,8 @@ class RateCoordinator:
             if self._state is CoordinatorState.COOLDOWN and self._cooldown_until is not None
             else now
         )
+        if self._pace.gap:
+            host = max(host, self._pace.next_at)
         return tuple(
             max(0.0, max((self._method_until.get(method, now) for method in methods), default=now) - now, host - now)
             for methods in scopes
@@ -387,13 +472,18 @@ class RateCoordinator:
             active_permits=self._active,
             queued=tuple((work_class, len(self._queues[work_class])) for work_class in WorkClass),
             method_cooldowns=len(self._method_until),
+            pace_gap=self._pace.gap,
         )
 
-    def _release_now(self) -> None:
-        """Return one permit without an await, so cancellation cannot interrupt the accounting."""
+    def _release_now(self, unsent: _Slot | None) -> None:
+        """Return one permit without an await, so cancellation cannot interrupt the accounting.
+
+        ``unsent`` is the pace slot of a permit whose send never left, given back with it.
+        """
         if self._active < 1:
             raise RuntimeError("permit accounting underflow")
         self._active -= 1
+        self._give_back(unsent)
         self._refresh_cooldown()
         self._grant()
 
@@ -410,15 +500,28 @@ class RateCoordinator:
         self._refresh_cooldown()
         return self._state is not CoordinatorState.COOLDOWN and self._methods_ready(methods)
 
-    def _return_granted(self) -> None:
+    def _return_granted(self, waiter: _Waiter) -> None:
+        """Take back a permit granted to ``waiter`` that it will not use, and the pace slot it was granted in."""
         if self._active < 1:
             raise RuntimeError("granted permit accounting underflow")
         self._active -= 1
+        self._give_back(waiter.slot)
+
+    def _give_back(self, slot: _Slot | None) -> None:
+        """Give back a pace slot no send took, if no later grant has taken the next one: the next permit may go now.
+
+        A slot is taken only once the one before it has passed, so now is never earlier than the pace allowed.
+        """
+        if slot is not None and self._pace.next_at == slot.next_at:
+            self._pace.next_at = self._clock()
 
     def _grant(self) -> None:
         if self._state is not CoordinatorState.OPEN:
             return
         while self._active < self._max_concurrency:
+            # The pace holds every waiter alike, so it is read before one is chosen: a held grant takes no turn.
+            if self._pace_holds():
+                return
             retry = self._eligible(WorkClass.RETRY)
             first = None if retry is not None and self._retry_turn else self._next_first_send()
             chosen = first or retry
@@ -426,9 +529,32 @@ class RateCoordinator:
                 return
             self._retry_turn = chosen is first
             work_class, waiter = chosen
+            waiter.slot = self._take_pace_slot()
             self._queues[work_class].remove(waiter)
             self._active += 1
             waiter.future.set_result(None)
+
+    def _pace_holds(self) -> bool:
+        """Return whether the host's pace holds every permit back now.
+
+        A permit it holds back is granted by the wake task once the gap has passed: the wake task is woken now
+        when it would sleep past that.
+        """
+        pace = self._pace
+        if not pace.gap or self._clock() >= pace.next_at:
+            return False
+        if any(self._queues.values()) and (self._wake_at is None or pace.next_at < self._wake_at):
+            self._schedule_wake()
+        return True
+
+    def _take_pace_slot(self) -> _Slot | None:
+        """Space the next permit a gap from now; return the slot this one took, given back if it sends nothing."""
+        pace = self._pace
+        if not pace.gap:
+            return None
+        slot = _Slot(self._clock() + pace.gap)
+        pace.next_at = slot.next_at
+        return slot
 
     def _next_first_send(self) -> tuple[WorkClass, _Waiter] | None:
         """Return the next eligible first send in the cycle's order, moving the cycle past it."""
@@ -479,19 +605,28 @@ class RateCoordinator:
         if self._wake_task is not None:
             self._wake_task.cancel()
         self._wake_task = asyncio.create_task(self._wake_after_cooldown(), name=_WAKE_TASK_NAME)
+        # The new task reads every deadline when it first runs, now: no deadline needs another until then.
+        self._wake_at = self._clock()
 
     async def _wake_after_cooldown(self) -> None:
-        while True:
-            if self._state is CoordinatorState.CLOSED:
-                return
-            deadlines = list(self._method_until.values())
-            if self._cooldown_until is not None:
-                deadlines.append(self._cooldown_until)
-            if not deadlines:
-                return
-            remaining = min(deadlines) - self._clock()
-            if remaining <= 0:
+        try:
+            while True:
+                if self._state is CoordinatorState.CLOSED:
+                    return
+                # What ended by now is lifted and its permits granted first: every deadline left is in the future.
                 self._refresh_cooldown()
                 self._grant()
-                continue
-            await self._sleep(remaining)
+                deadlines = list(self._method_until.values())
+                if self._cooldown_until is not None:
+                    deadlines.append(self._cooldown_until)
+                now = self._clock()
+                pace = self._pace
+                if pace.gap and pace.next_at > now and any(self._queues.values()):
+                    deadlines.append(pace.next_at)
+                if not deadlines:
+                    return
+                self._wake_at = min(deadlines)
+                await self._sleep(self._wake_at - now)
+        finally:
+            if self._wake_task is asyncio.current_task():
+                self._wake_at = None
