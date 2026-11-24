@@ -70,9 +70,9 @@ _QUERY_PATH = "/rest/1/token/conformance.test"
 # Decoded as PHP decodes a query: ``+`` and ``%20`` alike are a space, a blank value or a bare key is a parameter
 # still, and the order of distinct keys is no matter. The pairs must be exactly the ones the client encodes.
 _QUERY_PAIRS = sorted([("plain", "a b"), ("outer[items][0]", "x")])
-# Not octet-stream, the type a transport might send by default, and with a parameter: the case checks the declared
-# type goes out whole.
-_RAW_CONTENT = RawContent(b"\x00chunk\xff", "image/svg+xml; charset=utf-8")
+# Not octet-stream, the type a transport might send by default, and with a case-sensitive parameter value: the case
+# checks the declared type goes out whole and as written.
+_RAW_CONTENT = RawContent(b"\x00chunk\xff", 'image/svg+xml; charset=utf-8; name="Chunk  A.svg"')
 
 
 @dataclass(frozen=True, slots=True)
@@ -429,7 +429,7 @@ async def _run_query_case(
     response = await transport.send_wire(WireRequest(request), attempt_timeout=5, max_response_bytes=1024)
     capture = await captures.get()
     if content is None:
-        sent = _sent_query(capture, "GET") and capture.body == b""
+        sent = _sent_query(capture, "GET") and capture.body == b"" and "content-type" not in capture.headers
     else:
         sent = (
             _sent_query(capture, "POST")

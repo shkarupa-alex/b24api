@@ -26,6 +26,8 @@
   decode the query as PHP does (`+` and `%20` are both a space, the order of distinct keys does not matter,
   a blank value or a bare key is a parameter) and require exactly the pairs the client encodes, so a transport
   that sends a list item as `[]`, repeats a key or adds an empty one fails though PHP would read it alike.
+  The GET must carry no body and no content type; the raw POST must carry the declared content type exactly
+  as written, so a transport that rewrites it, even to an equivalent form, fails.
   An injected HTTPX client's own `params` join the query, as they join a body request's URL; on a shared key
   the request's value wins.
 - **HTTPX log records of the client's own requests drop the URL's query** and keep its path, as they never

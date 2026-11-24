@@ -101,7 +101,12 @@ async def test_a_query_string_request_without_parameters_has_no_query() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "chunk",
-    [_CHUNK, RawContent(b"", "application/octet-stream"), RawContent(b"<svg/>", "text/plain; charset=utf-8")],
+    [
+        _CHUNK,
+        RawContent(b"", "application/octet-stream"),
+        # Parameter values are case-sensitive: the type goes out as written, never normalized.
+        RawContent(b"--AbC--", 'multipart/form-data; boundary=AbC;\tname="Chunk  A.bin"'),
+    ],
     ids=["bytes", "empty", "declared_type"],
 )
 async def test_raw_content_is_posted_byte_for_byte_with_its_type_and_the_parameters_in_the_query(
@@ -165,11 +170,12 @@ def test_query_string_parameters_carry_a_batch_reference_as_text_as_a_form_reque
     ("parameters", "obstacle"),
     [({"filter": {"IDS": []}}, BracketObstacle.EMPTY_CONTAINER), ({"a": None}, BracketObstacle.NONE_VALUE)],
 )
+@pytest.mark.parametrize("content", [None, _CHUNK], ids=["get", "raw_content"])
 def test_query_string_parameters_refuse_what_php_query_encoding_would_drop_with_no_json_advice(
-    parameters: dict[str, object], obstacle: BracketObstacle
+    parameters: dict[str, object], obstacle: BracketObstacle, content: RawContent | None
 ) -> None:
     with pytest.raises(ValueError, match="query-string") as refused:
-        Request.bare("x.y", parameters, encoding=BodyEncoding.QUERY_STRING)
+        Request.bare("x.y", parameters, encoding=BodyEncoding.QUERY_STRING, content=content)
 
     assert str(refused.value) == f"query-string parameters cannot carry {obstacle}"
 
@@ -515,10 +521,15 @@ _URL_FLAWS: dict[str, Callable[[httpx.URL], httpx.URL]] = {
 }
 _BODY_FLAWS: dict[tuple[str, str], Callable[[str | None, bytes], tuple[str | None, bytes]]] = {
     ("get_with_body", "GET"): lambda _type, _body: ("application/x-www-form-urlencoded", b"plain=a+b"),
+    ("get_with_type", "GET"): lambda _type, body: ("application/octet-stream", body),
     ("bytes_as_text", "POST"): lambda content_type, body: (content_type, body.decode("utf-8", "replace").encode()),
     ("other_bytes", "POST"): lambda content_type, _body: (content_type, b'{"plain":"a b"}'),
     ("other_content_type", "POST"): lambda _type, body: ("application/json", body),
     ("default_content_type", "POST"): lambda _type, body: ("application/octet-stream", body),
+    ("content_type_lowercased", "POST"): lambda content_type, body: (
+        None if content_type is None else content_type.lower(),
+        body,
+    ),
     ("content_type_without_parameters", "POST"): lambda content_type, body: (
         None if content_type is None else content_type.split(";")[0],
         body,
@@ -584,6 +595,8 @@ class _Tampered(HttpxTransport):
         ("other_nested_key", (False, False)),
         ("other_value", (False, False)),
         ("get_with_body", (False, True)),
+        ("get_with_type", (False, True)),
+        ("content_type_lowercased", (True, False)),
         ("other_bytes", (True, False)),
         ("bytes_as_text", (True, False)),
         ("same_length_bytes", (True, False)),
