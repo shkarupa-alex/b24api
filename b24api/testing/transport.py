@@ -213,7 +213,8 @@ async def _run_case_environment(
     port = server.sockets[0].getsockname()[1]
     # A case that sent a request HTTP/1.1 cannot parse fails with that detail, whether the transport then returned,
     # raised or was cancelled (the responder answers and closes at once, so a transport still writing or reading may
-    # well fail). The verdict waits for the server to close, and so for every handler to read what it was sent.
+    # well fail). The verdict waits for the server to close, and so for every connection it accepted to be read. A
+    # send that blocks the event loop may end before its connection is accepted; closing drops it unread.
     try:
         try:
             outcome = await _run_owned_case(
