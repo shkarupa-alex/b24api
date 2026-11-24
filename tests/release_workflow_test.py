@@ -614,8 +614,10 @@ def test_local_qc_leaves_out_the_internal_benches_that_the_slow_job_runs() -> No
         "uv run --locked mypy b24api",
         "uv run --locked python .github/scripts/mypy_ratchet.py",
     ]
-    # The default addopts leave out the benches, so `test` must not override the marker selection.
-    assert targets["test"][1] == ["uv run --locked pytest"]
+    # The default addopts leave out the benches, so `test` must not override the marker selection. It runs one
+    # worker process per CPU unless PYTEST_WORKERS says otherwise.
+    assert targets["test"][1] == ["uv run --locked pytest -n $(PYTEST_WORKERS)"]
+    assert "\nPYTEST_WORKERS ?= auto\n" in (ROOT / "Makefile").read_text(encoding="utf-8")
     assert '"-m", "not slow and not benchmark"' in (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert targets["bench"][1] == ["uv run --locked pytest -m slow"]
     assert "make bench" in _runs("slow")
@@ -633,9 +635,9 @@ def test_blocking_jobs_run_the_specified_checks() -> None:
     assert "uv run --locked mypy b24api" in _runs("types")
     assert "python .github/scripts/mypy_ratchet.py" in _runs("types")
     assert jobs["tests"]["strategy"]["matrix"]["python-version"] == ["3.12", "3.13", "3.14"]
-    assert 'pytest -m "not slow and not benchmark" --cov=b24api' in _runs("tests")
+    assert 'pytest -n auto -m "not slow and not benchmark" --cov=b24api' in _runs("tests")
     assert "--resolution lowest-direct" in _runs("min-deps")
-    assert "-m pytest" in _runs("min-deps")
+    assert "-m pytest -n auto" in _runs("min-deps")
     assert "not slow" not in _runs("min-deps")
     assert "make bench" in _runs("slow")
     assert "uv sync --locked --only-group build --no-install-project" in _runs("wheel-typing")

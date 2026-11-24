@@ -75,6 +75,7 @@ dev = [
     "pytest-cov>=7.1.0",
     "pytest-env>=1.1.5",
     "pytest-mock>=3.14.1",
+    "pytest-xdist>=3.8.0",
     "pyyaml>=6.0.3",
     "ruff>=0.15.5",
     "types-jsonschema>=4.26.0.20260113",
