@@ -344,7 +344,8 @@
 - **Breaking: a key PHP would rename is refused in a classic batch.** An empty key, a key holding `[`,
   `]` or NUL, and a top-level key holding `.` or a space (PHP turns those into `_`) are refused there.
 - **Breaking: a `FORM_URLENCODED` request refuses `None` and such keys when it is built**, as it
-  already refused an empty container, with "use JSON encoding" in the message.
+  already refused an empty container, with "use JSON encoding" in the message. A `QUERY_STRING` request
+  refuses them too, without that advice: a GET-only action has no JSON form.
 - **Automatic keyset execution sends its pages directly** when the request cannot travel in a classic
   batch. Its report says `requested_kind=AUTO`, `selected_kind=SEQUENTIAL`,
   `reason=BATCH_UNREPRESENTABLE`. Breaking for an exhaustive match: `KeysetSelectionReason` gains that member.

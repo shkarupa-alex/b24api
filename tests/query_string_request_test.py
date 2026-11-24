@@ -14,6 +14,7 @@ from hypothesis import strategies as st
 from b24api import ReplaySafety, Request, RouteKind
 from b24api.contracts import BodyEncoding, Command, CommandFailure, CommandSuccess, RawContent, RequestHeaders
 from b24api.contracts.request import RequestSpec, canonical_request
+from b24api.encoding import BracketObstacle
 from b24api.errors import B24ApiError, CapabilityError
 from b24api.execution.executor import Executor
 from b24api.testing import (
@@ -153,13 +154,15 @@ def test_query_string_parameters_carry_a_batch_reference_as_text_as_a_form_reque
 
 @pytest.mark.parametrize(
     ("parameters", "obstacle"),
-    [({"filter": {"IDS": []}}, "empty"), ({"a": None}, "None")],
+    [({"filter": {"IDS": []}}, BracketObstacle.EMPTY_CONTAINER), ({"a": None}, BracketObstacle.NONE_VALUE)],
 )
-def test_query_string_parameters_refuse_what_php_query_encoding_would_drop(
-    parameters: dict[str, object], obstacle: str
+def test_query_string_parameters_refuse_what_php_query_encoding_would_drop_with_no_json_advice(
+    parameters: dict[str, object], obstacle: BracketObstacle
 ) -> None:
-    with pytest.raises(ValueError, match=f"query-string parameters cannot carry .*{obstacle}"):
+    with pytest.raises(ValueError, match="query-string") as refused:
         Request.bare("x.y", parameters, encoding=BodyEncoding.QUERY_STRING)
+
+    assert str(refused.value) == f"query-string parameters cannot carry {obstacle}"
 
 
 @pytest.mark.parametrize(

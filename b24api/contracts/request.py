@@ -294,8 +294,13 @@ class Request:
         if encoding is not BodyEncoding.JSON:
             obstacle = bracket_obstacle(frozen, batch=False)
             if obstacle is not None:
-                place = "form-encoded" if encoding is BodyEncoding.FORM_URLENCODED else "query-string"
-                raise ValueError(f"{place} parameters cannot carry {obstacle}; use JSON encoding")
+                # A GET-only action has no JSON form to advise.
+                place, advice = (
+                    ("form-encoded", "; use JSON encoding")
+                    if encoding is BodyEncoding.FORM_URLENCODED
+                    else ("query-string", "")
+                )
+                raise ValueError(f"{place} parameters cannot carry {obstacle}{advice}")
 
     @classmethod
     def bare(  # noqa: PLR0913 - mirrors the canonical constructor's arguments except route
