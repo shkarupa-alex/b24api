@@ -213,9 +213,9 @@ async def _run_case_environment(
     port = server.sockets[0].getsockname()[1]
     # A case that sent a request HTTP/1.1 cannot parse fails with that detail if the responder has read it, whether
     # the transport then returned, raised or was cancelled (the responder answers and closes at once, so a transport
-    # still writing or reading may well fail). The verdict waits for the server to close, and so (from Python 3.12.1)
-    # for every connection the loop has already attached to it; a transport that ends right after it writes may end
-    # before its connection is attached, and closing drops it unread, so the case keeps its own outcome or error.
+    # still writing or reading may well fail). The verdict waits for the server to close, and so for every connection
+    # the loop has attached to it. If the transport ends before the responder has read its request, the responder
+    # may still read it before closing, or closing may drop it unread; the case then keeps its own outcome or error.
     try:
         try:
             outcome = await _run_owned_case(
