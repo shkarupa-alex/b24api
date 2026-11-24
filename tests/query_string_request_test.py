@@ -280,10 +280,14 @@ def test_raw_content_type_admits_each_character_where_rfc_9110_does(form: str, a
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("field", "forged", "error"),
-    [("content_type", "text/plain\r\nX-Evil: 1", ValueError), ("data", "not bytes", TypeError)],
+    [
+        ("content_type", "text/plain\r\nX-Evil: 1", ValueError),
+        ("data", "not bytes", TypeError),
+        ("content", b"chunk", TypeError),
+    ],
 )
 async def test_the_repository_transport_refuses_forged_raw_content_before_it_sends(
-    field: str, forged: str, error: type[Exception]
+    field: str, forged: object, error: type[Exception]
 ) -> None:
     sent: list[httpx.Request] = []
 
@@ -293,15 +297,26 @@ async def test_the_repository_transport_refuses_forged_raw_content_before_it_sen
 
     transport = _httpx(respond)
     content = RawContent(b"chunk", "application/octet-stream")
-    object.__setattr__(content, field, forged)
     request = Request.bare("crm.site.fileuploader.upload", encoding=BodyEncoding.QUERY_STRING, content=content)
+    wire = WireRequest(request)
+    if field == "content":
+        object.__setattr__(wire, "content", forged)
+    else:
+        object.__setattr__(content, field, forged)
     try:
         with pytest.raises(error, match="raw content"):
-            await transport.send_wire(WireRequest(request), attempt_timeout=1, max_response_bytes=1024)
+            await transport.send_wire(wire, attempt_timeout=1, max_response_bytes=1024)
     finally:
         await transport.aclose()
 
     assert sent == []
+
+
+@pytest.mark.parametrize("match_args", [Request.__match_args__, WireRequest.__match_args__], ids=["request", "wire"])
+def test_raw_content_keeps_the_public_fields_before_it_in_their_positional_places(match_args: tuple[str, ...]) -> None:
+    public = [name for name in match_args if not name.startswith("_")]
+
+    assert public == ["method", "route", "replay_safety", "encoding", "headers", "result_error", "content"]
 
 
 def test_raw_content_keeps_its_bytes_out_of_every_representation() -> None:
@@ -467,6 +482,11 @@ _BODY_FLAWS: dict[tuple[str, str], Callable[[str | None, bytes], tuple[str | Non
     ("bytes_as_text", "POST"): lambda content_type, body: (content_type, body.decode("utf-8", "replace").encode()),
     ("other_bytes", "POST"): lambda content_type, _body: (content_type, b'{"plain":"a b"}'),
     ("other_content_type", "POST"): lambda _type, body: ("application/json", body),
+    # As long as the declared bytes, so only a byte-for-byte comparison tells them apart.
+    ("same_length_bytes", "POST"): lambda content_type, body: (
+        content_type,
+        body.decode("latin-1").encode("ascii", "replace"),
+    ),
 }
 
 
@@ -519,6 +539,7 @@ class _Tampered(HttpxTransport):
         ("get_with_body", (False, True)),
         ("other_bytes", (True, False)),
         ("bytes_as_text", (True, False)),
+        ("same_length_bytes", (True, False)),
         ("other_content_type", (True, False)),
         ("other_status", (False, False)),
     ],

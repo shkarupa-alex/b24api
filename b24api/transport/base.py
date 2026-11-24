@@ -108,8 +108,8 @@ class WireRequest:
     replay_safety: ReplaySafety
     encoding: BodyEncoding
     headers: RequestHeaders
-    content: RawContent | None
     result_error: ResultErrorSpec | None
+    content: RawContent | None
     _parameters: FrozenMapping = field(repr=False)
     _positional: PositionalArguments | None = field(repr=False)
     _array_body: V3BatchBody | None = field(repr=False)

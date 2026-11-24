@@ -37,6 +37,7 @@ from b24api.contracts import (
     Present,
 )
 from b24api.contracts.wire import BodyEncoding
+from b24api.encoding import bracket_obstacle
 from b24api.errors import CapabilityError
 from tests.scripting import ResponderTransport, client_for
 
@@ -264,8 +265,10 @@ async def test_explicit_fast_keyset_counted_and_verification_refuse_a_none_filte
     ids=["none", "nested-none", "none-in-list", "bracket-key", "dotted-top-key"],
 )
 def test_a_form_encoded_request_refuses_what_bracket_encoding_would_change(parameters: dict[str, object]) -> None:
-    with pytest.raises(ValueError, match="form-encoded parameters cannot carry"):
+    with pytest.raises(ValueError, match="form-encoded parameters cannot carry") as refused:
         Request.bare("disk.folder.add", parameters, encoding=BodyEncoding.FORM_URLENCODED)
+    obstacle = bracket_obstacle(parameters, batch=False)
+    assert str(refused.value) == f"form-encoded parameters cannot carry {obstacle}; use JSON encoding"
     # A reference pattern means nothing outside a batch, so a form body sends it as written.
     assert Request.bare("x.y", {"a": "$result[a]"}, encoding=BodyEncoding.FORM_URLENCODED)
 

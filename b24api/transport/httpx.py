@@ -14,7 +14,7 @@ from b24api._error_types import FailurePhase
 from b24api._webhook import TokenVault, Webhook, WebhookRefusal, parse_webhook
 from b24api.contracts.evidence import ResponseEvidence
 from b24api.contracts.request_summary import RequestSummary, RouteKind
-from b24api.contracts.wire import BodyEncoding, _validate_headers, _validate_raw_content
+from b24api.contracts.wire import BodyEncoding, _validate_headers, _validate_sent_content
 from b24api.encoding import encode_php_query
 from b24api.errors import (
     ClientClosedError,
@@ -191,8 +191,7 @@ class HttpxTransport:
             raise ValueError("max_response_bytes must be a positive integer")
         HTTPX_LOG_SHIELD.admit_send(self._client)
         headers = _validate_headers(request.headers.items)
-        if request.content is not None:
-            _validate_raw_content(request.content.data, request.content.content_type)
+        _validate_sent_content(request.content)
         return await self._send_wire_impl(
             request,
             headers=headers,

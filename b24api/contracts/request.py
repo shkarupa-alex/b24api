@@ -228,8 +228,9 @@ class Request:
     replay_safety: ReplaySafety
     encoding: BodyEncoding
     headers: RequestHeaders
-    content: RawContent | None
     result_error: ResultErrorSpec | None
+    # Last of the public fields: the ones before it keep their places in a positional pattern.
+    content: RawContent | None
     _parameters: FrozenMapping = field(repr=False)
     _positional: PositionalArguments | None = field(repr=False)
     _empty_container: bool | None = field(repr=False, compare=False)

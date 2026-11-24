@@ -4,7 +4,8 @@
 
 - **Breaking for code that matches or enumerates `BodyEncoding`: it gains `QUERY_STRING`.** Such a request sends its
   parameters in the URL's query, in the PHP encoding of form bodies, and refuses at build time what that
-  encoding would drop, as a form request does. Without content it is a GET, which `crm.site.fileuploader.preview`,
+  encoding would drop, as a form request does, but without advising JSON encoding, which a GET-only action
+  cannot take. Without content it is a GET, which `crm.site.fileuploader.preview`,
   `crm.site.fileuploader.download`, `call.Track.download` and `crm.timeline.ai.mergefields` require.
 - **New `RawContent(data, content_type)` and `Request(content=...)`** (also on `Request.bare()`, in the
   `RequestSpec` mapping, kept by `with_parameters()`). A `QUERY_STRING` request with content is a POST of
@@ -344,8 +345,7 @@
 - **Breaking: a key PHP would rename is refused in a classic batch.** An empty key, a key holding `[`,
   `]` or NUL, and a top-level key holding `.` or a space (PHP turns those into `_`) are refused there.
 - **Breaking: a `FORM_URLENCODED` request refuses `None` and such keys when it is built**, as it
-  already refused an empty container, with "use JSON encoding" in the message. A `QUERY_STRING` request
-  refuses them too, without that advice: a GET-only action has no JSON form.
+  already refused an empty container, with "use JSON encoding" in the message.
 - **Automatic keyset execution sends its pages directly** when the request cannot travel in a classic
   batch. Its report says `requested_kind=AUTO`, `selected_kind=SEQUENTIAL`,
   `reason=BATCH_UNREPRESENTABLE`. Breaking for an exhaustive match: `KeysetSelectionReason` gains that member.

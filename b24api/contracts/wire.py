@@ -99,6 +99,15 @@ class RawContent:
         return f"RawContent(content_type={self.content_type!r}, byte_length={self.byte_length!r})"
 
 
+def _validate_sent_content(content: object) -> None:
+    """Refuse a wire request's raw content that is no ``RawContent``, or whose fields were forged after it was built."""
+    if content is None:
+        return
+    if not isinstance(content, RawContent):
+        raise TypeError("raw content must be a RawContent")
+    _validate_raw_content(content.data, content.content_type)
+
+
 def _validate_raw_content(data: object, content_type: object) -> None:
     """Refuse raw content whose bytes are no bytes or whose content type is no media type (RFC 9110, 8.3.1).
 
