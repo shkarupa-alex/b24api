@@ -757,7 +757,7 @@ async def test_conformance_fails_every_case_sent_a_request_http_cannot_parse_wit
 class _EndsAtOnce(HttpxTransport):
     """Writes its JSON request itself and ends as ``ending`` says, never reading the answer.
 
-    Its ``aclose`` returns without yielding, so the case may end before the responder has read what it sent.
+    Neither the end of ``send_wire`` nor ``aclose`` yields, so the case ends before the responder reads what was sent.
     """
 
     def __init__(self, webhook_url: str, *, host_line: bool, ending: str) -> None:
@@ -773,10 +773,9 @@ class _EndsAtOnce(HttpxTransport):
         head += f"Host: {self.url.host}\r\n" if self.host_line else ""
         head += f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n"
         _, writer = await asyncio.open_connection(self.url.host, self.url.port)
+        # Nothing below yields: the case ends before the responder has even read what was sent.
         writer.write(head.encode() + body)
-        await writer.drain()
         writer.close()
-        await writer.wait_closed()
         if self.ending == "raises":
             raise ConnectionResetError
         if self.ending == "cancelled":
