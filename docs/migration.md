@@ -35,13 +35,13 @@
   chunked as one sent with `Content-Length`, so a transport that streams its body no longer fails the body
   cases, and a GET whose body goes out chunked fails `QUERY_STRING_GET`. Header names are matched in any
   letter case. A request HTTP/1.1 cannot parse, such as one without `Host` or with a space before a header's
-  colon, which a server must refuse, fails the case that sent it at once. The detail is `UnparseableRequest`
-  when the responder has read the request by the time the transport ends, whether it returns, raises or is
+  colon, which a server must refuse, fails the case that sent it with the detail `UnparseableRequest` when
+  the responder has read it by the time the transport ends, whether the transport returns, raises or is
   cancelled, so always for a transport that reads the answer. A transport that ends right after it writes may
-  end before that; the case still fails, with the detail its own check or the transport's error gives. A
-  header line folded onto the next is joined to it with one space, keeping any whitespace that ended the
-  first line, as HTTP/1.1 lets a server do, so the raw case reads a folded content type as joined; a portal's
-  web server may refuse it instead.
+  end before the responder reads its request; the case then keeps its own outcome or the transport's error,
+  and a case that does not wait for a request may even pass. A header line folded onto the next is joined to
+  it with one space, keeping any whitespace that ended the first line, as HTTP/1.1 lets a server do, so the
+  raw case reads a folded content type as joined; a portal's web server may refuse it instead.
 - **HTTPX log records of the client's own requests drop the URL's query** and keep its path, as they never
   show a body. The query still reaches the portal's web server and any proxy, which may log it.
 
