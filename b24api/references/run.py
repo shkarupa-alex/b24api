@@ -41,7 +41,7 @@ class _ReferenceRun:
     ended: bool = False
 
     def admit_page(self) -> None:
-        """Release the dispatcher's admission slot once the page is in the row buffer."""
+        """Release the dispatcher's admission slot once the page is in the row buffer, or waits in it to grow."""
         if self.page_admission is not None and not self.page_admission.done():
             self.page_admission.set_result(None)
         self.page_admission = None

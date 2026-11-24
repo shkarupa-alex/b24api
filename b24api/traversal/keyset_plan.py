@@ -237,8 +237,10 @@ class KeysetPlanner:
     ) -> tuple[BoundaryAnalysis, int]:
         host.admission.record_raw(len(asc.rows) + len(desc.rows))
         await host.adjust_buffer(len(asc.rows) + len(desc.rows))
-        available_rows = host.context.policy.max_buffered_rows - host.transactions.buffer_balance
-        host.batch_capacity = min(host.batch_capacity, available_rows // self.effective_page_cap)
+        # A reference binding's lease may grow here, to the share the facts known once its boundary wave
+        # landed give; the plan, its probes and every wave after them fit the rows it then holds.
+        available_rows = host.context.planning_rows() - host.transactions.buffer_balance
+        host.batch_capacity = min(host.command_capacity, available_rows // self.effective_page_cap)
         head, tail = (asc, desc) if self.keyset.direction == "ascending" else (desc, asc)
         self.facts.head_rows, self.facts.tail_rows = len(head.rows), len(tail.rows)
         asc_total, desc_total = (host.transactions.boundary_totals.get(receipt.command_id) for receipt in (asc, desc))

@@ -34,6 +34,10 @@ class KeysetContext(Protocol):
         """Return the operation context the engine and the executor charge requests to."""
         ...
 
+    def planning_rows(self) -> int:
+        """Return the buffered rows a plan may use, as it is chosen; ``policy`` names them from then on."""
+        ...
+
     async def start(self) -> None:
         """Start the operation clock once."""
         ...

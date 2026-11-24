@@ -46,11 +46,15 @@ When a REST 3.0 envelope of `SAFE` commands may have run without an answer, its 
 sent again alone, one at a time, within the slot of that envelope's batch. `fan_out()` and
 `fan_out_outcomes()` divide `max_buffered_rows` among the results they may have in flight at once: the
 requests of a `DirectDispatch`, or `batch_size` commands per physical batch of a `BatchDispatch`, at most
-`max_active_references`. That share is the longest result a command may return, and a longer one ends
-with `ResultTooLargeError`. A `BatchDispatch` share never drops below a full 50-row portal page while
+`max_active_references`. That share is what a command reserves before it is sent. A longer result takes
+the rest from the free rows, first in line for the rows that come back, while the commands already reserved
+or the consumer may still free all it lacks; a result longer than the budget, or one whose missing rows are
+held by other results waiting to grow, ends with `ResultTooLargeError` (see Resource boundaries). A `BatchDispatch`
+share never drops below a full 50-row portal page while
 the budget holds one per command of a batch: fewer commands are counted, and the row budget holds back
-the commands beyond them, which coalesce into fewer, fuller batches. Of the default 2,500 rows that
-gives:
+the commands beyond them, which coalesce into fewer, fuller batches: a batch whose commands fit only
+once a batch in flight lands waits for it (`coalesce_wait=0` sends it at once, in more requests). Of the
+default 2,500 rows that gives:
 
 | Dispatch | Share (rows) | In flight at once |
 | --- | --- | --- |
@@ -58,7 +62,8 @@ gives:
 | `BatchDispatch()` | 50 | 1 batch of 50 |
 | `BatchDispatch(batch_size=1, concurrency=8)` | 312 | 8 batches of 1 |
 | `BatchDispatch(batch_size=5, concurrency=4)` | 125 | 4 batches of 5 |
-| `BatchDispatch(concurrency=2)`, `BatchDispatch(batch_size=20, concurrency=4)` | 50 | 50 commands |
+| `BatchDispatch(concurrency=2)` | 50 | 1 batch of 50 |
+| `BatchDispatch(batch_size=20, concurrency=4)` | 50 | 2 batches of 20 |
 
 Raise `max_buffered_rows` or narrow the dispatch for longer results. Raise the client limit only as far
 as the portal's rate limits allow. `Bitrix24.from_webhook()` takes both limits
@@ -989,12 +994,22 @@ decoding.
 A command's decoded rows are known only once it has run, so `max_buffered_rows` bounds what an operation
 holds rather than what it sends. `batch()` and `batch_outcomes()` share the budget among a window's
 results in input order, one row per outcome and a success's other rows while they fit; `fan_out()` and
-`fan_out_outcomes()` give each command an equal share among the results their dispatch may have in
+`fan_out_outcomes()` reserve each command an equal share among the results their dispatch may have in
 flight at once, under a `BatchDispatch` never below a 50-row page while the budget holds one per
 command of a batch (50 rows under the default `BatchDispatch`, 250 under the default `DirectDispatch`,
-see the table above). A result that does not fit is dropped: its command ends as a `CommandFailure`
-with `ResultTooLargeError`, a `BudgetExceededError` that says the command ran and was answered, so it is
-never replayed, and every other command keeps its own outcome. A page's wait for row capacity, while the
+see the table above). A longer result grows into free rows. While it waits for them, the rows that come
+back are its first: no other command reserves rows (under `INPUT` delivery, none but the frontier's), and
+the commands reserved before it are still sent. It waits while the rows it lacks may all come back without
+it: a command already reserved lands, or the consumer takes rows (its own earlier pages and, under `READY`
+delivery, any). Under `INPUT` delivery a result behind the frontier
+waits for the frontier to reach it: the rows the results before it hold come back by then, those waiting to
+grow as well, while rows read ahead for the results behind it come back only after it. While a result waits its decoded rows are held beside the budget, not in it:
+at most one result per command in flight, each no longer than the budget. A result longer than the whole
+budget, or one whose missing rows are held by results waiting to grow as well or, under `INPUT`, read ahead
+behind it, does not fit and is dropped at once: its command ends as a `CommandFailure` with `ResultTooLargeError`, a `BudgetExceededError` that
+says the command ran and was answered, so it is never replayed, and every other command keeps its own
+outcome. A result still waiting when `max_elapsed` runs out is dropped the same way, its command answered, and
+the operation ends with its time budget. A page's wait for row capacity before its send, while the
 consumer has not yet taken the rows other pages hold, is bounded by `max_elapsed`: when it runs out, the
 binding or `fan_out()` command fails with its waiting page unsent, with `BudgetExceededError` ("row
 buffer wait exceeded operation time budget"). A binding's wait for the consumer to take a page already

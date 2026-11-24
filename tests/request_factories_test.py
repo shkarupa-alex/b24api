@@ -1,7 +1,9 @@
 """§3.12 (C1, C13): ``Request.bare`` and ``Request.v3`` are the constructor with a fixed route."""
 
 from __future__ import annotations
+import copy
 import inspect
+from unittest import mock
 
 import pytest
 
@@ -16,6 +18,7 @@ from b24api.contracts import (
     SlotContract,
     SlotShape,
 )
+from b24api.contracts import request as request_module
 
 
 def _parameters(function: object, *, drop: set[str]) -> list[tuple[str, object, object]]:
@@ -93,3 +96,17 @@ def test_factories_reject_unknown_arguments_and_an_explicit_route() -> None:
         Request.bare("user.get", route=RouteKind.API_V3)  # type: ignore[call-arg]
     with pytest.raises(TypeError):
         Request.v3("user.get", timeout=1)  # type: ignore[call-arg]
+
+
+def test_a_request_builds_its_summary_once_however_often_errors_read_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Traversals read the summary for every row whose identity they check; it is a pure function of the request.
+    summarize = mock.Mock(wraps=request_module.summarize_request)
+    monkeypatch.setattr(request_module, "summarize_request", summarize)
+    request = Request.bare("crm.deal.list", {"filter": {"ID": 1}}, ReplaySafety.SAFE)
+
+    summaries = {request.summary for _ in range(1_000)}
+
+    assert summarize.call_count == 1
+    assert [summary.parameter_keys for summary in summaries] == [("filter",)]
+    assert copy.copy(request).summary == copy.deepcopy(request).summary == request.summary
+    assert copy.deepcopy(request) == request

@@ -200,10 +200,27 @@ outcome.
 - The row budget bounds what an operation holds, not what it sends: a result's rows are known only
   after its command ran. A logical batch and a counted traversal's tail fit a window's results into
   `max_buffered_rows` in input order (`_within_row_budget`), and the reference scheduler fits each
-  page into the rows reserved for it before the page is accepted. A result that does not fit is dropped, and
+  page into the rows reserved for it before the page is accepted, growing the reservation into free rows
+  for an answer longer than it (`_RowBuffer.grow`, a fan-out's whole result). Its rows are decoded already, so
+  while it waits the pool holds rows back from every other page and lease (`_RowBuffer._held_back`; an ordered
+  pool still serves the frontier, unless the page waiting is the frontier's): the rows that come back are its
+  first. It no longer holds its batch's send slot (`_ReferenceRun.admit_page` before it waits), so the pages
+  reserved before it are sent and land. It waits only while the rows it lacks may all come back without its
+  own progress or a page reserved after it (`_RowBuffer._returnable`, counting each holder whole): another
+  binding's page reserved or a lease, rows the consumer takes anyway (its own binding's earlier pages, and
+  under `READY` any). Rows the pool promised to a woken page are its as well, since that page is held back
+  too. An ordered pool grows only the frontier: a page behind it waits for the frontier to reach it, and takes
+  no row the frontier could need; it counts every row the bindings before it hold, theirs waiting to grow too,
+  as coming back by then. Two pages waiting for each other's rows never both wait: the one that finds
+  the rows it lacks held by growing pages (under `INPUT`, those behind it), or under `INPUT` read ahead or
+  in a planned lease behind it, is dropped at once. While a page waits, its decoded rows are held outside the row budget: one answer per
+  page in flight at most, each no longer than the budget, since no page but an ordered pool's frontier
+  reserves rows meanwhile. A result that does not fit is dropped, and
   its command fails with `ResultTooLargeError`, recorded answered by `b24api.execution.facts.dropped_result`:
   a failure that ran, never one proven not run. A page's wait for row capacity (`_RowBuffer.reserve`) is
-  bounded by the operation's elapsed budget, as every other dispatch wait is. A binding's wait for the
+  bounded by the operation's elapsed budget, as every other dispatch wait is; so is a result's wait to grow
+  (`_RowBuffer.grow`), which then drops the result as one that does not fit, its command answered, while the
+  refusal the context recorded ends the operation. A binding's wait for the
   consumer is not: under `READY` delivery, or with a page stop, `_deliver_page` puts the page on the output
   queue and awaits its acknowledgement without a deadline, since the consumer holds control there. The budget
   ends the operation at its next scheduling point after the consumer takes the page.
@@ -556,7 +573,9 @@ on to its next page, so the bindings behind the frontier keep the batches full. 
 page stop waits for the consumer to leave each page, as its callback must see a delivered page. Rows
 behind the frontier stay held until it advances, so the pool keeps the frontier's next page free, or
 the pages its counted tail may still put in flight at once: rows the frontier already holds count
-toward that reserve, and the reserve covers the largest page of any admitted binding. A page of a
+toward that reserve, and the reserve covers the largest page of the bindings still adding pages, or the
+default page of a binding the source has not yielded yet; it grows as a binding with a larger page is admitted
+and is sized again as the frontier advances. A page of a
 binding behind the frontier also leaves free the next page of every producing binding between the
 frontier and it, as the consumer drains the nearer bindings first; otherwise later bindings would
 fill the pool and each page a nearer binding then needs would travel alone. The frontier is never
@@ -564,8 +583,9 @@ held back by that room, so it always progresses: either its page fits, or it hol
 consumer drains. The pool counts the rows each binding holds, and those of its queued pages, per
 binding, and sums the producers' rooms in binding order, so a check scans no reservation. A page that
 cannot reserve waits in binding order; a change of the pool wakes only the waiting pages that fit,
-nearest the frontier first, and stops at the first page behind the frontier that does not fit, since
-every later page keeps more room free. Under `READY` delivery a page's check is a count, and a change
+nearest the frontier first, in one pass that sums the rooms between the frontier and each page once. The pass
+records the free rows the next one needs, so a release that frees fewer runs none until rows are taken, a
+waiter changes or the producers' rooms change. Under `READY` delivery a page's check is a count, and a change
 wakes the waiting pages that fit in the order they came. Under both, a page is woken only for rows free
 beyond those promised to the pages already woken and not yet resumed, so a release wakes the pages its
 rows serve, not every waiting page. Promised rows are the woken page's own: no page or lease asking
@@ -579,10 +599,13 @@ each buffered-row change is applied once to the shared counter. Its waves and it
 commands of the shared dispatcher, and under `READY` delivery a binding awaiting the consumer's
 acknowledgement that has not reached its terminal, and so will hand over another row group or send its next
 command, is a pending continuation the dispatcher waits for, as an ordinary binding's page is. A command whose
-batch was lost in transit leaves its binding unknown, as a direct page does. The lease never grows:
-a binding is granted at least its planning floor and at most the larger of that floor and an equal
-share of the pool among active fast bindings, rows kept for ordinary pages excepted. Once the plan
-is chosen at the granted lease, a sequential or boundary-only plan, which only drains the rows it
+batch was lost in transit leaves its binding unknown, as a direct page does. A binding is granted at
+least its planning floor and at most the larger of that floor and an equal share of the pool among the
+fast bindings active or still to be read from the source, rows kept for ordinary pages excepted. The
+lease grows once, as its binding plans after its boundary wave has landed, to that share by the facts
+then known (`ReferenceScheduler.grow_lease`, read through `KeysetContext.planning_rows`): a source read
+out by then leaves a lone binding the whole pool. Once the plan is chosen at that lease, a sequential or
+boundary-only plan, which only drains the rows it
 holds and then holds one finish page at a time, trims the lease to that bound and gives the rest
 back to the pool; a lane plan keeps it whole. Under `INPUT` delivery the pool hands rows out in
 binding order: while a binding waits for its lease, no later binding is granted a lease or reserves
@@ -647,7 +670,9 @@ Selection and validation operate on the response's existing frozen tree. A synch
 is invoked once at the two canonical row funnels (driver and fast-keyset receipt) before commit;
 published rows alone are thawed. Reference cursor drivers share a capacity-aware dispatcher whose
 absolute per-wave coalescing deadline defaults to 20 ms and is skipped when no eligible producer can
-add a command. A pulled binding is a producer from the moment it leaves the source, before its task
+add a command. A wave whose next pages fit only once a wave in flight lands waits for that landing
+instead of the deadline, trading wall time for fewer requests; `coalesce_wait=0` sends every wave at
+once. A pulled binding is a producer from the moment it leaves the source, before its task
 first runs, until it publishes its terminal event: it stops counting once its cleanup has cancelled
 the pages it abandons, before that event may wait for room. A binding refused as a local
 non-execution is never a producer. A command whose task has started but has not reached the queue

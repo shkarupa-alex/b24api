@@ -3,9 +3,10 @@
 The binding holds one row lease ``G`` in the shared row pool from activation to terminal. Its
 runtime plans and fits every wave against a projection of the operation policy that differs only in
 ``max_buffered_rows=G``; requests, attempts, pages, deadline and bytes stay on the shared context,
-which is the only context the engine and the executor ever receive. Once its plan bounds the rows
-it can still hold, the binding trims ``G`` to that bound and gives the rest back to the pool; a
-lease never grows.
+which is the only context the engine and the executor ever receive. ``G`` is sized at admission;
+as the binding plans it grows once to the share the facts then known give (``planning_rows``), and
+once its plan bounds the rows it can still hold, the binding trims ``G`` to that bound and gives the
+rest back to the pool.
 """
 
 from __future__ import annotations
@@ -15,6 +16,8 @@ from typing import TYPE_CHECKING
 from b24api.errors import BudgetExceededError
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from b24api.contracts.policy import ExecutionPolicy
     from b24api.execution.context import ExecutionContext, ExecutionSnapshot, PageReservation
     from b24api.references.dispatch import _Reservation
@@ -22,7 +25,7 @@ if TYPE_CHECKING:
 
 @dataclass(slots=True, eq=False)
 class RowLease:
-    """A capacity in the shared row pool, which may only shrink, and the rows currently held against it."""
+    """A capacity in the shared row pool, which grows only as its binding plans, and the rows held against it."""
 
     capacity: int
     held: int = field(default=0, init=False)
@@ -51,6 +54,12 @@ class RowLease:
             raise BudgetExceededError("fast keyset rows exceed the binding's row lease")
         self.held += rows
 
+    def grow(self, capacity: int) -> None:
+        """Raise the capacity to the ``capacity`` rows its pool reservation now holds."""
+        if self.reservation is None or capacity != self.reservation.amount or capacity < self.capacity:
+            raise RuntimeError("a row lease grows only to the rows its pool reservation holds")
+        self.capacity = capacity
+
     def trim(self, capacity: int) -> None:
         """Lower the capacity to ``capacity`` rows: never below the rows held, never above the capacity."""
         if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
@@ -73,11 +82,26 @@ class BindingBudgetView:
     shared: ExecutionContext
     lease: RowLease
     projection: ExecutionPolicy
+    # Grows the lease's pool reservation to the binding's share and returns the rows it then holds; a lease
+    # outside a shared pool has no share to grow to.
+    grow: Callable[[], int] | None = None
 
     @classmethod
-    def over(cls, shared: ExecutionContext, lease: RowLease) -> BindingBudgetView:
+    def over(
+        cls, shared: ExecutionContext, lease: RowLease, grow: Callable[[], int] | None = None
+    ) -> BindingBudgetView:
         """Project the operation policy onto the lease: only ``max_buffered_rows`` changes."""
-        return cls(shared, lease, replace(shared.policy, max_buffered_rows=lease.capacity))
+        return cls(shared, lease, replace(shared.policy, max_buffered_rows=lease.capacity), grow)
+
+    def planning_rows(self) -> int:
+        """Grow the lease to the binding's share as it plans, and return the rows its plan may use.
+
+        A lease only grows: a pool closed meanwhile has reclaimed its rows, and the binding is being cancelled.
+        """
+        if self.grow is not None and (capacity := self.grow()) > self.lease.capacity:
+            self.lease.grow(capacity)
+            self.projection = replace(self.projection, max_buffered_rows=capacity)
+        return self.lease.capacity
 
     def trim(self, capacity: int) -> None:
         """Trim the lease and the projection together: the policy always names the lease's capacity."""

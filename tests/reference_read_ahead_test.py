@@ -21,11 +21,17 @@ from b24api import (
     BatchDispatch,
     Binding,
     CountedTraversal,
+    CursorSpec,
+    CursorTraversal,
+    DirectDispatch,
     ExecutionPolicy,
+    IdentityCoercion,
+    IdentitySpec,
     ParameterPath,
     ParameterUpdate,
     ReplaySafety,
     Request,
+    ResultSelector,
     SequentialTraversal,
     TerminalState,
 )
@@ -38,6 +44,7 @@ from b24api.contracts import (
     ReferenceComplete,
     ReferenceFailure,
     ReferenceItem,
+    ReferenceSource,
 )
 from b24api.errors import BudgetExceededError
 from tests.scripting import HANG_BOUND, BatchPortal, VirtualClock, client_for, on_loop
@@ -100,6 +107,7 @@ async def _traverse(  # noqa: PLR0913 - one scenario's knobs
     page_stop: PageStopPolicy | None = None,
     consumed: Counter[int] | None = None,
     budget_end: bool = False,
+    coalesce_wait: float = BatchDispatch().coalesce_wait,
 ) -> tuple[list[ReferenceOutcome[int]], OperationReport, BatchPortal]:
     """Drain one reference traversal over ``parents`` bindings; fail rather than hang past ``HANG_BOUND``.
 
@@ -115,7 +123,7 @@ async def _traverse(  # noqa: PLR0913 - one scenario's knobs
             Request.bare("gamma.list", {}, ReplaySafety.SAFE),
             bindings,
             traversal=traversal,
-            dispatch=BatchDispatch(batch_size=BATCH, output_order=order),
+            dispatch=BatchDispatch(batch_size=BATCH, output_order=order, coalesce_wait=coalesce_wait),
             page_stop=page_stop,
         )
         events: list[ReferenceOutcome[int]] = []
@@ -147,20 +155,22 @@ def _expected(parents: int, pages: int | None) -> list[tuple[int, object]]:
     return [(parent, parent * 100_000 + row) for parent in range(parents) for row in range(_total(parent, pages))]
 
 
-# INPUT sends at most this many times READY's physical requests; before read-ahead it sent 25 to 47
-# times as many, and 3.6 times on the skewed counted traversal. A counted tail sends its window of pages
-# at once: without room kept for all of them, the counted traversal of two pages sends a third more.
-# A sequential binding ends at its page without ``next``: on the skewed sources that leaves READY 14
-# requests where it sent 22 with an empty confirmation per binding, and INPUT 54 where it sent 71.
-_READY_RATIO = {
-    (2, "sequential"): 3.5,
-    (2, "counted"): 1.5,
-    (None, "sequential"): 4.0,
-    (None, "counted"): 2.0,
+# The most physical requests READY and INPUT send. Before read-ahead INPUT sent 25 to 47 times as many as READY. A
+# READY consumer takes every page waiting for it, so the pool projects its rows as coming back: counting them held
+# would send READY 28 to 35 requests here. Each binding ahead of the INPUT frontier keeps the part of its room its pages
+# in flight do not hold: keeping its whole room as well would cost the review's 5,000 bindings of one and two pages 201
+# requests instead of 125, for 24 instead of 35 on the counted traversal of two pages here. A sequential binding ends
+# at its page without ``next``: on the skewed sources that leaves READY 14 requests where it sent 22 with an empty
+# confirmation per binding.
+_REQUESTS = {
+    (2, "sequential"): (12, 28),
+    (2, "counted"): (13, 35),
+    (None, "sequential"): (14, 59),
+    (None, "counted"): (11, 15),
 }
 
 
-@pytest.mark.parametrize(("pages", "name"), list(_READY_RATIO), ids=lambda value: str(value or "skewed"))
+@pytest.mark.parametrize(("pages", "name"), list(_REQUESTS), ids=lambda value: str(value or "skewed"))
 @pytest.mark.asyncio
 async def test_input_batches_stay_near_ready_in_order_and_within_the_pool(
     monkeypatch: pytest.MonkeyPatch, pages: int | None, name: str
@@ -175,7 +185,9 @@ async def test_input_batches_stay_near_ready_in_order_and_within_the_pool(
     _ready_events, _ready_report, ready = await _traverse(DeliveryOrder.READY, traversal, pages=pages)
     events, report, portal = await _traverse(DeliveryOrder.INPUT, traversal, pages=pages)
 
-    assert len(portal.waves) <= _READY_RATIO[pages, name] * len(ready.waves)
+    ready_requests, input_requests = _REQUESTS[pages, name]
+    assert len(ready.waves) <= ready_requests
+    assert len(portal.waves) <= input_requests
     assert sum(portal.waves) == sum(ready.waves)
     assert _rows(events) == _expected(REVIEW_PARENTS, pages)
     completes = [event.correlation for event in events if isinstance(event, ReferenceComplete)]
@@ -330,3 +342,148 @@ async def test_input_fan_out_reads_whole_results_ahead(monkeypatch: pytest.Monke
     assert portal.waves == [3, 3, 3, 2]
     assert [outcome.correlation for outcome in outcomes if isinstance(outcome, CommandSuccess)] == list(range(11))
     assert clock.timer_firings == 0
+
+
+# Two bindings of 58 pages; a wave of 50 takes most of a window, so a tail sends its pages in four waves.
+WINDOW_PARENTS, WINDOW_PAGES, WINDOW_WAVES = 2, 58, 8
+
+
+@pytest.mark.parametrize("active", [1, 4])
+@pytest.mark.asyncio
+async def test_a_counted_window_fills_its_waves_whatever_the_active_bindings(
+    monkeypatch: pytest.MonkeyPatch, active: int
+) -> None:
+    """The pages waiting for a wave are bounded by their rows, not by the active bindings.
+
+    One or four bindings active at once and no coalescing: each counted tail puts its window of
+    pages in the queue at once, and a wave carries them all. A queue of one page per active binding sent the 116
+    pages in 116 requests with one active binding, and four pages a request with four.
+    """
+    VirtualClock().install(monkeypatch)
+    policy = ExecutionPolicy(max_buffered_rows=POOL, max_active_references=active)
+
+    events, report, portal = await _traverse(
+        DeliveryOrder.INPUT,
+        TRAVERSALS["counted"],
+        parents=WINDOW_PARENTS,
+        pages=WINDOW_PAGES,
+        policy=policy,
+        coalesce_wait=0.0,
+    )
+
+    assert _rows(events) == _expected(WINDOW_PARENTS, WINDOW_PAGES)
+    assert report.state is TerminalState.COMPLETED
+    assert sum(portal.waves) == WINDOW_PARENTS * WINDOW_PAGES
+    assert len(portal.waves) <= WINDOW_WAVES
+
+
+# Sources whose page caps differ: cursor pages of 2 rows and sequential pages of 3. A binding's (method, rows, lag in
+# event-loop turns): cursor rows count down from its rows, sequential rows count up to them.
+_CURSOR = CursorSpec(ParameterPath(("BEFORE",)), ("ID",), IdentityCoercion.EXACT_INTEGER, "descending", "last")
+_CURSOR_PAGES = CursorTraversal(selector=ResultSelector(), cursor=_CURSOR, page_size=2)
+_SEQUENTIAL_PAGES = SequentialTraversal(
+    identity=IdentitySpec(("ID",), "ID", "ID", IdentityCoercion.EXACT_INTEGER), page_size=3
+)
+type _MixedBindings = tuple[tuple[str, int, int], ...]
+_MIXED_CAPS: dict[str, tuple[int, DirectDispatch | BatchDispatch, _MixedBindings]] = {
+    "batch": (
+        6,
+        BatchDispatch(batch_size=2, concurrency=3, output_order=DeliveryOrder.INPUT, coalesce_wait=0.0),
+        (("cursor", 4, 8), ("sequential", 12, 8), ("cursor", 12, 0), ("cursor", 2, 1), ("cursor", 2, 0)),
+    ),
+    "direct": (
+        12,
+        DirectDispatch(concurrency=5, output_order=DeliveryOrder.INPUT),
+        (
+            ("cursor", 6, 1),
+            ("sequential", 18, 8),
+            ("cursor", 6, 0),
+            ("cursor", 12, 1),
+            ("cursor", 12, 0),
+            ("cursor", 12, 1),
+            ("sequential", 15, 8),
+        ),
+    ),
+    # Sources of one cap: the reserve is the cap the first admitted binding raised it to, before any frontier moved.
+    "admitted": (
+        3,
+        BatchDispatch(batch_size=3, concurrency=1, output_order=DeliveryOrder.INPUT, coalesce_wait=0.0),
+        (("cursor", 3, 4), ("cursor", 8, 0)),
+    ),
+}
+
+
+def _mixed_rows(method: str, rows: int, query: Query) -> Envelope:
+    if method == "cursor.list":
+        before = query.get("BEFORE")
+        top = rows if before is None else int(str(before)) - 1
+        return {"result": [{"ID": value} for value in range(top, max(0, top - 2), -1)]}
+    start = int(str(query.get("start", 0)))
+    body: Envelope = {"result": [{"ID": value} for value in range(start + 1, min(rows, start + 3) + 1)]}
+    if start + 3 < rows:
+        body["next"] = start + 3
+    return body
+
+
+async def _read_mixed(
+    bindings: _MixedBindings, budget: int, dispatch: DirectDispatch | BatchDispatch
+) -> tuple[BatchPortal, list[object]]:
+    async def answer(method: str, query: Query) -> Envelope:
+        _kind, rows, lag = bindings[int(str(query["PARENT"]))]
+        for _turn in range(lag):
+            await asyncio.sleep(0)
+        return _mixed_rows(method, rows, query)
+
+    sources = [
+        ReferenceSource(
+            Request.bare(f"{kind}.list", {}, ReplaySafety.SAFE),
+            _CURSOR_PAGES if kind == "cursor" else _SEQUENTIAL_PAGES,
+            Binding("parent", (ParameterUpdate(ParameterPath(("PARENT",)), index),), index),
+        )
+        for index, (kind, _rows, _lag) in enumerate(bindings)
+    ]
+    portal = BatchPortal(answer)
+    policy = ExecutionPolicy(max_elapsed=_MIXED_ELAPSED, max_buffered_rows=budget)
+    async with client_for(portal, policy=policy) as client:
+        stream = client.iter_reference_source_outcomes(on_loop(sources), dispatch=dispatch)
+        async with stream:
+            events: list[object] = [event async for event in stream]
+    assert not [event for event in events if isinstance(event, ReferenceFailure)]
+    delivered = [event.binding_index for event in events if isinstance(event, ReferenceItem)]
+    assert delivered == [index for index, (_kind, rows, _lag) in enumerate(bindings) for _row in range(rows)]
+    return portal, events
+
+
+@pytest.mark.parametrize("name", list(_MIXED_CAPS))
+@pytest.mark.asyncio
+async def test_the_input_frontier_finds_its_next_page_whatever_cap_the_binding_that_becomes_it_has(name: str) -> None:
+    """The frontier reserve covers the largest cap of the producers still adding pages, raised as each is admitted.
+
+    Bindings behind the frontier read ahead into the pool; with a reserve smaller than the frontier's page, the pages
+    read ahead behind it could hold the rows its next page needs, and the read would wait until ``max_elapsed``.
+    """
+    budget, dispatch, bindings = _MIXED_CAPS[name]
+
+    await _read_mixed(bindings, budget, dispatch)
+
+
+@pytest.mark.asyncio
+async def test_the_input_frontier_reserve_shrinks_to_the_cap_of_the_producers_left(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once the binding with the largest page has ended, the frontier keeps free only the page of those left.
+
+    A sequential binding (3-row pages) and two cursor bindings (2-row pages) share 4 rows. Once the sequential one ends,
+    the frontier keeps 2 rows for its next page, so the next binding's page joins the frontier's wave; a reserve still
+    sized for 3 would send it alone.
+    """
+    VirtualClock().install(monkeypatch)
+    dispatch = BatchDispatch(batch_size=2, concurrency=1, output_order=DeliveryOrder.INPUT, coalesce_wait=0.0)
+
+    portal, _events = await _read_mixed((("sequential", 3, 0), ("cursor", 2, 0), ("cursor", 2, 0)), 4, dispatch)
+
+    assert portal.waves == [1, 2, 1, 1]
+
+
+# A hang ends the read with a refusal within this budget, so the test fails rather than waits.
+_MIXED_ELAPSED = 5.0

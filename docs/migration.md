@@ -1,5 +1,48 @@
 # Migration guide
 
+## The reference row pool and its batches
+
+- **A fan-out result longer than its share grows into free rows.** `fan_out()` and `fan_out_outcomes()`
+  reserve each command a share of `max_buffered_rows` before it is sent; a list result longer than that
+  share was dropped with `ResultTooLargeError`, so a lookup returning 51 rows failed under the default
+  `BatchDispatch`, although the budget had room for it. The answer is decoded already, so it now takes the
+  rest from the free rows. While it waits for them, the rows that come back are its first: no other command
+  reserves rows (under `INPUT` delivery, none but the frontier's), and the commands reserved before it are
+  still sent. It waits while the rows it lacks may all come back without it: a command already reserved
+  lands, or the consumer takes rows (its own command's earlier pages and, under `READY` delivery, any). Under `INPUT` delivery a result behind the frontier waits for the
+  frontier to reach it: the rows the commands before it hold come back by then, those waiting to grow as well,
+  while the rows read ahead for the commands behind it come back only after it. While a result waits, its decoded rows are held beside `max_buffered_rows`, not in it: at most one
+  result per command in flight, each no longer than the budget. A result ends with `ResultTooLargeError`, at
+  once, only when it is longer than the whole budget, or when the rows it lacks cannot all come back: they are
+  held by results waiting to grow as well or, under `INPUT`, read ahead behind it, or when `max_elapsed` runs
+  out while it waits (the operation then ends with its time budget). The error's `limit` is then the rows it
+  could hold. A paged reference page never grows: one with more rows than its
+  page size fails its reference: the response exceeded the declared page cap (`PaginationError`).
+- **Source-order (`INPUT`) batched references send fuller batches.** Each binding ahead of the frontier
+  kept room for its next page however many rows its page in flight already held, so under the default
+  budget half the pool stayed free while pages waited for rows: 50,000 bindings took twice the requests of
+  `READY` delivery. A binding now keeps only the part of its room its pages in flight do not hold, the
+  dispatcher asks whether a page may still come by the pool's own rule, and an underfilled wave whose
+  pages wait for the rows of a wave in flight waits for that wave to land instead of for the coalescing
+  timer. `concurrency=4` no longer splits the pool between half-empty waves. Without a rate limit that
+  costs wall time, since a send slot stays idle while the rows it could use are in flight (5.5 s against
+  4.7 s for 2,000 one-row commands at `batch_size=20, concurrency=4` and 100 ms per batch);
+  `coalesce_wait=0` sends every wave at once, in more requests. The figures are in `docs/performance.md`. Two small read-ahead shapes send more requests than before (35 instead of 32, and
+  59 instead of 54, in `tests/reference_read_ahead_test.py`): that is the price of keeping only the unheld
+  part of a room, which on large sources sends far fewer (about 120 instead of 193 for 5,000 bindings of one
+  and two pages).
+- **A lone fast keyset binding costs what the same traversal costs directly.** A fast or automatic keyset
+  binding is granted its row lease when it is admitted, while the source may still hold bindings that
+  would share the pool, so a single binding planned on half of `max_buffered_rows`: over 20,000 dense
+  rows Auto took 23 requests in a binding against 14 directly, range windows 20 against 11, partitioning
+  290 against 227. The lease now grows as its binding plans, once its boundary wave has landed, to the
+  share the facts then known give: a source read out by then leaves a lone binding the whole pool, and
+  the binding costs what the direct traversal costs. A source whose next binding is still being read
+  keeps the half.
+- **A counted tail fills its waves whatever `max_active_references`.** The pages waiting for a wave were
+  bounded by the active bindings, so with `max_active_references=1` and no coalescing a counted tail of 116
+  pages took 116 requests. They are bounded by the rows they reserve, and the same tail takes 8.
+
 ## Load limits, holds and attempt timeouts
 
 - **Breaking: `Settings.http_timeout` bounds each attempt, and the client's default policy is
@@ -1793,7 +1836,8 @@ reference queue spends physical requests and how it reports a failed or lost com
 - **Small plans give rows back.** Once a binding selects a sequential or boundary-only plan, it trims
   its row lease to the rows that plan can still hold, so the bindings waiting for a lease start
   sooner. The plan itself is still chosen at the full lease, so selection and geometry are as before.
-  A lease never grows, so a dense binding admitted right after a cohort of small ones is sized while
+  A lease did not grow then (it now grows once as its binding plans, see "The reference row pool and its
+  batches"), so a dense binding admitted right after a cohort of small ones is sized while
   their leases are still active and can get a smaller share than before: 20 one-row parents followed
   by a 5000-row parent send about 15% more requests (428 instead of 373 under `READY`), and a tight
   pool can make it up to 40%. Across mixed cohorts the total request count still drops.

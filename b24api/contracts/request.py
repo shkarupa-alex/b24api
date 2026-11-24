@@ -232,6 +232,7 @@ class Request:
     _positional: PositionalArguments | None = field(repr=False)
     _empty_container: bool | None = field(repr=False, compare=False)
     _batch_obstacle: BracketObstacle | None = field(repr=False, compare=False)
+    _summary: RequestSummary | None = field(repr=False, compare=False)
 
     def __init__(  # noqa: C901, PLR0913 - canonical request boundary validates each declared contract
         self,
@@ -276,6 +277,7 @@ class Request:
         object.__setattr__(self, "_parameters", frozen)
         object.__setattr__(self, "_positional", positional)
         object.__setattr__(self, "_empty_container", None)
+        object.__setattr__(self, "_summary", None)
         # Computed here, not on first read: a lazy marker object would not survive copy or pickle.
         object.__setattr__(
             self, "_batch_obstacle", None if positional is not None else bracket_obstacle(frozen, batch=True)
@@ -381,14 +383,18 @@ class Request:
 
     @property
     def summary(self) -> RequestSummary:
-        """Return the summary."""
-        return summarize_request(
-            self.method,
-            {f"@{self._positional.layout_id}": None} if self._positional else self._parameters,
-            encoding=self.encoding,
-            header_names=self.headers.names,
-            route=self.route,
-        )
+        """Return the value-free summary every error about this request carries, built on first read."""
+        if self._summary is None:
+            summary = summarize_request(
+                self.method,
+                {f"@{self._positional.layout_id}": None} if self._positional else self._parameters,
+                encoding=self.encoding,
+                header_names=self.headers.names,
+                route=self.route,
+            )
+            object.__setattr__(self, "_summary", summary)
+            return summary
+        return self._summary
 
     def __repr__(self) -> str:
         """Return a safe representation."""

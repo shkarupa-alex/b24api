@@ -42,6 +42,7 @@ from b24api.references.dispatch import (
     _KernelReferenceComplete,
     _PageEvent,
     _ProducerState,
+    _Producing,
     _ReferenceWindowError,
     _RowBuffer,
     _Work,
@@ -161,8 +162,7 @@ class ReferenceScheduler:
             if self.default_program is None
             else _active_limit(output_order, policy, self.page_cap)
         )
-        self.producer_state = _ProducerState(set(), {})
-        self._caps: dict[int, int] = {}
+        self.producer_state = _ProducerState({}, default_cap=self.page_cap)
         head_reserve = (
             self.page_cap if output_order is ReferenceOutputOrder.INPUT and self.default_program is not None else 0
         )
@@ -183,7 +183,6 @@ class ReferenceScheduler:
                 dispatch,
                 producer_state=self.producer_state,
                 buffer=self.buffer,
-                page_cap=self.page_cap,
                 pending_continuations_can_progress=output_order is ReferenceOutputOrder.READY,
             )
         self.violations: list[Violation] = []
@@ -388,18 +387,23 @@ class ReferenceScheduler:
         """Record an admitted reference's row cap and register it as a producer the dispatcher counts.
 
         Under INPUT the frontier reserve covers every admitted cap: any admitted binding may become the
-        frontier while rows behind it stay held, so the reserve is the largest admitted cap, not only the
-        current head's. The binding is runnable from the moment it leaves the source, before its task first
-        runs, so a wave never closes short in between; its task retires it.
+        frontier while rows behind it stay held, so the reserve is the largest cap of the producers still
+        adding pages (``_head_reserve``), not only the current head's. The binding is runnable from the
+        moment it leaves the source, before its task first runs, so a wave never closes short in between;
+        its task retires it.
         """
         cap = self._program(work).page_cap
-        self._caps[work.index] = cap
         if self.output_order is ReferenceOutputOrder.INPUT:
             self.buffer.raise_head_reserve(cap)
         self.producer_state.register(_producer_key(work.index), work.index, cap)
 
-    def _head_cap(self, index: int) -> int:
-        return self._caps.get(index, self.page_cap if self.default_program is not None else 0)
+    def _head_reserve(self) -> int:
+        """Return the rows the INPUT frontier keeps free: the largest page cap among the producers.
+
+        A binding the source has not yielded yet may become the frontier with no producer left: its default cap.
+        """
+        default = self.page_cap if self.default_program is not None else 0
+        return max(self.producer_state.caps.values(), default=default)
 
     async def _run_reference(self, work: _Work, output: asyncio.Queue[_Event]) -> None:
         """Own one reference transaction from its first page to its terminal event, published on every way out.
@@ -583,13 +587,12 @@ class ReferenceScheduler:
         return self.dispatch.batch_size
 
     async def lease_rows(self, run: _ReferenceRun, fast: FastKeysetProgram) -> _Reservation:
-        """Wait for the binding's row lease ``G``; it is held, never grown, until the binding's terminal."""
+        """Wait for the binding's row lease ``G``; it grows only as its binding plans, and is held until terminal."""
         index = run.work.index
         self._fast_active.add(index)
         self._fast_waiting += 1
         # A binding waiting for its lease cannot add a command, so no wave may wait to coalesce with it.
-        self.producer_state.runnable.discard(run.producer_key)
-        self.producer_state.touch()
+        self.producer_state.move(run.producer_key, _Producing.WAITING)
         try:
             # The wait is bounded by the operation's elapsed budget, as every dispatch wait is.
             async with self.context.deadline("fast keyset lease wait exceeded the operation time budget"):
@@ -598,7 +601,7 @@ class ReferenceScheduler:
             self._fast_waiting -= 1
         # Every page of a leased binding is charged to its lease, none to the free pool rows.
         self.producer_state.charge_to_lease(run.producer_key)
-        self.producer_state.runnable.add(run.producer_key)
+        self.producer_state.move(run.producer_key, _Producing.RUNNABLE)
         return lease
 
     async def settle_lease(self, lease: _Reservation, rows: int) -> None:
@@ -630,12 +633,7 @@ class ReferenceScheduler:
                     return free
                 raise BudgetExceededError("fast keyset lease cannot fit the boundary wave at the INPUT frontier")
             return None
-        admission = self._admission
-        others = admission is not None and len(admission.tasks) > 1
-        unread = not self._source_ended
-        keep = 0 if frontier or not (others or unread) else self.buffer.head_reserve
-        sources = len(self._fast_active) + (1 if unread else 0)
-        cap = max(fast.floor, (pool - keep) // sources)
+        keep, cap = self._share(fast, frontier=frontier)
         available = free - keep
         # G = clamp(free - R_keep, P, G_cap): a share below the quota Q starts from the floor P, while a
         # share that can hold Q waits for it rather than plan below the comfortable quota.
@@ -646,6 +644,33 @@ class ReferenceScheduler:
                 return min(free, cap)
             raise BudgetExceededError("fast keyset lease cannot fit its plan at the INPUT frontier")
         return None
+
+    def grow_lease(self, run: _ReferenceRun, fast: FastKeysetProgram, lease: _Reservation) -> int:
+        """Grow the binding's lease to the share the facts known as it plans give; return the rows it holds.
+
+        A lease is sized at admission, while the source may still hold bindings that would share the pool. Once
+        the binding's boundary wave has landed, the source may have ended and other bindings finished: the
+        lease takes up to its share of the free rows, keeping the frontier reserve as ``_lease_size`` does.
+        AUTO below the floor already holds the whole pool, or all the frontier could take.
+        """
+        if not (fast.automatic and self.buffer.maximum < fast.floor):
+            frontier = self.output_order is ReferenceOutputOrder.INPUT and run.work.index == self.buffer.head_index
+            keep, cap = self._share(fast, frontier=frontier)
+            self.buffer.grow_lease(lease, lambda free: min(free - keep, cap - lease.amount))
+        return lease.amount
+
+    def _share(self, fast: FastKeysetProgram, *, frontier: bool) -> tuple[int, int]:
+        """Return the rows a lease keeps free for the INPUT frontier, and the most it may hold.
+
+        A binding keeps the frontier reserve R free while any other source is active or unread, and takes at
+        most an even share of the pool among the fast sources that are active or may still arrive.
+        """
+        admission = self._admission
+        others = admission is not None and len(admission.tasks) > 1
+        unread = not self._source_ended
+        keep = 0 if frontier or not (others or unread) else self.buffer.head_reserve
+        sources = len(self._fast_active) + (1 if unread else 0)
+        return keep, max(fast.floor, (self.buffer.maximum - keep) // sources)
 
     async def _wake_lease_waiters(self) -> None:
         if self._fast_waiting:
@@ -670,9 +695,7 @@ class ReferenceScheduler:
 
     async def dispatch_page(self, run: _ReferenceRun, request: Request) -> _DispatchedPage:
         """Schedule one page, reserve its row capacity and dispatch it; the caller settles it."""
-        self.producer_state.runnable.discard(run.producer_key)
-        self.producer_state.admitting.add(run.producer_key)
-        self.producer_state.touch()
+        self.producer_state.move(run.producer_key, _Producing.ADMITTING)
         run.scheduled_sequences.append(self.take_page_sequence())
         run.completion.scheduled()
         run.reservation = await self.buffer.reserve(run.work.index, run.program.page_cap)
@@ -687,8 +710,7 @@ class ReferenceScheduler:
 
     async def abandon_page(self, run: _ReferenceRun) -> None:
         """Return the row capacity of a page whose dispatch raised."""
-        self.producer_state.admitting.discard(run.producer_key)
-        self.producer_state.touch()
+        self.producer_state.leave(run.producer_key, _Producing.ADMITTING)
         if run.reservation is not None:
             await self.buffer.abort(run.reservation)
         run.reservation = None
@@ -724,14 +746,19 @@ class ReferenceScheduler:
         if run.reservation.hold is _Hold.IN_FLIGHT:
             # A counted head's rows were already charged when it was selected (LeaseCountedRowAccount).
             if page.retained_rows > run.reservation.amount:
-                # The page was answered: a result larger than the rows reserved for it is dropped, and its command
-                # ran. A fan-out result longer than its share of the row budget ends here.
-                raise dropped_result(
-                    rows=page.retained_rows,
-                    limit=run.reservation.amount,
-                    request_summary=run.work.reference.request.summary,
-                    evidence=page.response.evidence,
-                )
+                # The page was answered with more rows than it reserved, a whole result of a call that does not
+                # page: it grows into free rows, or, if the pool can never hold them, is dropped, its command run.
+                # While it waits its rows are the pool's first claim and no page reserves more, so it frees its
+                # sender's slot: the pages reserved before it are sent, and their unused rows come back to it.
+                run.admit_page()
+                limit = await self.buffer.grow(run.reservation, page.retained_rows)
+                if limit is not None:
+                    raise dropped_result(
+                        rows=page.retained_rows,
+                        limit=limit,
+                        request_summary=run.work.reference.request.summary,
+                        evidence=page.response.evidence,
+                    )
             await self.buffer.accept(run.reservation, page.retained_rows)
 
     async def _deliver_page(self, run: _ReferenceRun, page: _Page) -> bool:
@@ -754,8 +781,7 @@ class ReferenceScheduler:
         acknowledged = asyncio.get_running_loop().create_future() if awaits_consumer else None
         # A dense counted tail reports its own pending pages to the dispatcher (ReferenceTailStream).
         if acknowledged is not None and page.continuing and not run.tail_active:
-            self.producer_state.pending_continuations.add(run.producer_key)
-            self.producer_state.touch()
+            self.producer_state.move(run.producer_key, _Producing.AWAITING_CONSUMER)
         page_violations = tuple(run.driver.violations[run.violation_offset :])
         run.violation_offset = len(run.driver.violations)
         page_records = self._pending_page_records(run)
@@ -780,7 +806,7 @@ class ReferenceScheduler:
             await acknowledged
             if self.output_order is ReferenceOutputOrder.READY:
                 run.settle_page()
-        self.producer_state.pending_continuations.discard(run.producer_key)
+        self.producer_state.leave(run.producer_key, _Producing.AWAITING_CONSUMER)
         run.partial_rows += len(page.items)
         run.reservation = None
         stopped = await self._caller_stopped(run, page, page_records)
@@ -789,8 +815,7 @@ class ReferenceScheduler:
         if stopped:
             return False
         if page.continuing and not run.tail_active:
-            self.producer_state.runnable.add(run.producer_key)
-            self.producer_state.touch()
+            self.producer_state.move(run.producer_key, _Producing.RUNNABLE)
         return True
 
     async def _caller_stopped(self, run: _ReferenceRun, page: _Page, page_records: tuple[PageRecord, ...]) -> bool:
@@ -877,7 +902,6 @@ class ReferenceScheduler:
                 continue
             await _finish_task(admission.tasks, event.work.index)
             admission.queues.pop(event.work.index, None)
-            self._caps.pop(event.work.index, None)
             admission.slots.release()
             await self._wake_lease_waiters()
         (await producer).unwrap()
@@ -901,11 +925,10 @@ class ReferenceScheduler:
                 continue
             await _finish_task(admission.tasks, head)
             admission.queues.pop(head, None)
-            self._caps.pop(head, None)
             admission.slots.release()
             await self._wake_lease_waiters()
             next_head = min(admission.tasks) if admission.tasks else head + 1
-            await self.buffer.advance_head(next_head, max(self._caps.values(), default=self._head_cap(next_head)))
+            await self.buffer.advance_head(next_head, self._head_reserve())
         (await producer).unwrap()
         self._raise_if_budget_refused()
 

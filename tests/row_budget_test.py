@@ -48,6 +48,8 @@ from tests.scripting import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Callable
+
     from b24api.contracts import CommandOutcome
     from b24api.references.dispatch import _Reservation
     from tests.scripting import Envelope, Query
@@ -279,7 +281,7 @@ async def test_a_counted_tail_page_over_its_cap_is_reported_as_answered() -> Non
     ]
 
 
-def _rows(count: int) -> ResponderTransport:
+def _list_answer(count: int) -> Callable[[Request], object]:
     """Answer a direct request, or each command of a classic batch, with a list of ``count`` rows."""
 
     def respond(request: Request) -> object:
@@ -288,7 +290,12 @@ def _rows(count: int) -> ResponderTransport:
             return {"result": {"result": {key: list(range(count)) for key in commands}, "result_error": []}}
         return {"result": list(range(count))}
 
-    return ResponderTransport(respond)
+    return respond
+
+
+def _rows(count: int) -> ResponderTransport:
+    """Answer every request with lists of ``count`` rows (``_list_answer``)."""
+    return ResponderTransport(_list_answer(count))
 
 
 # A command's share of the row budget: the budget divided among the results a dispatch has in flight at once, a
@@ -339,32 +346,39 @@ async def test_a_fan_out_result_exactly_its_share_of_the_row_budget_is_delivered
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("dispatch", "policy", "share"), _SHARES[:2], ids=_SHARE_IDS[:2])
-async def test_a_fan_out_result_far_longer_than_its_share_names_the_share_as_its_limit(
+@pytest.mark.parametrize(("dispatch", "policy", "share"), _SHARES, ids=_SHARE_IDS)
+async def test_a_fan_out_result_longer_than_its_share_grows_into_the_free_rows(
     dispatch: BatchDispatch | DirectDispatch, policy: ExecutionPolicy | None, share: int
 ) -> None:
-    # The limit is the rows the share left the result, however far the result outgrew it.
+    # The share is what a command reserves before it is sent. Its answer is decoded already: while the pool has
+    # the rows, a longer result keeps them, here twice its share.
     command = Command(Request("crm.item.list", {}, ReplaySafety.SAFE, route=RouteKind.BARE), 0)
     async with client_for(_rows(share * 2), policy=policy) as client:
-        (outcome,) = [outcome async for outcome in client.fan_out_outcomes([command], dispatch=dispatch)]
+        stream = client.fan_out_outcomes([command], dispatch=dispatch)
+        (outcome,) = [outcome async for outcome in stream]
 
-    _assert_dropped(outcome, rows=share * 2, limit=share)
+    assert isinstance(outcome, CommandSuccess)
+    assert outcome.response.result == list(range(share * 2))
+    report = stream.report
+    assert report is not None
+    assert report.buffered_rows_high_water == share * 2
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("dispatch", "policy", "share"), _SHARES, ids=_SHARE_IDS)
-async def test_a_fan_out_result_longer_than_its_share_of_the_row_budget_reports_that_it_ran(
+async def test_a_fan_out_result_longer_than_the_row_budget_reports_that_it_ran(
     dispatch: BatchDispatch | DirectDispatch, policy: ExecutionPolicy | None, share: int
 ) -> None:
+    del share
     command = Command(Request("crm.item.add", {}, ReplaySafety.UNSAFE, route=RouteKind.BARE), 0)
-    transport = _rows(share + 1)
+    transport = _rows(_DEFAULT_ROWS + 1)
     async with client_for(transport, policy=policy) as client:
         (outcome,) = [outcome async for outcome in client.fan_out_outcomes([command], dispatch=dispatch)]
         _, error = await drain_to_failure(client.fan_out([command], dispatch=dispatch), BatchFailed)
 
-    _assert_dropped(outcome, rows=share + 1, limit=share)
+    _assert_dropped(outcome, rows=_DEFAULT_ROWS + 1, limit=_DEFAULT_ROWS)
     (failed,) = error.outcomes
-    _assert_dropped(failed, rows=share + 1, limit=share)
+    _assert_dropped(failed, rows=_DEFAULT_ROWS + 1, limit=_DEFAULT_ROWS)
     assert len(transport.requests) == 2  # noqa: PLR2004 - one send of each operation
 
 
@@ -380,15 +394,216 @@ _CLIENT_LIMIT = 2
 async def test_a_fan_out_share_counts_only_the_sends_the_client_limit_lets_in_flight(
     dispatch: BatchDispatch | DirectDispatch,
 ) -> None:
-    # The client keeps two requests in flight, so two results share the budget, however wide the dispatch.
+    # The client keeps two requests in flight, so two results share the budget, however wide the dispatch: each
+    # reserves half of it. Both answer one row more: the first to land waits for a row the other holds, the other
+    # finds the rest held by a result that waits as well, and is dropped with the share it held. The first then
+    # grows into its rows. Shared among ten, both would have grown.
     share = _DEFAULT_ROWS // _CLIENT_LIMIT
-    command = Command(Request("crm.item.list", {}, ReplaySafety.SAFE, route=RouteKind.BARE), 0)
-    transport = _rows(share + 1)
+    commands = [
+        Command(Request("crm.item.list", {"id": index}, ReplaySafety.SAFE, route=RouteKind.BARE), index)
+        for index in range(_CLIENT_LIMIT)
+    ]
+    answer = _list_answer(share + 1)
+    both = asyncio.Event()
+
+    async def respond(request: Request) -> object:
+        # Both commands are in flight before either answers.
+        if len(transport.requests) == _CLIENT_LIMIT:
+            both.set()
+        await both.wait()
+        return answer(request)
+
+    transport = ResponderTransport(respond)
     settings = Settings(webhook_url=f"https://{transport.host}/rest/1/token/", max_concurrent_requests=_CLIENT_LIMIT)
     async with Bitrix24(settings, transport=transport) as client:
-        (outcome,) = [outcome async for outcome in client.fan_out_outcomes([command], dispatch=dispatch)]
+        outcomes = [outcome async for outcome in client.fan_out_outcomes(on_loop(commands), dispatch=dispatch)]
 
-    _assert_dropped(outcome, rows=share + 1, limit=share)
+    (delivered,) = [outcome for outcome in outcomes if isinstance(outcome, CommandSuccess)]
+    assert delivered.response.result == list(range(share + 1))
+    (dropped,) = [outcome for outcome in outcomes if isinstance(outcome, CommandFailure)]
+    _assert_dropped(dropped, rows=share + 1, limit=share)
+
+
+def _two_answers(share: int, *, longer_first: bool) -> ResponderTransport:
+    """Answer two commands in flight together: one with ``share`` rows, the other with a page more, first or last."""
+    lists = {0: _list_answer(share), 1: _list_answer(share + _PAGE_ROWS)}
+    both = asyncio.Event()
+
+    async def respond(request: Request) -> object:
+        if len(transport.requests) == 2:  # noqa: PLR2004 - both commands
+            both.set()
+        await both.wait()
+        command = cast("int", request.copy_parameters()["id"])
+        if (command == 1) is not longer_first:
+            for _ in range(10):
+                await asyncio.sleep(0)
+        return lists[command](request)
+
+    transport = ResponderTransport(respond)
+    return transport
+
+
+async def _two_outcomes(transport: ResponderTransport, order: DeliveryOrder) -> tuple[list[CommandOutcome[int]], int]:
+    """Fan out two commands in flight together; the consumer stalls after the first outcome until both answered."""
+    commands = [
+        Command(Request("crm.item.list", {"id": index}, ReplaySafety.SAFE, route=RouteKind.BARE), index)
+        for index in range(2)
+    ]
+    async with client_for(transport) as client:
+        stream = client.fan_out_outcomes(on_loop(commands), dispatch=DirectDispatch(concurrency=2, output_order=order))
+        outcomes: list[CommandOutcome[int]] = []
+        async with stream:
+            async for outcome in stream:
+                outcomes.append(outcome)
+                for _ in range(30):
+                    await asyncio.sleep(0)
+    report = stream.report
+    assert report is not None
+    return outcomes, report.buffered_rows_high_water
+
+
+@pytest.mark.asyncio
+async def test_a_result_behind_the_input_frontier_waits_for_the_rows_the_frontier_frees() -> None:
+    # Two commands in flight reserve half the budget each. The second answers first, a page more than its half,
+    # while the first, the frontier, is in flight; then the first answers its whole half, which waits for the
+    # consumer. Behind the frontier the second waits for the consumer to take the frontier's rows, and grows.
+    share = _DEFAULT_ROWS // 2
+    outcomes, high_water = await _two_outcomes(_two_answers(share, longer_first=True), DeliveryOrder.INPUT)
+
+    assert [outcome.correlation for outcome in outcomes] == [0, 1]
+    assert [_rows_of(outcome) for outcome in outcomes] == [share, share + _PAGE_ROWS]
+    assert high_water <= _DEFAULT_ROWS
+
+
+@pytest.mark.asyncio
+async def test_a_ready_result_waits_for_the_rows_the_consumer_holds() -> None:
+    # The first command answers its whole half of the budget, and the consumer holds those rows while it stalls;
+    # the second answers a page more than its half. The consumer takes rows whatever the second does, so the second
+    # waits for them, and grows.
+    share = _DEFAULT_ROWS // 2
+    outcomes, high_water = await _two_outcomes(_two_answers(share, longer_first=False), DeliveryOrder.READY)
+
+    assert [outcome.correlation for outcome in outcomes] == [0, 1]
+    assert [_rows_of(outcome) for outcome in outcomes] == [share, share + _PAGE_ROWS]
+    assert high_water <= _DEFAULT_ROWS
+
+
+_FEW_ROWS = 10
+_GROWTH = 1000
+# The first three commands, then the rest.
+_TWO_BATCHES = 2
+
+
+@pytest.mark.asyncio
+async def test_a_batched_result_waiting_to_grow_frees_its_send_slot_for_the_commands_reserved_before_it() -> None:
+    # One batch at a time, three commands a batch, each reserving a third of the budget. The first command answers
+    # 1,000 rows more than its share. While it waits to grow it holds no send slot, and no command reserves rows:
+    # the rows its batch's other two return are its first, so it grows, and the commands behind it follow in one
+    # more batch. Holding the slot, it waited for rows only a command behind it, never sent, could return.
+    share = _DEFAULT_ROWS // 3
+    rows = {0: share + _GROWTH} | dict.fromkeys(range(1, 6), _FEW_ROWS)
+
+    def respond(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        answers = {key: list(range(rows[int(str(command).rsplit("=", 1)[1])])) for key, command in commands.items()}
+        return {"result": {"result": answers, "result_error": []}}
+
+    transport = ResponderTransport(respond)
+    commands = [
+        Command(Request("crm.item.list", {"id": index}, ReplaySafety.SAFE, route=RouteKind.BARE), index)
+        for index in rows
+    ]
+    dispatch = BatchDispatch(batch_size=3, concurrency=1, output_order=DeliveryOrder.READY)
+    async with client_for(transport, policy=ExecutionPolicy(max_elapsed=DEADLINE_BUDGET * 10)) as client:
+        stream = client.fan_out_outcomes(on_loop(commands), dispatch=dispatch)
+        outcomes = [outcome async for outcome in stream]
+
+    assert {outcome.correlation: _rows_of(outcome) for outcome in outcomes} == rows
+    assert len(transport.requests) == _TWO_BATCHES
+    report = stream.report
+    assert report is not None
+    assert report.buffered_rows_high_water <= _DEFAULT_ROWS
+
+
+@pytest.mark.asyncio
+async def test_a_batched_result_waiting_to_grow_lets_the_command_reserved_behind_it_be_sent() -> None:
+    # One batch at a time. The first command travels alone; while it is in flight the second reserves its share and
+    # waits for the send slot. The first answers 1,000 rows more than its share, and only the second, once sent and
+    # answered, returns enough: a result waiting to grow frees its slot, so the second is sent, lands short, and the
+    # first grows into its rows. Holding the slot, the first waited for a command that could never be sent.
+    share = _DEFAULT_ROWS // 3
+    rows = {0: share + _GROWTH, 1: _FEW_ROWS}
+    first_sent = asyncio.Event()
+
+    async def respond(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        if not first_sent.is_set():
+            first_sent.set()
+            for _ in range(50):
+                await asyncio.sleep(0)
+        answers = {key: list(range(rows[int(str(command).rsplit("=", 1)[1])])) for key, command in commands.items()}
+        return {"result": {"result": answers, "result_error": []}}
+
+    async def commands() -> AsyncIterator[Command[int]]:
+        for index in rows:
+            yield Command(Request("crm.item.list", {"id": index}, ReplaySafety.SAFE, route=RouteKind.BARE), index)
+            await first_sent.wait()
+
+    transport = ResponderTransport(respond)
+    dispatch = BatchDispatch(batch_size=3, concurrency=1, coalesce_wait=0.0, output_order=DeliveryOrder.READY)
+    async with client_for(transport, policy=ExecutionPolicy(max_elapsed=DEADLINE_BUDGET * 10)) as client:
+        stream = client.fan_out_outcomes(commands(), dispatch=dispatch)
+        outcomes = [outcome async for outcome in stream]
+
+    assert {outcome.correlation: _rows_of(outcome) for outcome in outcomes} == rows
+    assert len(transport.requests) == _TWO_BATCHES
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("landing", [(2, 1, 0), (2, 0, 1)], ids=["behind-first", "frontier-first"])
+async def test_input_results_that_fit_the_budget_together_grow_whichever_lands_first(landing: tuple[int, ...]) -> None:
+    # Three commands in flight share the budget. The first two answer more than their share, together less than the
+    # budget. Behind the frontier a result waits for the frontier to reach it rather than take rows the frontier may
+    # need: whichever lands first, both grow. Taking them, the result behind left the frontier dropped.
+    share = _DEFAULT_ROWS // 3
+    rows = {0: share + _GROWTH // 2, 1: share + _GROWTH * 4 // 5, 2: _FEW_ROWS}
+    all_sent = asyncio.Event()
+    landed = {command: asyncio.Event() for command in landing}
+
+    async def respond(request: Request) -> object:
+        if len(transport.requests) == len(rows):
+            all_sent.set()
+        await all_sent.wait()
+        command = cast("int", request.copy_parameters()["id"])
+        position = landing.index(command)
+        if position:
+            await landed[landing[position - 1]].wait()
+            for _ in range(50):
+                await asyncio.sleep(0)
+        landed[command].set()
+        return {"result": list(range(rows[command]))}
+
+    transport = ResponderTransport(respond)
+    commands = [
+        Command(Request("crm.item.list", {"id": index}, ReplaySafety.SAFE, route=RouteKind.BARE), index)
+        for index in rows
+    ]
+    dispatch = DirectDispatch(concurrency=len(rows), output_order=DeliveryOrder.INPUT)
+    async with client_for(transport, policy=ExecutionPolicy(max_elapsed=DEADLINE_BUDGET * 10)) as client:
+        stream = client.fan_out_outcomes(on_loop(commands), dispatch=dispatch)
+        outcomes = [outcome async for outcome in stream]
+
+    assert [(outcome.correlation, _rows_of(outcome)) for outcome in outcomes] == list(rows.items())
+    report = stream.report
+    assert report is not None
+    assert report.buffered_rows_high_water <= _DEFAULT_ROWS
+
+
+def _rows_of(outcome: CommandOutcome[int]) -> int:
+    assert isinstance(outcome, CommandSuccess)
+    return len(cast("list[int]", outcome.response.result))
 
 
 _BATCHES_IN_FLIGHT = 4
@@ -484,6 +699,74 @@ async def test_a_command_waiting_for_rows_a_stalled_consumer_holds_ends_with_the
     assert str(waited.error) == "row buffer wait exceeded operation time budget"
     assert execution(waited.error) is Execution.NOT_SENT
     assert len(transport.requests) == 1
+    assert isinstance(error, BudgetExceededError)
+    report = stream.report
+    assert report is not None
+    assert report.state is TerminalState.INCOMPLETE
+    assert "budget_exhausted" in {violation.code for violation in report.violations}
+
+
+# The rows each of two commands answers, and the limit the second is dropped with: the rows it could hold.
+_DEADLINE_DROPS: dict[str, tuple[tuple[int, int], int]] = {
+    "its_share": ((2, 3), 2),
+    # The first command's unused row is free: the second could hold it as well.
+    "its_share_and_the_free_rows": ((1, 4), 3),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", list(_DEADLINE_DROPS))
+@pytest.mark.parametrize("order", [DeliveryOrder.READY, DeliveryOrder.INPUT])
+async def test_a_result_waiting_to_grow_when_the_elapsed_budget_runs_out_ends_as_a_command_that_ran(
+    monkeypatch: pytest.MonkeyPatch, order: DeliveryOrder, case: str
+) -> None:
+    # Two commands in flight share 4 rows, 2 each. The consumer holds the first command's rows while it stalls; the
+    # second answers more than its share and the free rows and waits to grow into rows the consumer's may return. The
+    # elapsed budget runs out first: the second command ran, so it ends dropped as answered, never as unsent, with the
+    # rows it could hold as its limit, and the operation ends with its time budget.
+    answers, limit = _DEADLINE_DROPS[case]
+    grow = _RowBuffer.grow
+    wait_ended = asyncio.Event()
+
+    async def observed_grow(buffer: _RowBuffer, reservation: _Reservation, total: int) -> int | None:
+        try:
+            return await grow(buffer, reservation, total)
+        finally:
+            wait_ended.set()
+
+    monkeypatch.setattr(_RowBuffer, "grow", observed_grow)
+    both_sent = asyncio.Event()
+
+    async def respond(request: Request) -> object:
+        if len(transport.requests) == len(commands):
+            both_sent.set()
+        await both_sent.wait()
+        index = cast("int", request.copy_parameters()["id"])
+        for _turn in range(10 * index):  # the second answer lands once the first is the consumer's
+            await asyncio.sleep(0)
+        return {"result": list(range(answers[index]))}
+
+    transport = ResponderTransport(respond)
+    commands = [
+        Command(Request("crm.item.add", {"id": index}, ReplaySafety.UNSAFE, route=RouteKind.BARE), index)
+        for index in range(2)
+    ]
+    policy = ExecutionPolicy(max_elapsed=DEADLINE_BUDGET, max_buffered_rows=4)
+    async with client_for(transport, policy=policy) as client:
+        stream = client.fan_out_outcomes(on_loop(commands), dispatch=DirectDispatch(concurrency=2, output_order=order))
+        first = await anext(stream)
+        # The consumer stalls with the first result in hand until the second command's growth has ended.
+        await reached(wait_ended, DEADLINE_BUDGET + DEADLINE_SLACK)
+        rest, error = await drain_to_failure(stream, BudgetExceededError)
+
+    assert isinstance(first, CommandSuccess)
+    (dropped,) = rest
+    assert isinstance(dropped, CommandFailure)
+    assert isinstance(dropped.error, ResultTooLargeError)
+    assert (dropped.error.rows, dropped.error.limit) == (answers[1], limit)
+    assert execution(dropped.error) is Execution.ANSWERED
+    assert dropped.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
+    assert len(transport.requests) == len(commands)
     assert isinstance(error, BudgetExceededError)
     report = stream.report
     assert report is not None

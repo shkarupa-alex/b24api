@@ -11,6 +11,7 @@ dispatcher, and its page evidence is recorded into the shared operation gate und
 
 from __future__ import annotations
 import asyncio
+import functools
 from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol
 
@@ -19,7 +20,7 @@ from b24api.contracts.report import KeysetSelectionSummary, Violation, Violation
 from b24api.errors import PaginationError
 from b24api.execution.context import latch_escape
 from b24api.references.budget_view import BindingBudgetView, RowLease
-from b24api.references.dispatch import _DoneEvent, _FailureEvent, _PageEvent
+from b24api.references.dispatch import _DoneEvent, _FailureEvent, _PageEvent, _Producing
 from b24api.references.wave_engine import SharedWaveEngine, WaveHost
 from b24api.traversal.keyset_eligibility import reject_unencodable_fast_request, validate_fast_keyset
 from b24api.traversal.keyset_observation import FastTraceRecorder
@@ -56,6 +57,10 @@ class FastKeysetHost(WaveHost, Protocol):
         """Wait for and hold the binding's row lease in the shared pool."""
         ...
 
+    def grow_lease(self, run: _ReferenceRun, fast: FastKeysetProgram, lease: _Reservation) -> int:
+        """Grow the binding's lease to its share as it plans; return the rows it holds."""
+        ...
+
     async def settle_lease(self, lease: _Reservation, rows: int) -> None:
         """Fix the planned binding's lease at ``rows``, giving the rest back to the shared pool."""
         ...
@@ -85,7 +90,9 @@ async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKe
         )
         reject_unencodable_fast_request(request)
         lease = await host.lease_rows(run, fast)
-        view = BindingBudgetView.over(host.context, RowLease.of(lease))
+        view = BindingBudgetView.over(
+            host.context, RowLease.of(lease), functools.partial(host.grow_lease, run, fast, lease)
+        )
         runtime = KeysetRuntime(
             request=request,
             identity=fast.identity,
@@ -169,10 +176,7 @@ async def _deliver(
     """
     state, key = host.producer_state, run.producer_key
     continuing = not runtime.terminal
-    state.runnable.discard(key)
-    if continuing:
-        state.pending_continuations.add(key)
-    state.touch()
+    state.move(key, _Producing.AWAITING_CONSUMER if continuing else _Producing.WAITING)
     acknowledged = asyncio.get_running_loop().create_future()
     await run.output.put(
         _PageEvent(
@@ -190,10 +194,8 @@ async def _deliver(
     )
     await acknowledged
     run.partial_rows += len(rows)
-    state.pending_continuations.discard(key)
     if continuing:
-        state.runnable.add(key)
-    state.touch()
+        state.move(key, _Producing.RUNNABLE)
 
 
 def _page_records(host: FastKeysetHost, run: _ReferenceRun, trace: FastTraceRecorder) -> tuple[PageRecord, ...]:
