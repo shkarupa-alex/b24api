@@ -2,7 +2,7 @@
   "slf001_tests": 116,
   "slf001_package": 27,
   "noqa_package": 150,
-  "homemade_transports": 35,
+  "homemade_transports": 34,
   "long_functions": {
     "b24api/testing/transport.py::_run_case": {
       "lines": 124,

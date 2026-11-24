@@ -39,6 +39,8 @@ dependencies = [
     # verified against, and widening either bound reruns the hpack matrix (httpx-latest job).
     "h2>=4.3.0,<4.5",
     "hpack>=4.1.0,<4.3",
+    # The conformance responder in b24api.testing reads requests with h11, the HTTP/1.1 parser under HTTPX.
+    "h11>=0.16",
     "pydantic>=2.12.0",
     "pydantic-settings>=2.10.1",
 ]

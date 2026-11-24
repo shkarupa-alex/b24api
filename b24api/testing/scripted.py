@@ -199,13 +199,13 @@ class ScriptedTransport:
     """Match a finite frozen exchange table by the exact request each call sends.
 
     A call matches an exchange whose request is equal to it (method, route, replay safety, body encoding,
-    scoped headers, embedded-error contract and parameters). ``Request`` equality reads JSON objects as
+    scoped headers, raw content, embedded-error contract and parameters). ``Request`` equality reads JSON objects as
     unordered, as the client builds them (a cursor it sets is added where the update puts it), so a test
     that depends on key order, such as the sort priority of ``order``, asserts it on ``calls``, which keep
-    each request's parameters in the order they were sent. Form-encoded bodies and scoped headers are
-    supported as an HTTP transport supports them. A call no exchange matches is recorded in ``unexpected``
-    and fails its send; the client reports that as a transport failure of the call, and
-    ``assert_exhausted()`` names it ahead of unused exchanges.
+    each request's parameters in the order they were sent. Form-encoded bodies, query-string requests with or
+    without raw content and scoped headers are supported as an HTTP transport supports them. A call no
+    exchange matches is recorded in ``unexpected`` and fails its send; the client reports that as a transport
+    failure of the call, and ``assert_exhausted()`` names it ahead of unused exchanges.
     """
 
     capabilities = TransportCapabilities(
@@ -284,6 +284,7 @@ class ScriptedTransport:
             replay_safety=request.replay_safety,
             encoding=request.encoding,
             headers=request.headers,
+            content=request.content,
             result_error=request.result_error,
             route=request.route,
         )

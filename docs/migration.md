@@ -1,5 +1,51 @@
 # Migration guide
 
+## Actions outside a JSON or form POST
+
+- **Breaking for code that matches or enumerates `BodyEncoding`: it gains `QUERY_STRING`.** Such a request sends its
+  parameters in the URL's query, in the PHP encoding of form bodies, and refuses at build time what that
+  encoding would drop, as a form request does, but without advising JSON encoding, which a GET-only action
+  cannot take. Without content it is a GET, which `crm.site.fileuploader.preview`,
+  `crm.site.fileuploader.download`, `call.Track.download` and `crm.timeline.ai.mergefields` require.
+- **New `RawContent(data, content_type)` and `Request(content=...)`** (also on `Request.bare()`, in the
+  `RequestSpec` mapping, kept by `with_parameters()`). A `QUERY_STRING` request with content is a POST of
+  those bytes as they are, under the declared content type, as `crm.site.fileuploader.upload` reads a chunk.
+  Content with another encoding is refused when the request is built. The content type is a media type with
+  optional parameters, as RFC 9110 writes it in visible ASCII (`text/plain; charset=utf-8`), at most 256 characters;
+  `HttpxTransport` checks it again before it sends. Its representation shows the type and length, never
+  the bytes.
+- **Breaking: a transport that declares `QUERY_STRING` in `TransportCapabilities.encodings` must honor
+  `content`.** `HttpxTransport` and `ScriptedTransport` declare it; a send-only transport, one that does not declare it and
+  a classic batch refuse such a request before any send. The `CapabilityError` for an undeclared encoding now
+  reads "transport does not support <encoding> requests" (it said "request bodies").
+  A scripted exchange matches raw content by its bytes and type. A third-party transport that declares its
+  encodings as `frozenset(BodyEncoding)` now declares `QUERY_STRING` too, with no change of its own: the
+  client sends it query-string requests, and `run_transport_conformance` fails it. List the encodings it builds instead.
+- **Breaking for code that matches or enumerates `ConformanceCase`, or counts a report's outcomes: it gains
+  `QUERY_STRING_GET` and `QUERY_STRING_RAW_CONTENT`.** Both are skipped for a transport that does not declare `QUERY_STRING`. They
+  decode the query as PHP does (`+` and `%20` are both a space, the order of distinct keys does not matter,
+  a blank value or a bare key is a parameter) and require exactly the pairs the client encodes, so a transport
+  that sends a list item as `[]`, repeats a key or adds an empty one fails though PHP would read it alike.
+  The GET must carry no body and no content type; the raw POST must carry exactly the declared bytes and the
+  declared content type exactly as written, so a transport that rewrites it, even to an equivalent form, fails.
+  An injected HTTPX client's own `params` join the query, as they join a body request's URL; on a shared key
+  the request's value wins.
+- **Breaking for a transport whose requests HTTP/1.1 cannot parse: the conformance responder reads a request
+  with `h11`**, the HTTP/1.1 parser under HTTPX, now a declared dependency. Every case decodes a body sent
+  chunked as one sent with `Content-Length`, so a transport that streams its body no longer fails the body
+  cases, and a GET whose body goes out chunked fails `QUERY_STRING_GET`. Header names are matched in any
+  letter case. A request HTTP/1.1 cannot parse, such as one without `Host` or with a space before a header's
+  colon, which a server must refuse, fails the case that sent it with the detail `UnparseableRequest` when
+  the responder has read it by the time the transport ends, whether the transport returns, raises or is
+  cancelled, so always for a transport that reads the answer. If the transport ends before the responder has
+  read the request, the detail is not promised: the responder may still read it before the case closes, or
+  closing may drop it unread; the case then keeps its own outcome or the transport's error, and a case that
+  does not wait for a request may even pass. A header line folded onto the next is joined to it with one
+  space, keeping any whitespace that ended the first line, as HTTP/1.1 lets a server do, so the raw case reads
+  a folded content type as joined; a portal's web server may refuse it instead.
+- **HTTPX log records of the client's own requests drop the URL's query** and keep its path, as they never
+  show a body. The query still reaches the portal's web server and any proxy, which may log it.
+
 ## The reference row pool and its batches
 
 - **A fan-out result longer than its share grows into free rows.** `fan_out()` and `fan_out_outcomes()`

@@ -14,7 +14,7 @@ from b24api._error_types import FailurePhase
 from b24api._webhook import TokenVault, Webhook, WebhookRefusal, parse_webhook
 from b24api.contracts.evidence import ResponseEvidence
 from b24api.contracts.request_summary import RequestSummary, RouteKind
-from b24api.contracts.wire import BodyEncoding, _validate_headers
+from b24api.contracts.wire import BodyEncoding, _validate_headers, _validate_sent_content
 from b24api.encoding import encode_php_query
 from b24api.errors import (
     ClientClosedError,
@@ -88,7 +88,7 @@ class HttpxTransport:
     """HTTPX transport with conservative failure-phase classification."""
 
     capabilities = TransportCapabilities(
-        encodings=frozenset({BodyEncoding.JSON, BodyEncoding.FORM_URLENCODED}),
+        encodings=frozenset({BodyEncoding.JSON, BodyEncoding.FORM_URLENCODED, BodyEncoding.QUERY_STRING}),
         scoped_headers=True,
         positional_json=True,
         routes=frozenset(RouteKind),
@@ -182,8 +182,8 @@ class HttpxTransport:
     ) -> WireResponse:
         """Send one owned request attempt under the HTTPX log shield.
 
-        The scoped headers are validated here, once: a forged wire request is refused with
-        ``ValueError`` before the credential is even read.
+        The scoped headers and the raw content are validated here, once: a forged wire request is refused with
+        ``ValueError`` (or ``TypeError``) before the credential is even read.
         """
         if self._closed or self._client.is_closed:
             raise _closed_refusal(transport_closed=self._closed)
@@ -191,6 +191,7 @@ class HttpxTransport:
             raise ValueError("max_response_bytes must be a positive integer")
         HTTPX_LOG_SHIELD.admit_send(self._client)
         headers = _validate_headers(request.headers.items)
+        _validate_sent_content(request.content)
         return await self._send_wire_impl(
             request,
             headers=headers,
@@ -228,6 +229,16 @@ class HttpxTransport:
             request_headers["content-type"] = "application/x-www-form-urlencoded"
             content = encode_php_query(cast("Mapping[str | int, object]", request.copy_parameters())).encode()
             return self._client.build_request("POST", method_url, headers=request_headers, content=content)
+        if request.encoding is BodyEncoding.QUERY_STRING:
+            # Passed as ``params``, the query is merged with an injected client's own, as a body request's URL is;
+            # in the URL, the client's would replace it.
+            query = encode_php_query(cast("Mapping[str | int, object]", request.copy_parameters()))
+            if request.content is None:
+                return self._client.build_request("GET", method_url, params=query, headers=request_headers)
+            request_headers["content-type"] = request.content.content_type
+            return self._client.build_request(
+                "POST", method_url, params=query, headers=request_headers, content=request.content.data
+            )
         raise TypeError("unsupported body encoding")  # pragma: no cover - guarded by typed contracts/capabilities
 
     async def _send_wire_impl(

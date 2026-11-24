@@ -143,6 +143,34 @@ absent, parsed or malformed. The name is caller-facing metadata, not a safe path
 normalized, truncated or reduced to a basename, and it stays out of the representation and
 diagnostics. Sanitize it before using it on a filesystem.
 
+A few actions refuse a POST or read a raw body instead of parameters. `BodyEncoding.QUERY_STRING` sends a
+request's parameters in the URL's query, in the PHP encoding of form bodies. Without `content` it is a GET:
+`crm.site.fileuploader.preview`, `crm.site.fileuploader.download`, `call.Track.download` and
+`crm.timeline.ai.mergefields` accept nothing else. With `content=RawContent(data, content_type)` it is a
+POST of those bytes as they are, under the declared content type, as `crm.site.fileuploader.upload` reads a
+chunk. The query is part of the URL, which the portal's web server and any proxy may log: send nothing
+secret in it. The client's own HTTPX log records keep the path and drop the query.
+
+<!-- tested: tests/query_string_request_test.py::test_raw_content_is_posted_byte_for_byte_with_its_type_and_the_parameters_in_the_query -->
+```python
+from b24api import ReplaySafety, Request
+from b24api.contracts import BodyEncoding, RawContent, RequestHeaders
+
+preview = await client.call_bytes(
+    Request.bare("crm.site.fileuploader.preview", {"fileId": 7}, ReplaySafety.SAFE, encoding=BodyEncoding.QUERY_STRING)
+)
+chunk = b"the first bytes of the file"
+uploaded = await client.call(
+    Request.bare(
+        "crm.site.fileuploader.upload",
+        replay_safety=ReplaySafety.UNSAFE,
+        encoding=BodyEncoding.QUERY_STRING,
+        headers=RequestHeaders({"X-Upload-Content-Name": "chunk.bin"}),
+        content=RawContent(chunk, "application/octet-stream"),
+    )
+)
+```
+
 <!-- tested: tests/client_v2_test.py::test_call_and_call_response_have_stable_detached_types -->
 ```python
 from b24api import RouteKind
@@ -1212,8 +1240,8 @@ disk, exits `4`.
 `b24api.testing` holds two offline tools. `ScriptedTransport` plays a fixed table of exchanges
 (`ScriptedExchange.json()`, `.batch()` for a classic batch, `.v3_batch()` for a REST 3.0 envelope) to a
 client built on it, with no socket and no credential. A call matches an exchange only when it sends what
-the exchange names: the same method, route, replay safety, body encoding (JSON or form), scoped headers
-and parameters. Parameters compare as JSON values, so the order of mapping keys does not matter for a
+the exchange names: the same method, route, replay safety, body encoding (JSON, form or query string), scoped
+headers, raw content and parameters. Parameters compare as JSON values, so the order of mapping keys does not matter for a
 match; `calls` keeps each request with its keys in the order they were sent, for a test that checks the
 sort priority of `order`. A call nothing matches fails its send, as a transport failure, and is kept in
 `unexpected`; `assert_exhausted()` reports such calls and exchanges never used. `.batch()` refuses a

@@ -34,8 +34,11 @@ def test_bare_mirrors_the_constructor_without_its_route() -> None:
     assert _parameters(Request.bare, drop=set()) == _parameters(Request.__init__, drop={"self", "route"})
 
 
-def test_v3_mirrors_the_constructor_without_route_or_encoding() -> None:
-    assert _parameters(Request.v3, drop=set()) == _parameters(Request.__init__, drop={"self", "route", "encoding"})
+def test_v3_mirrors_the_constructor_without_route_encoding_or_raw_content() -> None:
+    # REST 3.0 takes JSON only, and raw content travels only with QUERY_STRING encoding.
+    assert _parameters(Request.v3, drop=set()) == _parameters(
+        Request.__init__, drop={"self", "route", "encoding", "content"}
+    )
 
 
 def test_bare_builds_the_same_request_as_the_constructor() -> None:

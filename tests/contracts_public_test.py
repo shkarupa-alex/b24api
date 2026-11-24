@@ -198,7 +198,7 @@ def test_request_mapping_contract_is_a_closed_typed_dict() -> None:
     assert is_typeddict(RequestSpec)
     assert RequestSpec.__required_keys__ == frozenset({"method", "route"})
     assert RequestSpec.__optional_keys__ == frozenset(
-        {"parameters", "replay_safety", "encoding", "headers", "result_error"},
+        {"parameters", "replay_safety", "encoding", "content", "headers", "result_error"},
     )
 
 
