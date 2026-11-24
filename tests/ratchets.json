@@ -5,7 +5,7 @@
   "homemade_transports": 35,
   "long_functions": {
     "b24api/testing/transport.py::_run_case": {
-      "lines": 123,
+      "lines": 124,
       "justification": "one independent arm per ConformanceCase, read as a flat table next to the enum; not touched in Ф3"
     }
   }

@@ -115,9 +115,10 @@ class _Capture:
     body: bytes
 
 
-# What a request HTTP/1.1 cannot parse is captured as: it matches no case's expectations, so the case waiting
-# for it fails at once instead of at its deadline.
+# Wakes the case waiting for a request HTTP/1.1 cannot parse, so the case ends at once instead of at its deadline;
+# the case environment fails it with this detail, whatever the case makes of the capture.
 _UNPARSED = _Capture("", "", {}, b"")
+_UNPARSEABLE_DETAIL = "UnparseableRequest"
 
 
 async def _next_event(connection: h11.Connection, reader: asyncio.StreamReader) -> object:
@@ -127,16 +128,16 @@ async def _next_event(connection: h11.Connection, reader: asyncio.StreamReader) 
 
 
 async def _read_capture(connection: h11.Connection, reader: asyncio.StreamReader) -> _Capture | None:
-    """Read one request as HTTP/1.1 frames it, by ``Content-Length`` or chunked; ``None`` if none was sent."""
-    try:
-        request = await _next_event(connection, reader)
-        if not isinstance(request, h11.Request):
-            return None
-        body = bytearray()
-        while isinstance(event := await _next_event(connection, reader), h11.Data):
-            body += event.data
-    except h11.RemoteProtocolError:
-        return _UNPARSED
+    """Read one request as HTTP/1.1 frames it, by ``Content-Length`` or chunked; ``None`` if none was sent.
+
+    Raises ``h11.RemoteProtocolError`` for a request HTTP/1.1 cannot parse.
+    """
+    request = await _next_event(connection, reader)
+    if not isinstance(request, h11.Request):
+        return None
+    body = bytearray()
+    while isinstance(event := await _next_event(connection, reader), h11.Data):
+        body += event.data
     return _Capture(
         request.method.decode("latin-1"),
         request.target.decode("latin-1"),
@@ -179,11 +180,16 @@ async def _run_case_environment(
 ) -> ConformanceOutcome:
     """Own one case's event loop, responder, captures, and transport."""
     captures: asyncio.Queue[_Capture] = asyncio.Queue()
+    unparseable = asyncio.Event()
 
     async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             with contextlib.suppress(ConnectionResetError, BrokenPipeError):
-                capture = await _read_capture(h11.Connection(h11.SERVER), reader)
+                try:
+                    capture = await _read_capture(h11.Connection(h11.SERVER), reader)
+                except h11.RemoteProtocolError:
+                    unparseable.set()
+                    capture = _UNPARSED
                 if capture is None:
                     return
                 await captures.put(capture)
@@ -206,10 +212,11 @@ async def _run_case_environment(
     server = await asyncio.start_server(handler, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
     try:
-        return await _run_owned_case(case, factory, f"http://127.0.0.1:{port}/rest/1/token/", captures, controller)
+        outcome = await _run_owned_case(case, factory, f"http://127.0.0.1:{port}/rest/1/token/", captures, controller)
     finally:
         server.close()
         await server.wait_closed()
+    return ConformanceOutcome(case, passed=False, detail=_UNPARSEABLE_DETAIL) if unparseable.is_set() else outcome
 
 
 async def _run_owned_case(  # noqa: C901, PLR0912 - preserve the first lifecycle failure
@@ -373,18 +380,19 @@ async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915
         task = asyncio.create_task(
             transport.send(Request("cancel.test", route=RouteKind.BARE), attempt_timeout=5, max_response_bytes=1024),
         )
-        capture = await captures.get()
+        await captures.get()
         task.cancel()
         try:
             await task
         except asyncio.CancelledError:
-            return ConformanceOutcome(case, passed=capture is not _UNPARSED)
+            return ConformanceOutcome(case, passed=True)
         return ConformanceOutcome(case, passed=False)
     if case is ConformanceCase.RESPONSE_BYTE_CEILING:
         try:
             await transport.send(Request("limit.test", route=RouteKind.BARE), attempt_timeout=5, max_response_bytes=1)
         except ResponseTooLargeError:
-            return ConformanceOutcome(case, passed=await captures.get() is not _UNPARSED)
+            await captures.get()
+            return ConformanceOutcome(case, passed=True)
         _discard_capture(captures)
         return ConformanceOutcome(case, passed=False)
 

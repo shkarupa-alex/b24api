@@ -17,7 +17,7 @@ from b24api import ReplaySafety, Request, RouteKind
 from b24api.contracts import BodyEncoding, Command, CommandFailure, CommandSuccess, RawContent, RequestHeaders
 from b24api.contracts.request import RequestSpec, canonical_request
 from b24api.encoding import BracketObstacle
-from b24api.errors import B24ApiError, CapabilityError, ResponseTooLargeError
+from b24api.errors import B24ApiError, CapabilityError
 from b24api.execution.executor import Executor
 from b24api.testing import (
     ConformanceCase,
@@ -676,47 +676,73 @@ async def test_conformance_skips_the_query_string_cases_for_a_transport_that_doe
     assert all(outcome.skipped for outcome in report.outcomes)
 
 
-class _RawSocket(HttpxTransport):
-    """A transport that writes its request line and ``Host`` header itself, separated from the value by ``separator``.
+class _HandWritten(httpx.AsyncBaseTransport):
+    """Writes each request HTTPX built by hand, its ``Host`` header joined to its value by ``separator``."""
 
-    It otherwise behaves: it holds the cancellation case's request until it is cancelled, and refuses an answer
-    over the byte ceiling.
-    """
-
-    def __init__(self, webhook_url: str, separator: str) -> None:
-        super().__init__(webhook_url)
-        self.url = httpx.URL(webhook_url)
+    def __init__(self, separator: str) -> None:
         self.separator = separator
 
-    async def send_wire(self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-        target = f"{self.url.path}{request.method}?plain=a+b&outer%5Bitems%5D%5B0%5D=x"
-        async with asyncio.timeout(attempt_timeout):
-            reader, writer = await asyncio.open_connection(self.url.host, self.url.port)
-            writer.write(f"GET {target} HTTP/1.1\r\nHost{self.separator}{self.url.host}\r\n\r\n".encode())
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        lines = [f"{request.method} {request.url.raw_path.decode()} HTTP/1.1"]
+        for raw_name, raw_value in request.headers.raw:
+            name, value = raw_name.decode(), raw_value.decode()
+            lines.append(f"{name}{self.separator if name.lower() == 'host' else ': '}{value}")
+        reader, writer = await asyncio.open_connection(request.url.host, request.url.port)
+        try:
+            writer.write(("\r\n".join(lines) + "\r\n\r\n").encode() + await request.aread())
             await writer.drain()
-            if request.method == "cancel.test":
-                await asyncio.Event().wait()
             answer = await reader.read()
+        finally:
             writer.close()
-            await writer.wait_closed()
         head, _, body = answer.partition(b"\r\n\r\n")
-        if len(body) > max_response_bytes:
-            raise ResponseTooLargeError("the answer exceeded the byte ceiling")
-        return WireResponse(int(head.split(b" ")[1]), (), body)
+        if not head:
+            raise httpx.RemoteProtocolError("no answer", request=request)
+        fields = [line.partition(b": ")[::2] for line in head.split(b"\r\n")[1:]]
+        return httpx.Response(int(head.split(b" ")[1]), headers=fields, content=body, request=request)
+
+
+class _HandWrittenTransport(HttpxTransport):
+    """``HttpxTransport`` whose requests go out through :class:`_HandWritten`."""
+
+    def __init__(self, webhook_url: str, separator: str) -> None:
+        self.client = httpx.AsyncClient(transport=_HandWritten(separator))
+        super().__init__(webhook_url, client=self.client)
+
+    async def aclose(self) -> None:
+        await super().aclose()
+        await self.client.aclose()
+
+
+# The cases that judge the transport without sending it a request.
+_SENDS_NOTHING = frozenset(
+    {
+        ConformanceCase.RESPONSE_STATUS_RANGE,
+        ConformanceCase.WIRE_RESPONSE_IMMUTABLE,
+        ConformanceCase.REPR_REDACTION,
+        ConformanceCase.HOST_PROPERTY_CREDENTIAL_FREE,
+        ConformanceCase.FORBIDDEN_HEADER_REVALIDATED,
+    }
+)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "case",
-    [ConformanceCase.QUERY_STRING_GET, ConformanceCase.CANCELLATION_PROPAGATES, ConformanceCase.RESPONSE_BYTE_CEILING],
-)
-@pytest.mark.parametrize(("separator", "passed"), [(": ", True), (" ", False)], ids=["parseable", "no_colon"])
-async def test_conformance_fails_a_request_http_cannot_parse_in_every_case_that_waits_for_it(
-    case: ConformanceCase, separator: str, *, passed: bool
-) -> None:
-    report = await run_transport_conformance(lambda url: _RawSocket(url, separator), cases=frozenset({case}))
+async def test_conformance_passes_every_case_when_the_hand_written_request_is_the_one_httpx_builds() -> None:
+    report = await run_transport_conformance(lambda url: _HandWrittenTransport(url, ": "))
 
-    assert report.outcomes == (ConformanceOutcome(case, passed=passed),)
+    assert report.outcomes == tuple(ConformanceOutcome(case, passed=True) for case in ConformanceCase)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("separator", [" ", " : "], ids=["no_colon", "space_before_colon"])
+async def test_conformance_fails_every_case_sent_a_request_http_cannot_parse_with_its_detail(separator: str) -> None:
+    report = await run_transport_conformance(lambda url: _HandWrittenTransport(url, separator))
+
+    assert report.outcomes == tuple(
+        ConformanceOutcome(case, passed=True)
+        if case in _SENDS_NOTHING
+        else ConformanceOutcome(case, passed=False, detail="UnparseableRequest")
+        for case in ConformanceCase
+    )
 
 
 class _Streaming(HttpxTransport):

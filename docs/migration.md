@@ -34,8 +34,8 @@
   dependency. Every case decodes a body sent chunked as one sent with `Content-Length`, so a transport that
   streams its body no longer fails the body cases, and a GET whose body goes out chunked fails
   `QUERY_STRING_GET`. Header names are matched in any letter case. A request HTTP/1.1 cannot parse, such as one
-  without `Host` or with a space before a header's colon, which a server must refuse, fails every case that
-  waits for it, at once. A header continued on a folded line is unfolded to one space, as HTTP/1.1 lets a server
+  without `Host` or with a space before a header's colon, which a server must refuse, fails the case that sent
+  it at once, with the detail `UnparseableRequest`. A header continued on a folded line is unfolded to one space, as HTTP/1.1 lets a server
   do, so the raw case reads a folded content type as unfolded; a portal's web server may refuse it instead.
 - **HTTPX log records of the client's own requests drop the URL's query** and keep its path, as they never
   show a body. The query still reaches the portal's web server and any proxy, which may log it.
