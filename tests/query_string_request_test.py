@@ -754,6 +754,72 @@ async def test_conformance_fails_every_case_sent_a_request_http_cannot_parse_wit
     )
 
 
+class _EndsAtOnce(HttpxTransport):
+    """Writes its JSON request itself and ends as ``ending`` says, never reading the answer.
+
+    Its ``aclose`` returns without yielding, so the case may end before the responder has read what it sent.
+    """
+
+    def __init__(self, webhook_url: str, *, host_line: bool, ending: str) -> None:
+        super().__init__(webhook_url)
+        self.url = httpx.URL(webhook_url)
+        self.host_line = host_line
+        self.ending = ending
+
+    async def send_wire(self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        del attempt_timeout, max_response_bytes
+        body = b'{"plain":"a b"}'
+        head = f"POST {self.url.path}{request.method} HTTP/1.1\r\n"
+        head += f"Host: {self.url.host}\r\n" if self.host_line else ""
+        head += f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n"
+        _, writer = await asyncio.open_connection(self.url.host, self.url.port)
+        writer.write(head.encode() + body)
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+        if self.ending == "raises":
+            raise ConnectionResetError
+        if self.ending == "cancelled":
+            raise asyncio.CancelledError
+        return WireResponse(200, (), b'{"result":true}')
+
+    async def aclose(self) -> None:
+        """Hold no connection of HTTPX's own, so there is nothing to close."""
+
+
+_JSON_CASES = (ConformanceCase.LEGACY_JSON_BODY, ConformanceCase.JSON_CONTENT_TYPE)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("host_line", "ending", "detail"),
+    [
+        (False, "returns", "UnparseableRequest"),
+        (False, "raises", "UnparseableRequest"),
+        (False, "cancelled", "UnparseableRequest"),
+        (True, "raises", "ConnectionResetError"),
+        (True, "cancelled", "CancelledError"),
+    ],
+)
+async def test_conformance_gives_an_unparseable_request_its_detail_however_and_whenever_the_transport_ends(
+    *, host_line: bool, ending: str, detail: str
+) -> None:
+    report = await run_transport_conformance(
+        lambda url: _EndsAtOnce(url, host_line=host_line, ending=ending), cases=frozenset(_JSON_CASES)
+    )
+
+    assert report.outcomes == tuple(ConformanceOutcome(case, passed=False, detail=detail) for case in _JSON_CASES)
+
+
+@pytest.mark.asyncio
+async def test_the_transport_that_ends_at_once_passes_the_json_cases_when_its_request_parses() -> None:
+    report = await run_transport_conformance(
+        lambda url: _EndsAtOnce(url, host_line=True, ending="returns"), cases=frozenset(_JSON_CASES)
+    )
+
+    assert report.outcomes == tuple(ConformanceOutcome(case, passed=True) for case in _JSON_CASES)
+
+
 class _Streaming(HttpxTransport):
     """A transport that streams every body one byte per chunk, with no ``Content-Length``."""
 
