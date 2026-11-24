@@ -67,7 +67,8 @@ _ROUTE_PATHS = MappingProxyType(
 _QUERY_CASES = frozenset({ConformanceCase.QUERY_STRING_GET, ConformanceCase.QUERY_STRING_RAW_CONTENT})
 _QUERY_PARAMETERS = MappingProxyType({"plain": "a b", "outer": {"items": ["x"]}})
 _QUERY_PATH = "/rest/1/token/conformance.test"
-# Decoded as PHP reads a query: ``+`` and ``%20`` alike are a space, and the order of distinct keys is no matter.
+# Decoded as PHP reads a query: ``+`` and ``%20`` alike are a space, a blank value or a bare key is a parameter
+# still, and the order of distinct keys is no matter.
 _QUERY_PAIRS = sorted([("plain", "a b"), ("outer[items][0]", "x")])
 # Not octet-stream, the type a transport might send by default: the case checks the declared one goes out.
 _RAW_CONTENT = RawContent(b"\x00chunk\xff", "image/svg+xml")
@@ -441,7 +442,11 @@ def _sent_query(capture: _Capture, method: str) -> bool:
     """Return whether ``capture`` is a ``method`` request for the case's path, its parameters in the query."""
     verb, target, *_ = [*capture.request_line.split(" "), "", ""]
     parts = urlsplit(target)
-    return verb == method and parts.path == _QUERY_PATH and sorted(parse_qsl(parts.query)) == _QUERY_PAIRS
+    return (
+        verb == method
+        and parts.path == _QUERY_PATH
+        and sorted(parse_qsl(parts.query, keep_blank_values=True)) == _QUERY_PAIRS
+    )
 
 
 def _discard_capture(captures: asyncio.Queue[_Capture]) -> None:

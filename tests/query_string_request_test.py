@@ -23,6 +23,7 @@ from b24api.testing import (
     ScriptedTransport,
     run_transport_conformance,
 )
+from b24api.transport import httpx as httpx_transport_module
 from b24api.transport.base import TransportCapabilities, WireRequest, WireResponse
 from b24api.transport.decoding import BOUNDED_ACCEPT_ENCODING
 from b24api.transport.httpx import HttpxTransport
@@ -286,10 +287,12 @@ def test_raw_content_type_admits_each_character_where_rfc_9110_does(form: str, a
         ("content", b"chunk", TypeError),
     ],
 )
-async def test_the_repository_transport_refuses_forged_raw_content_before_it_sends(
-    field: str, forged: object, error: type[Exception]
+async def test_the_repository_transport_refuses_forged_raw_content_before_it_reads_the_credential(
+    field: str, forged: object, error: type[Exception], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     sent: list[httpx.Request] = []
+    credential_reads: list[str] = []
+    monkeypatch.setattr(httpx_transport_module, "_token_for", credential_reads.append)
 
     def respond(request: httpx.Request) -> httpx.Response:
         sent.append(request)
@@ -310,6 +313,7 @@ async def test_the_repository_transport_refuses_forged_raw_content_before_it_sen
         await transport.aclose()
 
     assert sent == []
+    assert credential_reads == []
 
 
 @pytest.mark.parametrize("match_args", [Request.__match_args__, WireRequest.__match_args__], ids=["request", "wire"])
@@ -476,6 +480,10 @@ _URL_FLAWS: dict[str, Callable[[httpx.URL], httpx.URL]] = {
     "space_as_percent": lambda url: url.copy_with(query=url.query.replace(b"+", b"%20")),
     "keys_reordered": lambda url: url.copy_with(query=b"&".join(reversed(url.query.split(b"&")))),
     "other_path": lambda url: url.copy_with(path=url.path + "x"),
+    # PHP reads each as one more parameter, an empty string, so the transport sent other parameters.
+    "extra_blank_value": lambda url: url.copy_with(query=url.query + b"&plain_extra="),
+    "extra_bare_key": lambda url: url.copy_with(query=url.query + b"&admin"),
+    "extra_blank_item": lambda url: url.copy_with(query=url.query + b"&outer%5Bitems%5D%5B1%5D="),
 }
 _BODY_FLAWS: dict[tuple[str, str], Callable[[str | None, bytes], tuple[str | None, bytes]]] = {
     ("get_with_body", "GET"): lambda _type, _body: ("application/x-www-form-urlencoded", b"plain=a+b"),
@@ -533,6 +541,9 @@ class _Tampered(HttpxTransport):
         ("keys_reordered", (True, True)),
         ("no_query", (False, False)),
         ("other_path", (False, False)),
+        ("extra_blank_value", (False, False)),
+        ("extra_bare_key", (False, False)),
+        ("extra_blank_item", (False, False)),
         ("other_method", (False, False)),
         ("other_nested_key", (False, False)),
         ("other_value", (False, False)),
