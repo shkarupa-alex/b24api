@@ -244,11 +244,23 @@ outcome.
   a direct answer and a command's own entry, a classic entry or a REST 3.0 element;
   `observe_envelope_failure` for a classic or REST 3.0 envelope as a whole): a
   request-rate refusal (`throttle.limit_of`: the quota code, the REST 3.0 rate limit, a 429) holds the
-  host for the server's hint, else for the backoff of the host's refusals in a row
-  (`RateCoordinator.limit_streak`: a refusal of a send that left after the latest pause began grows the
-  streak, one of the burst that pause answers does not, and an answer about anything but the load (a
-  success, or a failure with no limit's code, no 429 and no 503), to a send that left after that pause
-  began, ends it, an envelope's own failure only the host's); an
+  host for the server's hint. Without one it paces the host, as the portal limits a webhook by rate (a
+  leaky bucket), not by pauses: `RateCoordinator.slow_host` widens the host's send gap to the retry
+  backoff's initial delay, then by its factor up to its maximum, for a refusal of a send that left after
+  the gap last widened (one of the burst that widening answers leaves it), and the host is held for the
+  gap. The coordinator then grants at most one permit per gap (`_pace_holds`, read before a waiter is
+  chosen, so a held grant takes no turn of the work-class cycle; `_take_pace_slot`; its wake task grants the
+  next once the gap has passed, and `admission_delay` counts the gap as a hold of the next permit). A
+  permit whose send never left (refused at `_start_send`, or for good by the transport before it left)
+  gives its slot back (`_Permit.unsent`): the pace spaces sends, a cancelled one and one whose connection
+  was refused included. Only answers quicken the pace, never time. An answer about anything but the load
+  (a success, or a failure with no limit's code, no 429 and no 503) to a send that left after the gap last
+  widened quickens the pace (`speed_host`: the rate the gap allows rises by a 32nd of the initial delay's
+  rate, and past 16 times that rate the host is unpaced). Each send's answer is read once
+  (`_observe_host_answer`): the executor reads a lone request's answer and an envelope's failure; the batch
+  engine reads an envelope's success after its commands' entries (`observe_entries`,
+  `Executor.observe_envelope_answer`), so an entry with a limit's code makes the whole answer one about the
+  load, and the entries quicken nothing of their own. Such an answer also ends the limit streaks of its methods (`observe_answer`); an
   `OPERATION_TIME_LIMIT` holds its method (`hold_method`) for the hint, else until the operating time
   that method's latest answer gave resets (`observe_reset`, from `time.operating_reset_at`, a classic
   command's `result_time` included), else for the method's streak backoff. A hint holds the host only

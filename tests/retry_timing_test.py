@@ -1199,7 +1199,8 @@ def _v3(identifier: int, safety: ReplaySafety) -> Request:
 @pytest.mark.asyncio
 async def test_a_rest_v3_batch_replays_its_safe_envelope_but_not_an_unsafe_one_into_a_short_window() -> None:
     # REST v3 envelopes carry one safety class, so the SAFE command and the UNSAFE one are refused in separate
-    # envelopes, each with its own window: the SAFE one is replayed, the UNSAFE one keeps its refusal unwaited.
+    # envelopes, each with its own window: the SAFE one is replayed, the UNSAFE one keeps its refusal unwaited. The
+    # UNSAFE envelope's first send leaves one gap of the host's pace after the replay, as every send after a refusal.
     safe, unsafe = _v3(1, ReplaySafety.SAFE), _v3(2, ReplaySafety.UNSAFE)
     transport = ScriptedTransport(
         (
@@ -1220,7 +1221,7 @@ async def test_a_rest_v3_batch_replays_its_safe_envelope_but_not_an_unsafe_one_i
     assert isinstance(second, BatchFailure)
     assert isinstance(second.error, BatchCommandError)
     assert second.replay_disposition is ReplayDisposition.ELIGIBLE
-    assert time.waits == [0.6]
+    assert time.waits == [0.6, 0.6]
 
 
 def _v3_refused_holding_nothing(commands: tuple[Request, ...]) -> ScriptedExchange:

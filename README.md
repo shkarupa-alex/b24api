@@ -229,11 +229,21 @@ by its transport's timeout (`Settings.http_timeout` for the client's own transpo
 hangs leaves the rest of the window to its retries; one that times out before anything was sent
 (connecting, the TLS handshake, waiting for a pooled connection) is retried whatever its safety.
 
-The portal's load limits pause what they limit, for every request of the client. A request-rate
+The portal's load limits slow down what they limit, for every request of the client. A request-rate
 refusal (`QUERY_LIMIT_EXCEEDED`, the REST 3.0 rate limit, or a 429) holds the whole portal for the
-server's hint (`Retry-After` or `X-Bitrix-RateLimit-Reset`), or, without one, for the retry backoff of
-the refusals in a row, so the requests that share the portal slow down together, those waiting for a
-connection slot included, more with each refusal of a request sent after the latest pause began. An `OPERATION_TIME_LIMIT` holds its method
+server's hint (`Retry-After` or `X-Bitrix-RateLimit-Reset`). Without one, it paces the portal: the
+portal limits a webhook by its request rate, so requests that waited out a pause together would be
+refused together again. The client's sends then leave one gap apart, those waiting for a connection
+slot included. The gap starts at the retry backoff's initial delay (0.5 s by default) and grows by its
+factor, up to its maximum delay, with each refusal of a request sent after it last grew. Each answer to
+a request sent after that quickens the pace a step (a 32nd of the initial delay's rate), and past 16
+times that rate the client sends at full speed again; an answer about the load (a 429, a 503 or a
+limit's code) does not. A batch is one request, and its answer is about the load if any of its
+commands' entries carries a limit's code. Only answers quicken it, not time: a client that
+went idle keeps its gap until its next requests are answered. The pace holds every kind of work alike,
+so batches keep their share of the sends it lets through. So 300 reads from 10 tasks or from 300, against a
+limit of 2 requests a second, all succeed in about the time the limit allows, with some 20 sends
+refused. An `OPERATION_TIME_LIMIT` holds its method
 alone: for the hint, else until the method's operating time resets, as its latest answer said
 (`time.operating_reset_at`, of a classic batch command too), else for the backoff. A hint on any
 other answer than a 429, a 503 or a load limit's code holds nothing. A retry waits the longer of its

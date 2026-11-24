@@ -24,7 +24,7 @@ from b24api.batch.outcome import (
     BatchOutcome,
     BatchSuccess,
 )
-from b24api.batch.v3 import _V3Resolution, observe_entry
+from b24api.batch.v3 import _V3Resolution, observe_entries
 from b24api.contracts.dispatch import PORTAL_BATCH_CAP
 from b24api.contracts.json import repeated_names
 from b24api.contracts.policy import (
@@ -587,6 +587,8 @@ class BatchExecutor:
                     evidence=response.evidence,
                 )
             except B24ApiError as error:
+                # An answer that attributes nothing is still the envelope's answer (``observe_envelope_answer``).
+                self.executor.observe_envelope_answer(context, (), sent_at=attempts.sent_at)
                 failure, owned = error, True
         if failure is not None:
             scoped = _scoped(failure, request, strict=options.strict_envelope)
@@ -601,8 +603,7 @@ class BatchExecutor:
         outcomes = self._decode_commands(commands, envelope, context=context, options=options, attempts=attempts)
         # Each command's entry answered this send; a command sent again carries only what earlier sends left open.
         attempts.classified(None, may_have_run=False)
-        for command, outcome in zip(commands, outcomes, strict=True):
-            await observe_entry(self.executor, context, command, outcome, sent_at=attempts.sent_at)
+        await observe_entries(self.executor, context, commands, outcomes, sent_at=attempts.sent_at)
         # A SAFE command is sent again after its own transient error; any other only after a listed refusal.
         replay = (
             ()

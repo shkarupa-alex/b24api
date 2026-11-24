@@ -8,7 +8,7 @@ import json
 import math
 import random
 import time
-from collections.abc import Awaitable, Callable, Coroutine, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Literal, NamedTuple
@@ -403,7 +403,7 @@ class _RequestAttempts:
     # send by it, and plans that round's SAFE commands again. ``start_round`` clears it.
     refusal: BudgetExceededError | None = None
     # When the latest send left: a limit refusal of a send that left after the latest pause for that limit began
-    # lengthens the next pause (``RateCoordinator.limit_streak``).
+    # lengthens the next pause (``RateCoordinator.limit_streak``, ``RateCoordinator.slow_host``).
     sent_at: float = 0.0
 
     def open_window(self, clock: Clock) -> float:
@@ -569,6 +569,7 @@ class Executor:
                 work_class=work_class,
                 mode=_BodyMode.JSON,
                 methods=_admission_methods or frozenset({request.method}),
+                envelope=_admission_methods is not None,
                 shared=attempts,
             )
             response = _decoded(response)
@@ -624,8 +625,12 @@ class Executor:
         mode: _BodyMode,
         methods: frozenset[str],
         shared: _RequestAttempts,
+        envelope: bool = False,
     ) -> tuple[WireResponse, Response | None]:
-        """Run the attempt loop and return one conclusive response, decoded unless binary; ``shared`` counts sends."""
+        """Run the attempt loop and return one conclusive response, decoded unless binary; ``shared`` counts sends.
+
+        An ``envelope`` is a classic batch's, admitted under its commands' ``methods``: its answer is theirs to read.
+        """
         self.preflight_request(request)
         wire_request = WireRequest(request) if self._wire_transport is not None else None
         cancellation = await mark_cancellation()
@@ -637,11 +642,14 @@ class Executor:
             )
             try:
                 async with permit:
-                    remaining = await self._start_send(context, shared, request.replay_safety, spent=attempts)
+                    remaining = await self._start_send(
+                        context, shared, request.replay_safety, spent=attempts, permit=permit
+                    )
                     wire = await self._dispatch(
                         context,
                         shared,
                         self._send_attempt(request, wire_request, context=context, remaining=remaining),
+                        permit=permit,
                     )
             except asyncio.CancelledError:
                 raise
@@ -657,15 +665,19 @@ class Executor:
                 continue
 
             response_error, response = self._classify_response(request, wire, context=context, mode=mode)
+            if response_error is not None or not envelope:
+                # A batch envelope's answer is read for the pace with its entries (``observe_envelope_answer``).
+                _observe_host_answer(context, response_error, sent_at=shared.sent_at)
             if response_error is None:
-                # A classic batch envelope's own name is none of the methods it is admitted under, so its answer
-                # is no answer of theirs: their commands' entries are (``observe_command``).
-                self.observe_answer(context, wire, response, methods=methods & {request.method}, sent_at=shared.sent_at)
+                # A batch envelope's answer is no answer of the methods it is admitted under: their commands'
+                # entries are (``observe_command``).
+                answered = frozenset() if envelope else methods
+                self.observe_answer(context, wire, response, methods=answered, sent_at=shared.sent_at)
                 # An answer that arrives after the budget is still the answer: it is returned, never discarded.
                 cancellation.raise_if_requested()
                 return wire, response
-            # The methods the coordinator admits: a classic batch envelope's own name is not one of them.
-            observe = self.observe_failure if request.method in methods else self.observe_envelope_failure
+            # A batch envelope's failure is no answer of its commands' methods: it ends none of their streaks.
+            observe = self.observe_envelope_failure if envelope else self.observe_failure
             await observe(context, response_error, methods=methods, sent_at=shared.sent_at, wire=wire)
             cancellation.raise_if_requested()
             # A late failure meets the ambiguity rules first; the budget stops only a retry it would ask for.
@@ -700,12 +712,18 @@ class Executor:
             raise
 
     async def _start_send(
-        self, context: ExecutionContext, attempts: _RequestAttempts, safety: ReplaySafety, *, spent: int
+        self,
+        context: ExecutionContext,
+        attempts: _RequestAttempts,
+        safety: ReplaySafety,
+        *,
+        spent: int,
+        permit: _Permit,
     ) -> float:
-        """Admit and count the send a permit was granted for, and return the window left for it.
+        """Admit and count the send ``permit`` was granted for, and return the window left for it.
 
         Refused here, by the deadline, the retry window or the attempt budget, the send never leaves: the refusal
-        is chained to the failure it followed, as at the permit.
+        is chained to the failure it followed, as at the permit, and the permit gives its pace slot back.
         """
         try:
             retry_started = attempts.open_window(self._clock)
@@ -713,6 +731,7 @@ class Executor:
             attempts.admit(remaining, safety, now=self._clock())
             await context.reserve_attempt(attempts_for_request=spent)
         except B24ApiError as error:
+            permit.unsent()
             attempts.chain_stop(error)
             raise
         attempts.sent_at = self._clock()
@@ -720,7 +739,11 @@ class Executor:
 
     @staticmethod
     async def _dispatch(
-        context: ExecutionContext, attempts: _RequestAttempts, send: Coroutine[object, object, WireResponse]
+        context: ExecutionContext,
+        attempts: _RequestAttempts,
+        send: Coroutine[object, object, WireResponse],
+        *,
+        permit: _Permit,
     ) -> WireResponse:
         """Hand an admitted, counted send to its transport, and record it sent unless the transport kept it.
 
@@ -728,7 +751,8 @@ class Executor:
         phase ``not_dispatched`` that is not retryable, whichever transport it is: ``ClientClosedError`` from a
         closed one, a request HTTPX could not build. That is a stop before the send, as at the permit. The
         reservation is released, so it is no physical request, nothing is recorded sent, so no batch round or
-        isolated send counts it, and it is chained to the failure it followed. Any other outcome, a cancellation
+        isolated send counts it, it is chained to the failure it followed, and the permit gives its pace slot back.
+        Any other outcome, a cancellation
         and a retryable failure before dispatch (a refused connection) included, is a send.
         """
         try:
@@ -739,6 +763,7 @@ class Executor:
                 raise
             context.release_attempt()
             attempts.chain_stop(error)
+            permit.unsent()
             raise
         except BaseException:
             attempts.dispatched()
@@ -818,6 +843,8 @@ class Executor:
             None, wire, context=context, mode=_BodyMode.JSON, summary=envelope.summary
         )
         if response_error is not None:
+            # An answer is read for the pace with its entries (``observe_envelope_answer``), a failure here.
+            _observe_host_answer(context, response_error, sent_at=attempts.sent_at)
             await self.observe_envelope_failure(
                 context, response_error, methods=methods, sent_at=attempts.sent_at, wire=wire
             )
@@ -840,9 +867,9 @@ class Executor:
             context, attempts, work_class=WorkClass.BATCH if spent == 0 else WorkClass.RETRY, methods=methods
         )
         async with permit:
-            remaining = await self._start_send(context, attempts, envelope.replay_safety, spent=spent)
+            remaining = await self._start_send(context, attempts, envelope.replay_safety, spent=spent, permit=permit)
             send = _send_envelope_attempt(wire_transport, envelope, context=context, remaining=remaining)
-            return await self._dispatch(context, attempts, send)
+            return await self._dispatch(context, attempts, send, permit=permit)
 
     def _read_answer(
         self, request: Request | None, wire: WireResponse, *, context: ExecutionContext, summary: RequestSummary | None
@@ -934,8 +961,8 @@ class Executor:
     ) -> None:
         """Record what an answer that is no limit refusal says about the load: of ``methods``, its own methods.
 
-        It ends the host's limit streak and theirs, and records when a method's operating time resets, from the
-        ``time`` block of its answer.
+        It ends their limit streaks, and records when a method's operating time resets, from the ``time`` block of
+        its answer. The host's pace reads the send's answer alone (``_observe_host_answer``).
         """
         coordinator = context.coordinator
         coordinator.observe_answer(methods, sent_at=sent_at)
@@ -958,7 +985,7 @@ class Executor:
         """Record what a failed answer of ``methods``' own request says about the load.
 
         A failure about the load holds what its limit holds (``_hold``). Any other failure answers the request as
-        a success does: it ends the limit streaks of the host and of ``methods`` (``observe_answer``).
+        a success does: it ends the limit streaks of ``methods`` (``observe_answer``).
         """
         if hints_load(error):
             await self._hold(context, error, methods=methods, sent_at=sent_at, wire=wire)
@@ -977,12 +1004,10 @@ class Executor:
         """Record what a failed answer of a whole batch envelope, admitted under ``methods``, says about the load.
 
         A failure about the load cannot be attributed to one command: it holds every method its limit holds
-        (``_hold``). Any other failure is the host's answer, not its commands': it ends the host's limit streak.
+        (``_hold``). Any other failure is the host's answer, not its commands' (``_observe_host_answer``).
         """
         if hints_load(error):
             await self._hold(context, error, methods=methods, sent_at=sent_at, wire=wire)
-        else:
-            context.coordinator.observe_answer(frozenset(), sent_at=sent_at)
 
     async def _hold(
         self,
@@ -997,10 +1022,10 @@ class Executor:
 
         A method's operating-time refusal holds each of ``methods`` alone: for the server's hint, else until its
         operating time resets, as its latest answer said, else for the retry backoff of its limit streak. A
-        request-rate refusal holds the host for the server's hint, else for the backoff of the host's limit streak,
-        so the sends that share the host slow down together. Any other failure about the load (429 or 503,
-        ``hints_load``) holds the host for its hint, if it has one. The host's hold is added to the operation's
-        cooldown.
+        request-rate refusal holds the host for the server's hint; without one, it widens the host's send gap
+        (``RateCoordinator.slow_host``) and holds the host for that gap, so the sends that share the host slow down
+        together and then go one gap apart. Any other failure about the load (429 or 503, ``hints_load``) holds the
+        host for its hint, if it has one. The host's hold is added to the operation's cooldown.
         """
         coordinator = context.coordinator
         limit = limit_of(error)
@@ -1013,7 +1038,10 @@ class Executor:
                 coordinator.hold_method(method, delay)
             return
         if limit is Limit.HOST and hint is None:
-            hint = backoff_delay(context.policy, coordinator.limit_streak(None, sent_at=sent_at))
+            retry = context.policy.retry
+            hint = coordinator.slow_host(
+                sent_at=sent_at, initial=retry.initial_delay, factor=retry.backoff, maximum=retry.maximum_delay
+            )
         if hint is not None:
             cooldown = await coordinator.observe_throttle(hint, reason=_throttle_reason(error))
             await context.record_cooldown(cooldown)
@@ -1034,6 +1062,18 @@ class Executor:
             await self.observe_failure(context, answer, methods=frozenset({method}), sent_at=sent_at)
         else:
             self.observe_answer(context, None, answer, methods=frozenset({method}), sent_at=sent_at)
+
+    def observe_envelope_answer(
+        self, context: ExecutionContext, entries: Iterable[B24ApiError], *, sent_at: float
+    ) -> None:
+        """Read a batch envelope's answer for the host's pace, once its commands' entries are read.
+
+        The envelope is one send and its answer one answer: an entry refused for the load (``entries``, the
+        failed ones) makes it an answer about the load, which does not quicken the pace (``_observe_host_answer``).
+        An answer whose entries cannot be read is no answer about the load.
+        """
+        load = next((error for error in entries if hints_load(error)), None)
+        _observe_host_answer(context, load, sent_at=sent_at)
 
     def plan_replay(
         self,
@@ -1223,6 +1263,16 @@ def _dispatched_attempt(
     error: BaseException | None = None,
 ) -> PhysicalAttemptOutcome:
     return PhysicalAttemptOutcome(kind, wire, response, error, dispatch_started=True)
+
+
+def _observe_host_answer(context: ExecutionContext, error: B24ApiError | None, *, sent_at: float) -> None:
+    """Narrow the host's send gap for the answer to one send, unless it is a failure about the load.
+
+    The send's answer alone counts, once: the entries of a batch's commands are no sends of their own, but a
+    batch envelope's answer is read with them (``Executor.observe_envelope_answer``).
+    """
+    if error is None or not hints_load(error):
+        context.coordinator.speed_host(sent_at=sent_at)
 
 
 def _envelope_answered(

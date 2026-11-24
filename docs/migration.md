@@ -69,13 +69,16 @@
 - **Breaking: a quota refusal slows every request to the portal.** A `QUERY_LIMIT_EXCEEDED`, a REST 3.0
   rate limit or a 429 without a `Retry-After` (the portal sends none: it answers a burst with HTTP 503
   `QUERY_LIMIT_EXCEEDED`) only delayed the refused request's own retry: every other request of the client
-  went on at full rate and was refused in turn. Such a refusal now holds the whole portal for the retry
-  backoff of the refusals in a row (0.5 s, then 1, 2 and so on up to 30 s by default), so the client's
-  requests slow down together, a request waiting for the slot the refused one frees included. A refusal of a request sent after the latest pause began grows that
-  backoff; the refusals of one burst, sent before it, do not; an answer about anything but the load (a
-  success, or a failure with no limit's code, no 429 and no 503), to a request sent after that pause
-  began, resets it. A
-  `Retry-After` or `X-Bitrix-RateLimit-Reset` sets the pause instead, as before.
+  went on at full rate and was refused in turn. Such a refusal now paces the whole portal: the client's
+  requests leave one gap apart, a request waiting for the slot the refused one frees included, and the
+  portal is held for that gap. The gap starts at the retry backoff's initial delay (0.5 s by default)
+  and grows by its factor, up to its maximum delay (30 s), with each refusal of a request sent after it
+  last grew; the refusals of one burst, sent before it, do not grow it. Each answer about anything but
+  the load (a success, or a failure with no limit's code, no 429 and no 503) to a request sent after
+  that quickens the pace a step, until the client sends at full speed again; time alone does not, so an
+  idle client keeps its gap until its next requests are answered. A `Retry-After` or
+  `X-Bitrix-RateLimit-Reset` sets the pause instead, as before, and paces nothing.
+  `CoordinatorSnapshot.pace_gap` shows the gap.
 - **Breaking: `OPERATION_TIME_LIMIT` holds its method as long as the portal says.** It held the method
   for a fixed 120 s, which no setting changed. It now holds it for the answer's hint, else until the
   method's operating time resets, as its latest answer said (`time.operating_reset_at`), else for the
@@ -1635,13 +1638,6 @@ now unknown with reason `CONNECTION_LOST_AFTER_DISPATCH` and a cause chain that 
 
 ## Traversal contract checks
 
-- **`SERVER_NEXT` needs an exact total.** `OffsetSpec(continuation=OffsetContinuation.SERVER_NEXT)`
-  without `total_termination=TotalTermination.EXACT_QUALIFIED` now raises `ValueError` at
-  construction. Such a traversal never continued without `next`, and with the total disabled only an
-  empty page could close it: an empty first page, or one a `next` had led to. Bitrix omits `next` on
-  its last page, which still holds rows, so every non-empty source failed with `PaginationError` on
-  that page. Add `EXACT_QUALIFIED` when the
-  filtered `total` is exact, or use the default `SERVER_NEXT_OR_OBSERVED_COUNT`.
 - **A row breaking its identity raises `IdentityContractError` on every traversal.** A missing
   identity, or one of the wrong type, failed the traversal with a plain `PaginationError` (for example
   "identity path is missing") before the typed check could run, and the page was recorded as

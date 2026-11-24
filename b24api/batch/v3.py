@@ -53,14 +53,27 @@ if TYPE_CHECKING:
     from b24api.execution.executor import PhysicalAttemptOutcome
 
 
-async def observe_entry(
-    executor: Executor, context: ExecutionContext, command: _Command, outcome: BatchOutcome, *, sent_at: float
+async def observe_entries(
+    executor: Executor,
+    context: ExecutionContext,
+    commands: tuple[_Command, ...],
+    outcomes: tuple[BatchOutcome, ...],
+    *,
+    sent_at: float,
 ) -> None:
-    """Record what a command's own entry in its envelope's answer says about the load, if its entry answered it."""
-    if isinstance(outcome, BatchSuccess):
-        await executor.observe_command(context, command.request.method, outcome.response, sent_at=sent_at)
-    elif isinstance(outcome.error, BatchCommandError):
-        await executor.observe_command(context, command.request.method, outcome.error, sent_at=sent_at)
+    """Record what each command's own entry in its envelope's answer says about the load, then the answer's pace.
+
+    Each entry its command's answer, if it answered it (``Executor.observe_command``); the envelope's answer is
+    read for the host's pace after all of them (``Executor.observe_envelope_answer``).
+    """
+    failed: list[B24ApiError] = []
+    for command, outcome in zip(commands, outcomes, strict=True):
+        if isinstance(outcome, BatchSuccess):
+            await executor.observe_command(context, command.request.method, outcome.response, sent_at=sent_at)
+        elif isinstance(outcome.error, BatchCommandError):
+            failed.append(outcome.error)
+            await executor.observe_command(context, command.request.method, outcome.error, sent_at=sent_at)
+    executor.observe_envelope_answer(context, failed, sent_at=sent_at)
 
 
 @dataclass(slots=True)
@@ -115,6 +128,7 @@ class _V3Resolution:
             if elements is not None:
                 return await self._attributed(pending, elements, attempt.response), False
             # An answer that attributes nothing leaves the envelope possibly run, as a lost answer does.
+            self.executor.observe_envelope_answer(self.context, (), sent_at=self.attempts.sent_at)
             error: B24ApiError = ProtocolError(
                 "REST v3 batch result is not a complete array of command responses",
                 evidence=attempt.response.evidence,
@@ -141,7 +155,7 @@ class _V3Resolution:
         self.attempts.classified(None, may_have_run=False)
         for command, outcome in zip(pending, outcomes, strict=True):
             self.last[command.index] = outcome
-            await observe_entry(self.executor, self.context, command, outcome, sent_at=self.attempts.sent_at)
+        await observe_entries(self.executor, self.context, pending, outcomes, sent_at=self.attempts.sent_at)
         # A SAFE command is sent again after its own transient error; any other only after a listed refusal.
         replay = tuple(
             command
