@@ -211,10 +211,11 @@ async def _run_case_environment(
 
     server = await asyncio.start_server(handler, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
-    # A case that sent a request HTTP/1.1 cannot parse fails with that detail, whether the transport then returned,
-    # raised or was cancelled (the responder answers and closes at once, so a transport still writing or reading may
-    # well fail). The verdict waits for the server to close, and so for every connection it accepted to be read. A
-    # send that blocks the event loop may end before its connection is accepted; closing drops it unread.
+    # A case that sent a request HTTP/1.1 cannot parse fails with that detail if the responder has read it, whether
+    # the transport then returned, raised or was cancelled (the responder answers and closes at once, so a transport
+    # still writing or reading may well fail). The verdict waits for the server to close, and so for every
+    # connection the loop has already attached to it; a transport that ends right after it writes may end before
+    # its connection is attached, and closing drops it unread, so the transport's own error stands.
     try:
         try:
             outcome = await _run_owned_case(
