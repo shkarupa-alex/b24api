@@ -1362,8 +1362,12 @@ def test_real_mid_benchmark_tracked_mutation_cannot_emit_pass(tmp_path: Path) ->
             time.sleep(0.001)
         assert plan_path.exists(), "benchmark finished before its immutable plan became observable"
         assert process.poll() is None, "benchmark completed before the mid-run mutation window"
+        # Swap the file in one rename: an in-place rewrite truncates it first, and a concurrent cleanliness
+        # check can then read a torn file and fail to verify instead of reporting the dirty tree.
         readme = worktree / "README.md"
-        readme.write_text(readme.read_text() + "\nmid-benchmark dirty-tree regression\n")
+        mutated = tmp_path / "README.md.mutated"
+        mutated.write_text(readme.read_text() + "\nmid-benchmark dirty-tree regression\n")
+        mutated.replace(readme)
 
         stdout, stderr = process.communicate(timeout=30)
 
