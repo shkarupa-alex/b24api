@@ -12,6 +12,8 @@ from functools import partial
 from types import MappingProxyType
 from urllib.parse import parse_qsl, urlsplit
 
+import h11
+
 from b24api.contracts.request import Request
 from b24api.contracts.request_summary import RouteKind
 from b24api.contracts.wire import BodyEncoding, RawContent, RequestHeaders
@@ -28,6 +30,7 @@ type TransportFactory = Callable[[str], Transport | Awaitable[Transport]]
 _HTTP_OK = 200
 _CASE_TIMEOUT_SECONDS = 6.0
 _CLOSE_TIMEOUT_SECONDS = 1.0
+_READ_BYTES = 65536
 
 
 class ConformanceCase(StrEnum):
@@ -104,9 +107,42 @@ class ConformanceReport:
 
 @dataclass(slots=True)
 class _Capture:
-    request_line: str
+    """One request as the responder read it: header names lower-cased, the body decoded from its framing."""
+
+    method: str
+    target: str
     headers: dict[str, str]
     body: bytes
+
+
+# What a request HTTP/1.1 cannot parse is captured as: it matches no case's expectations, so the case waiting
+# for it fails at once instead of at its deadline.
+_UNPARSED = _Capture("", "", {}, b"")
+
+
+async def _next_event(connection: h11.Connection, reader: asyncio.StreamReader) -> object:
+    while (event := connection.next_event()) is h11.NEED_DATA:
+        connection.receive_data(await reader.read(_READ_BYTES))
+    return event
+
+
+async def _read_capture(connection: h11.Connection, reader: asyncio.StreamReader) -> _Capture | None:
+    """Read one request as HTTP/1.1 frames it, by ``Content-Length`` or chunked; ``None`` if none was sent."""
+    try:
+        request = await _next_event(connection, reader)
+        if not isinstance(request, h11.Request):
+            return None
+        body = bytearray()
+        while isinstance(event := await _next_event(connection, reader), h11.Data):
+            body += event.data
+    except h11.RemoteProtocolError:
+        return _UNPARSED
+    return _Capture(
+        request.method.decode("latin-1"),
+        request.target.decode("latin-1"),
+        {name.decode("latin-1"): value.decode("latin-1") for name, value in request.headers},
+        bytes(body),
+    )
 
 
 async def run_transport_conformance(
@@ -146,20 +182,12 @@ async def _run_case_environment(
 
     async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            with contextlib.suppress(asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
-                head = await reader.readuntil(b"\r\n\r\n")
-                lines = head.decode("latin-1").split("\r\n")
-                request_line = lines[0]
-                headers = {
-                    name.strip().casefold(): value.strip()
-                    for line in lines[1:]
-                    if ":" in line
-                    for name, value in (line.split(":", 1),)
-                }
-                length = int(headers.get("content-length", "0"))
-                body = await reader.readexactly(length) if length else b""
-                await captures.put(_Capture(request_line, headers, body))
-                if "cancel.test" in request_line:
+            with contextlib.suppress(ConnectionResetError, BrokenPipeError):
+                capture = await _read_capture(h11.Connection(h11.SERVER), reader)
+                if capture is None:
+                    return
+                await captures.put(capture)
+                if "cancel.test" in capture.target:
                     await reader.read()
                     return
                 response_body = b'{"result":true}'
@@ -406,7 +434,7 @@ async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915
     elif expected_header is not None:
         passed = passed and capture.headers.get(expected_header[0]) == expected_header[1]
     elif case in _CASE_ROUTES:
-        passed = passed and capture.request_line.split(" ")[1] == _ROUTE_PATHS[route]
+        passed = passed and capture.target == _ROUTE_PATHS[route]
     return ConformanceOutcome(case, passed=passed)
 
 
@@ -441,10 +469,9 @@ async def _run_query_case(
 
 def _sent_query(capture: _Capture, method: str) -> bool:
     """Return whether ``capture`` is a ``method`` request for the case's path, its parameters in the query."""
-    verb, target, *_ = [*capture.request_line.split(" "), "", ""]
-    parts = urlsplit(target)
+    parts = urlsplit(capture.target)
     return (
-        verb == method
+        capture.method == method
         and parts.path == _QUERY_PATH
         and sorted(parse_qsl(parts.query, keep_blank_values=True)) == _QUERY_PAIRS
     )

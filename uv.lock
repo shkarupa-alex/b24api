@@ -41,6 +41,7 @@ wheels = [
 name = "b24api"
 source = { editable = "." }
 dependencies = [
+    { name = "h11" },
     { name = "h2" },
     { name = "hpack" },
     { name = "httpx", extra = ["http2"] },
@@ -75,6 +76,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "h11", specifier = ">=0.16" },
     { name = "h2", specifier = ">=4.3.0,<4.5" },
     { name = "hpack", specifier = ">=4.1.0,<4.3" },
     { name = "httpx", extras = ["http2"], specifier = ">=0.28.1,<0.29" },

@@ -1,6 +1,7 @@
 """A ``QUERY_STRING`` request: a GET with its parameters in the query, or a POST of its raw content."""
 
 from __future__ import annotations
+import asyncio
 import dataclasses
 import io
 import logging
@@ -20,6 +21,7 @@ from b24api.errors import B24ApiError, CapabilityError
 from b24api.execution.executor import Executor
 from b24api.testing import (
     ConformanceCase,
+    ConformanceOutcome,
     ScriptedExchange,
     ScriptedTransport,
     run_transport_conformance,
@@ -31,7 +33,7 @@ from b24api.transport.httpx import HttpxTransport
 from tests.scripting import ResponderTransport, client_for, json_response
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncIterator, Callable
 
 _WEBHOOK = "https://portal.invalid/rest/1/token/"
 _UNBOUNDED_ACCEPT_ENCODING = "gzip, deflate, br, zstd"
@@ -528,6 +530,8 @@ _BODY_FLAWS: dict[tuple[str, str], Callable[[str | None, bytes], tuple[str | Non
     # Each flaw changes exactly one aspect of the request, so each check is shown to fail on its own.
     ("get_with_body", "GET"): lambda content_type, _body: (content_type, b"plain=a+b"),
     ("get_with_type", "GET"): lambda _type, body: ("application/octet-stream", body),
+    ("get_with_empty_type", "GET"): lambda _type, body: ("", body),
+    ("get_with_chunked_body", "GET"): lambda content_type, _body: (content_type, b"plain=a+b"),
     ("bytes_as_text", "POST"): lambda content_type, body: (content_type, body.decode("utf-8", "replace").encode()),
     ("other_bytes", "POST"): lambda content_type, _body: (content_type, b'{"plain":"a b"}'),
     ("other_content_type", "POST"): lambda _type, body: ("application/json", body),
@@ -553,12 +557,25 @@ _BODY_FLAWS: dict[tuple[str, str], Callable[[str | None, bytes], tuple[str | Non
         None if content_type is None else " ".join(content_type.split()),
         body,
     ),
+    ("content_type_parameter_appended", "POST"): lambda content_type, body: (
+        None if content_type is None else content_type + "; x=y",
+        body,
+    ),
+    ("body_suffix", "POST"): lambda content_type, body: (content_type, body + b"\r\n"),
     # As long as the declared bytes, so only a byte-for-byte comparison tells them apart.
     ("same_length_bytes", "POST"): lambda content_type, body: (
         content_type,
         body.decode("latin-1").encode("ascii", "replace"),
     ),
 }
+
+
+# Each sends its body chunked, with no Content-Length: the GET's body, and the raw POST's declared bytes unchanged.
+_CHUNKED_FLAWS = frozenset({"get_with_chunked_body", "raw_chunked_body"})
+
+
+async def _chunked(body: bytes) -> AsyncIterator[bytes]:
+    yield body
 
 
 class _Tampered(HttpxTransport):
@@ -584,7 +601,7 @@ class _Tampered(HttpxTransport):
             content_type, body = tamper(content_type, body)
         if content_type is not None:
             kept.append(("content-type", content_type))
-        return httpx.Request(method, url, headers=kept, content=body)
+        return httpx.Request(method, url, headers=kept, content=_chunked(body) if self.flaw in _CHUNKED_FLAWS else body)
 
     async def send_wire(self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
         answer = await super().send_wire(
@@ -615,6 +632,11 @@ class _Tampered(HttpxTransport):
         ("other_value", (False, False)),
         ("get_with_body", (False, True)),
         ("get_with_type", (False, True)),
+        ("get_with_empty_type", (False, True)),
+        ("get_with_chunked_body", (False, True)),
+        ("raw_chunked_body", (True, True)),
+        ("content_type_parameter_appended", (True, False)),
+        ("body_suffix", (True, False)),
         ("content_type_lowercased", (True, False)),
         ("other_bytes", (True, False)),
         ("bytes_as_text", (True, False)),
@@ -647,6 +669,32 @@ async def test_conformance_skips_the_query_string_cases_for_a_transport_that_doe
     )
 
     assert all(outcome.skipped for outcome in report.outcomes)
+
+
+class _Unparseable(HttpxTransport):
+    """A transport that sends the responder its request with a header line HTTP/1.1 cannot parse."""
+
+    def __init__(self, webhook_url: str) -> None:
+        super().__init__(webhook_url)
+        self.url = httpx.URL(webhook_url)
+
+    async def send_wire(self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        target = f"{self.url.path}{request.method}?plain=a+b&outer%5Bitems%5D%5B0%5D=x"
+        async with asyncio.timeout(attempt_timeout):
+            reader, writer = await asyncio.open_connection(self.url.host, self.url.port)
+            writer.write(f"GET {target} HTTP/1.1\r\nHost {self.url.host}\r\n\r\n".encode())
+            await writer.drain()
+            answer = await reader.read(max_response_bytes)
+            writer.close()
+            await writer.wait_closed()
+        return WireResponse(200 if answer.startswith(b"HTTP/1.1 200 ") else 502, (), b'{"result":true}')
+
+
+@pytest.mark.asyncio
+async def test_conformance_fails_a_request_http_cannot_parse_at_once_rather_than_at_the_case_deadline() -> None:
+    report = await run_transport_conformance(_Unparseable, cases=frozenset({ConformanceCase.QUERY_STRING_GET}))
+
+    assert report.outcomes == (ConformanceOutcome(ConformanceCase.QUERY_STRING_GET, passed=False),)
 
 
 class _BodiesOnly(HttpxTransport):
