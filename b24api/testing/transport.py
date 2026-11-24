@@ -215,7 +215,7 @@ async def _run_case_environment(
     # the transport then returned, raised or was cancelled (the responder answers and closes at once, so a transport
     # still writing or reading may well fail). The verdict waits for the server to close, and so for every
     # connection the loop has already attached to it; a transport that ends right after it writes may end before
-    # its connection is attached, and closing drops it unread, so the transport's own error stands.
+    # its connection is attached, and closing drops it unread, so the case keeps its own outcome or error.
     try:
         try:
             outcome = await _run_owned_case(
