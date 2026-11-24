@@ -1,4 +1,4 @@
-"""Dependency-free conformance runner for public transport contracts."""
+"""Conformance runner for public transport contracts, needing nothing beyond b24api's own dependencies."""
 
 from __future__ import annotations
 import asyncio
@@ -105,7 +105,7 @@ class ConformanceReport:
         return not self.failures
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class _Capture:
     """One request as the responder read it: header names lower-cased, the body decoded from its framing."""
 
@@ -373,19 +373,18 @@ async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915
         task = asyncio.create_task(
             transport.send(Request("cancel.test", route=RouteKind.BARE), attempt_timeout=5, max_response_bytes=1024),
         )
-        await captures.get()
+        capture = await captures.get()
         task.cancel()
         try:
             await task
         except asyncio.CancelledError:
-            return ConformanceOutcome(case, passed=True)
+            return ConformanceOutcome(case, passed=capture is not _UNPARSED)
         return ConformanceOutcome(case, passed=False)
     if case is ConformanceCase.RESPONSE_BYTE_CEILING:
         try:
             await transport.send(Request("limit.test", route=RouteKind.BARE), attempt_timeout=5, max_response_bytes=1)
         except ResponseTooLargeError:
-            await captures.get()
-            return ConformanceOutcome(case, passed=True)
+            return ConformanceOutcome(case, passed=await captures.get() is not _UNPARSED)
         _discard_capture(captures)
         return ConformanceOutcome(case, passed=False)
 

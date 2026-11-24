@@ -17,7 +17,7 @@ from b24api import ReplaySafety, Request, RouteKind
 from b24api.contracts import BodyEncoding, Command, CommandFailure, CommandSuccess, RawContent, RequestHeaders
 from b24api.contracts.request import RequestSpec, canonical_request
 from b24api.encoding import BracketObstacle
-from b24api.errors import B24ApiError, CapabilityError
+from b24api.errors import B24ApiError, CapabilityError, ResponseTooLargeError
 from b24api.execution.executor import Executor
 from b24api.testing import (
     ConformanceCase,
@@ -575,7 +575,9 @@ _CHUNKED_FLAWS = frozenset({"get_with_chunked_body", "raw_chunked_body"})
 
 
 async def _chunked(body: bytes) -> AsyncIterator[bytes]:
-    yield body
+    """Stream ``body`` one byte per chunk, so the responder must join every chunk to read it."""
+    for index in range(len(body)):
+        yield body[index : index + 1]
 
 
 class _Tampered(HttpxTransport):
@@ -601,6 +603,8 @@ class _Tampered(HttpxTransport):
             content_type, body = tamper(content_type, body)
         if content_type is not None:
             kept.append(("content-type", content_type))
+        if self.flaw == "header_names_title_case":
+            kept = [(name.title(), value) for name, value in kept]
         return httpx.Request(method, url, headers=kept, content=_chunked(body) if self.flaw in _CHUNKED_FLAWS else body)
 
     async def send_wire(self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
@@ -635,6 +639,7 @@ class _Tampered(HttpxTransport):
         ("get_with_empty_type", (False, True)),
         ("get_with_chunked_body", (False, True)),
         ("raw_chunked_body", (True, True)),
+        ("header_names_title_case", (True, True)),
         ("content_type_parameter_appended", (True, False)),
         ("body_suffix", (True, False)),
         ("content_type_lowercased", (True, False)),
@@ -671,30 +676,67 @@ async def test_conformance_skips_the_query_string_cases_for_a_transport_that_doe
     assert all(outcome.skipped for outcome in report.outcomes)
 
 
-class _Unparseable(HttpxTransport):
-    """A transport that sends the responder its request with a header line HTTP/1.1 cannot parse."""
+class _RawSocket(HttpxTransport):
+    """A transport that writes its request line and ``Host`` header itself, separated from the value by ``separator``.
 
-    def __init__(self, webhook_url: str) -> None:
+    It otherwise behaves: it holds the cancellation case's request until it is cancelled, and refuses an answer
+    over the byte ceiling.
+    """
+
+    def __init__(self, webhook_url: str, separator: str) -> None:
         super().__init__(webhook_url)
         self.url = httpx.URL(webhook_url)
+        self.separator = separator
 
     async def send_wire(self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
         target = f"{self.url.path}{request.method}?plain=a+b&outer%5Bitems%5D%5B0%5D=x"
         async with asyncio.timeout(attempt_timeout):
             reader, writer = await asyncio.open_connection(self.url.host, self.url.port)
-            writer.write(f"GET {target} HTTP/1.1\r\nHost {self.url.host}\r\n\r\n".encode())
+            writer.write(f"GET {target} HTTP/1.1\r\nHost{self.separator}{self.url.host}\r\n\r\n".encode())
             await writer.drain()
-            answer = await reader.read(max_response_bytes)
+            if request.method == "cancel.test":
+                await asyncio.Event().wait()
+            answer = await reader.read()
             writer.close()
             await writer.wait_closed()
-        return WireResponse(200 if answer.startswith(b"HTTP/1.1 200 ") else 502, (), b'{"result":true}')
+        head, _, body = answer.partition(b"\r\n\r\n")
+        if len(body) > max_response_bytes:
+            raise ResponseTooLargeError("the answer exceeded the byte ceiling")
+        return WireResponse(int(head.split(b" ")[1]), (), body)
 
 
 @pytest.mark.asyncio
-async def test_conformance_fails_a_request_http_cannot_parse_at_once_rather_than_at_the_case_deadline() -> None:
-    report = await run_transport_conformance(_Unparseable, cases=frozenset({ConformanceCase.QUERY_STRING_GET}))
+@pytest.mark.parametrize(
+    "case",
+    [ConformanceCase.QUERY_STRING_GET, ConformanceCase.CANCELLATION_PROPAGATES, ConformanceCase.RESPONSE_BYTE_CEILING],
+)
+@pytest.mark.parametrize(("separator", "passed"), [(": ", True), (" ", False)], ids=["parseable", "no_colon"])
+async def test_conformance_fails_a_request_http_cannot_parse_in_every_case_that_waits_for_it(
+    case: ConformanceCase, separator: str, *, passed: bool
+) -> None:
+    report = await run_transport_conformance(lambda url: _RawSocket(url, separator), cases=frozenset({case}))
 
-    assert report.outcomes == (ConformanceOutcome(ConformanceCase.QUERY_STRING_GET, passed=False),)
+    assert report.outcomes == (ConformanceOutcome(case, passed=passed),)
+
+
+class _Streaming(HttpxTransport):
+    """A transport that streams every body one byte per chunk, with no ``Content-Length``."""
+
+    def _build_request(
+        self, request: WireRequest, headers: tuple[tuple[str, str], ...], method_url: str
+    ) -> httpx.Request:
+        built = super()._build_request(request, headers, method_url)
+        kept = [(name, value) for name, value in built.headers.items() if name != "content-length"]
+        return httpx.Request(
+            built.method, built.url, headers=kept, content=_chunked(built.content) if built.content else None
+        )
+
+
+@pytest.mark.asyncio
+async def test_conformance_reads_every_body_case_from_a_body_streamed_in_chunks() -> None:
+    report = await run_transport_conformance(_Streaming)
+
+    assert all(outcome.passed and not outcome.skipped for outcome in report.outcomes)
 
 
 class _BodiesOnly(HttpxTransport):
