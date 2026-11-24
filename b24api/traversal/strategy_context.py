@@ -13,8 +13,9 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
     from b24api.completion.recorder import CompletionSink
+    from b24api.contracts.completion import CommandSettlement
     from b24api.contracts.json import FrozenJson, JsonValue
-    from b24api.contracts.policy import ConfirmationPolicy
+    from b24api.contracts.policy import ConfirmationPolicy, TotalSemantics
     from b24api.contracts.report import PageDispatch
     from b24api.contracts.request import IdentitySpec, Request, ResultSelector
     from b24api.contracts.response import Response
@@ -60,6 +61,11 @@ class StrategyContext(Protocol):
         ...
 
     @property
+    def total_semantics(self) -> TotalSemantics:
+        """Return the effective meaning of a server-reported total."""
+        ...
+
+    @property
     def page_offset(self) -> int | None:
         """Return the logical offset of the scheduled page."""
         ...
@@ -72,8 +78,15 @@ class StrategyContext(Protocol):
         """Attach physical dispatch provenance without changing the logical cursor."""
         ...
 
-    def record_unknown_page(self, *, dispatch: PageDispatch, batch_index: int | None, error: BaseException) -> None:
-        """Record a scheduled page whose rows could not be decoded."""
+    def record_failed_page(
+        self,
+        *,
+        dispatch: PageDispatch,
+        batch_index: int | None,
+        error: BaseException,
+        settled: CommandSettlement,
+    ) -> None:
+        """Record a failed page by its settlement (``settled``): none for a page never sent, else the trace's code."""
         ...
 
     def select_page(self, response: Response, *, single: bool = False) -> tuple[FrozenJson, ...]:
@@ -82,6 +95,10 @@ class StrategyContext(Protocol):
 
     def reject_external_page(self, items: tuple[FrozenJson, ...], response: Response, error: BaseException) -> None:
         """Record a pre-commit rejection exactly once."""
+        ...
+
+    def ensure_identity_capacity(self, rows: int) -> None:
+        """Refuse, before any row is admitted, a range whose identities the identity budget cannot hold."""
         ...
 
     def begin_external_validation(self) -> None:
@@ -160,6 +177,8 @@ class PageVerdict:
     admitted: tuple[int, ...] | None = None
     # Deliver a valid page even when it admits no row, so a page-stop policy still sees it.
     deliver_empty: bool = False
+    # The page is an empty first page without a usable total that closes the source (``EmptySourceWitness``).
+    empty_source: bool = False
 
 
 @dataclass(frozen=True, slots=True)

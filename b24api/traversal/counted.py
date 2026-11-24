@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import asyncio
+from contextlib import aclosing
 from typing import TYPE_CHECKING, Self
 
 from b24api.completion.recorder import CountedCompletionRecorder
@@ -16,7 +17,9 @@ from b24api.contracts.policy import (
     SnapshotState,
 )
 from b24api.contracts.report import retain_page_trace
-from b24api.errors import B24ApiError, CapabilityError, IncompleteTraversalError
+from b24api.errors import B24ApiError, IncompleteTraversalError, PaginationError
+from b24api.execution.context import latch_escape
+from b24api.execution.failure import CANCELLED_REASON
 from b24api.execution.failure import attach_report as _attach_report
 from b24api.execution.snapshot import KernelReport
 from b24api.traversal.driver import PaginationDriver
@@ -30,11 +33,17 @@ if TYPE_CHECKING:
     from b24api.contracts.page import PageAdapter
     from b24api.contracts.request import Request, ResultSelector, TraversalIdentity
     from b24api.execution import Executor
+    from b24api.execution.context import ExecutionContext
     from b24api.traversal.plans import CountedOffsetPlan
 
 
 class CountedItemStream:
     """Single-use counted item stream backed by the proven pagination driver."""
+
+    # Every page is read inside a read; nothing runs between reads.
+    works_between_reads = False
+    # Its pages close inside the traversal, so a failed close is a failure of the traversal, never its end alone.
+    cleanup_failure: BaseException | None = None
 
     def __init__(  # noqa: PLR0913
         self,
@@ -80,6 +89,11 @@ class CountedItemStream:
         return self
 
     @property
+    def operation_context(self) -> ExecutionContext:
+        """Return the operation context whose elapsed budget bounds the wrapper's cleanup."""
+        return self._context
+
+    @property
     def completion_gate(self) -> object:
         """Expose live counted completion evidence to the operation wrapper."""
         return self._completion.gate
@@ -112,32 +126,32 @@ class CountedItemStream:
     async def _run(self) -> AsyncGenerator[JsonValue]:
         primary: BaseException | None = None
         try:
-            async for page in self._driver.counted_batch_pages(
-                batch_size=self._batch_size,
-                page_size=self._page_size,
-            ):
-                self._evidence.append(page.response.evidence)
-                for item, is_unique in zip(page.items, self._driver.last_page_unique_mask, strict=True):
-                    self._emitted += 1
-                    self._unique += int(is_unique)
-                    yield thaw_json(item)
-                if page.items:
-                    self._completion.delivered()
-                    self._completion.acknowledged()
+            pages = self._driver.counted_batch_pages(batch_size=self._batch_size, page_size=self._page_size)
+            async with aclosing(pages):
+                async for page in pages:
+                    self._evidence.append(page.response.evidence)
+                    for item, is_unique in zip(page.items, self._driver.last_page_unique_mask, strict=True):
+                        self._emitted += 1
+                        self._unique += int(is_unique)
+                        yield thaw_json(item)
+                    if page.items:
+                        self._completion.delivered()
+                        self._completion.acknowledged()
             await self._finalize(KernelState.COMPLETED, "counted traversal completed exactly")
         except asyncio.CancelledError as error:
             primary = error
-            await self._finalize(KernelState.CANCELLED, "iteration cancelled")
+            await self._finalize(KernelState.CANCELLED, CANCELLED_REASON)
             _attach_report(error, self.report)
             raise
         except GeneratorExit as error:
             primary = error
             await self._finalize(KernelState.CANCELLED, "stream closed before exhaustion")
             raise
-        except BaseException as error:
+        except Exception as error:
             primary = error
-            snapshot = await self._context.snapshot()
-            if isinstance(error, CapabilityError) and snapshot.counters.physical_requests == 0:
+            if not isinstance(error, PaginationError | IncompleteTraversalError):
+                # As in ``iter_list``: a typed failure leaves as raised on a FAILED report; only a broken
+                # pagination invariant makes the traversal incomplete.
                 await self._finalize(KernelState.FAILED, type(error).__name__)
                 _attach_report(error, self.report)
                 raise
@@ -155,6 +169,13 @@ class CountedItemStream:
                 replay_disposition=replay_disposition,
             )
             raise incomplete from cause
+        except BaseException as error:
+            # A BaseException that is not an Exception is no traversal failure to wrap: it leaves as raised.
+            latch_escape(error)  # Latched before the await, so no cancellation of it can ever replace it.
+            primary = error
+            await self._finalize(KernelState.FAILED, type(error).__name__)
+            _attach_report(error, self.report)
+            raise
         finally:
             self._closed = True
             if primary is not None and self.report.state is KernelState.NOT_STARTED:
@@ -164,7 +185,6 @@ class CountedItemStream:
     async def _finalize(self, state: KernelState, reason: str) -> None:
         if self.report.state is not KernelState.NOT_STARTED:
             return
-        self._completion.settle_unobserved()
         snapshot = await self._context.snapshot()
         batch = self._driver.batch_report
         snapshot_state = (

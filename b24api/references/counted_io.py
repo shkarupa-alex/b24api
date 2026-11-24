@@ -15,26 +15,28 @@ from typing import TYPE_CHECKING, Protocol
 from b24api.completion.closure import QUALIFIED_TOTAL_REACHED
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
-from b24api.errors import CapabilityError
-from b24api.references.dispatch import _BatchPageError, _failed_dispatch, _failed_settlement
+from b24api.errors import B24ApiError, CapabilityError
+from b24api.execution.context import Settled, latch_escape, spawn_settled
+from b24api.references.dispatch import _BatchPageError, _failed_page, _Producing, _SentPageError
 from b24api.traversal.counted_io import HeadAttempt, TailReceipt
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
 
     from b24api.batch.engine import _BatchInput
-    from b24api.batch.outcome import BatchFailure
     from b24api.contracts.policy import ExecutionPolicy
     from b24api.contracts.request import Request
     from b24api.execution import ExecutionContext
     from b24api.execution.snapshot import KernelReport
-    from b24api.references.dispatch import _DispatchedPage, _ProducerState, _Reservation, _RowBuffer
+    from b24api.references.dispatch import _DispatchedPage, _ProducerState, _Reservation, _RowBuffer, _Transit
     from b24api.references.run import _ReferenceRun
     from b24api.traversal.strategy_context import StrategyContext
 
 
 class _PageFetcher(Protocol):
-    async def fetch(self, request: Request, reference_id: str) -> _DispatchedPage: ...
+    async def fetch(
+        self, request: Request, reference_id: str, *, transit: _Transit | None = None
+    ) -> _DispatchedPage: ...
 
 
 class CountedHost(Protocol):
@@ -113,7 +115,8 @@ class SharedCountedWaveIO:
         del context  # the shared dispatcher already runs on the operation context
         try:
             dispatched = await self._host.dispatch_page(self._run, request)
-        except BaseException:
+        except BaseException as error:
+            latch_escape(error)  # Latched before the await, so no cancellation of it can ever replace it.
             await self._host.abandon_page(self._run)
             raise
         return HeadAttempt(
@@ -121,21 +124,18 @@ class SharedCountedWaveIO:
             None,
             dispatched.dispatch,
             dispatched.batch_index,
-            dispatch_started=True,
             settlement=CommandSettlement.SUCCESS,
         )
 
     def head_failure(self, error: BaseException) -> HeadAttempt:
         """Return the actual batch provenance of a failed head and its settlement."""
-        failed = _failed_dispatch(self._host.page_dispatch, error)
+        failed = _failed_page(error)
         return HeadAttempt(
             None,
-            failed.error or error,
-            failed.dispatch,
+            failed.error,
+            self._host.page_dispatch,
             failed.batch_index,
-            dispatch_started=isinstance(error, _BatchPageError)
-            or bool(getattr(error, "_b24api_dispatch_started", False)),
-            settlement=_failed_settlement(error),
+            settlement=failed.settlement,
         )
 
     async def tail_batch_size(
@@ -161,13 +161,14 @@ class SharedCountedWaveIO:
         self,
         requests: Iterator[_BatchInput],
         *,
+        pages: int,
         batch_size: int,
         policy: ExecutionPolicy,
         context: ExecutionContext,
     ) -> ReferenceTailStream:
-        """Stream the dense tail through the shared dispatcher with ``batch_size`` pages in flight."""
+        """Stream the dense tail's ``pages`` through the shared dispatcher with ``batch_size`` pages in flight."""
         del policy, context
-        return ReferenceTailStream(self._host, self._run, requests, window=batch_size)
+        return ReferenceTailStream(self._host, self._run, requests, pages=pages, window=batch_size)
 
 
 @dataclass(slots=True, eq=False)
@@ -176,7 +177,7 @@ class _TailSlot:
     page_id: int
     sequence: int
     reservation: _Reservation | None = None
-    task: asyncio.Task[_DispatchedPage] | None = None
+    task: asyncio.Task[Settled[_DispatchedPage]] | None = None
     error: BaseException | None = field(default=None, repr=False)
     consumed: bool = False
 
@@ -188,6 +189,10 @@ class ReferenceTailStream:
     the shared dispatcher, at most ``window`` pages ahead of the consumer. Receipts are yielded in
     offset order; ``aclose`` settles every page the binding will not commit exactly once: never sent
     as not executed, sent without an observed outcome as unknown, settled but unconsumed as aborted.
+
+    While the submitter holds its next page and only the consumer's progress stands between it and
+    the queue, the tail is a pending refill of the dispatcher: the window slots a draining consumer
+    frees one by one then fill one batch instead of one batch each.
     """
 
     report: KernelReport | None = None
@@ -198,6 +203,7 @@ class ReferenceTailStream:
         run: _ReferenceRun,
         requests: Iterator[_BatchInput],
         *,
+        pages: int,
         window: int,
     ) -> None:
         """Hold the planned requests; nothing is reserved or sent before iteration starts."""
@@ -205,10 +211,21 @@ class ReferenceTailStream:
         self._run = run
         self._requests = requests
         self._window = asyncio.Semaphore(max(1, window))
+        self._width = max(1, window)
+        # The planned pages not handed to the dispatcher yet.
+        self._unsent = pages
         self._slots: dict[int, _TailSlot] = {}
         self._changed = asyncio.Event()
         self._submitter: asyncio.Task[None] | None = None
         self._closed = False
+        # The submitter holds its next page until the page departs for the queue.
+        self._in_hand = False
+        # That page has its window slot.
+        self._slot_taken = False
+        # The consumer freed a window slot the submitter has not taken yet.
+        self._slot_freed = False
+        # The consumer holds a yielded receipt; moving past it frees a window slot.
+        self._holding = False
 
     async def __aiter__(self) -> AsyncIterator[TailReceipt]:
         """Yield each planned page's receipt in offset order."""
@@ -220,34 +237,73 @@ class ReferenceTailStream:
             if slot is None:
                 return
             ordinal += 1
-            yield await self._receipt(slot)
+            receipt = await self._receipt(slot)
+            self._holding = True
+            self._publish()
+            yield receipt
+            self._holding = False
+            self._slot_freed = True
             self._window.release()
+            self._publish()
+
+    def _publish(self) -> None:
+        """Report what the tail's next page waits for, from where the submitter and the consumer stand.
+
+        With no page in hand the tail adds none. A page with its slot, or a free one, is runnable. A page whose
+        window is full waits for nothing but the consumer when the consumer has freed a slot the submitter has
+        not taken yet, or holds a receipt whose release frees one, its rows coming back to the pool first. While
+        the consumer itself waits for an in-flight page, the tail adds nothing on its own.
+        """
+        state, key = self._host.producer_state, self._run.producer_key
+        if not self._in_hand:
+            state.move(key, _Producing.WAITING)
+        elif self._slot_taken or not self._window.locked():
+            state.move(key, _Producing.RUNNABLE)
+        elif self._slot_freed:
+            state.move(key, _Producing.REFILLING)
+        elif self._holding:
+            state.move(key, _Producing.REFILLING, returns=self._run.reservation)
+        else:
+            state.move(key, _Producing.WAITING)
+
+    def _publish_window(self) -> None:
+        """Report the pages the tail may still put in flight at once: an ordered pool keeps room for them."""
+        self._host.producer_state.set_window(self._run.producer_key, min(self._width, self._unsent))
 
     async def _submit(self) -> None:
         """Plan, reserve and dispatch tail pages ahead of the consumer, bounded by the window."""
         host, run = self._host, self._run
         state, key = host.producer_state, run.producer_key
+        self._publish_window()
         try:
             for ordinal, item in enumerate(self._requests):
-                if self._window.locked():
-                    state.runnable.discard(key)
-                    state.touch()
+                self._in_hand = True
+                self._publish()
                 await self._window.acquire()
-                state.runnable.add(key)
-                state.touch()
+                self._slot_taken, self._slot_freed = True, False
+                self._publish()
                 slot = _TailSlot(ordinal, run.completion.reserve(), host.take_page_sequence())
                 self._slots[ordinal] = slot
                 slot.reservation = await host.buffer.reserve(run.work.index, run.program.page_cap)
-                slot.task = asyncio.create_task(self._fetch(slot, item.request))
+                transit = state.depart(key, page_reserved=False)
+                # The fetch runs the caller's transport: its task returns how it ended (``Settled``).
+                slot.task = spawn_settled(self._fetch(slot, item.request, transit))
+                transit.carried_by(slot.task)
+                self._unsent -= 1
+                self._publish_window()
+                self._in_hand = self._slot_taken = False
+                self._publish()
                 self._changed.set()
         finally:
-            state.runnable.discard(key)
-            state.touch()
+            self._in_hand = self._slot_taken = False
+            self._unsent = 0
+            self._publish_window()
+            self._publish()
             self._changed.set()
 
-    async def _fetch(self, slot: _TailSlot, request: Request) -> _DispatchedPage:
+    async def _fetch(self, slot: _TailSlot, request: Request, transit: _Transit) -> _DispatchedPage:
         try:
-            dispatched = await self._host.dispatcher.fetch(request, self._run.producer_key)
+            dispatched = await self._host.dispatcher.fetch(request, self._run.producer_key, transit=transit)
         except BaseException as error:
             slot.error = error
             raise
@@ -284,13 +340,18 @@ class ReferenceTailStream:
             raise RuntimeError("counted tail page lacks its dispatch")
         run = self._run
         try:
-            dispatched = await task
-        except _BatchPageError as error:
+            dispatched = (await task).unwrap()
+        except (_SentPageError, B24ApiError) as error:
+            # A failed page, whatever its command did, is the page's outcome, as on the flat tail: the binding takes
+            # it, and the tail's one trace site traces it by its settlement (``failed_page``), none if never sent.
+            failed = _failed_page(error)
             self._take(slot)
-            return TailReceipt(slot.ordinal, None, error.failure, error.failure.command_index)
+            return TailReceipt(
+                slot.ordinal, None, failed.batch_index, failed.settlement, error=failed.error, failure=failed.failure
+            )
         self._take(slot)
         run.page_state += 1
-        return TailReceipt(slot.ordinal, dispatched.response, None, dispatched.batch_index)
+        return TailReceipt(slot.ordinal, dispatched.response, dispatched.batch_index, CommandSettlement.SUCCESS)
 
     def _take(self, slot: _TailSlot) -> None:
         run = self._run
@@ -301,15 +362,15 @@ class ReferenceTailStream:
 
     def settle(self, receipt: TailReceipt) -> None:
         """Record the activated page's physical command outcome."""
-        failure = receipt.failure
-        self._run.completion.settled(
-            CommandSettlement.SUCCESS if failure is None else _failed_settlement(_BatchPageError(failure))
-        )
+        self._run.completion.settled(receipt.settlement)
 
-    def failure(self, receipt: TailReceipt, outcome: BatchFailure) -> BaseException:
-        """Return the binding failure carrying the command's replay disposition."""
-        del receipt
-        return _BatchPageError(outcome)
+    def failure(self, receipt: TailReceipt) -> BaseException:
+        """Return the binding failure: its command's own, which carries the replay disposition, or its chunk's."""
+        if receipt.failure is not None:
+            return _BatchPageError(receipt.failure)
+        if receipt.error is None:
+            raise RuntimeError("counted tail failure lacks its error")
+        return receipt.error
 
     async def aclose(self) -> None:
         """Stop planning, then settle and release every page the binding will not commit, once."""
@@ -339,10 +400,10 @@ def _abandoned_settlement(slot: _TailSlot) -> CommandSettlement:
     task = slot.task
     if task is None:
         return CommandSettlement.NOT_EXECUTED
-    if not task.cancelled() and task.exception() is None:
-        return CommandSettlement.SUCCESS
     error = slot.error
-    return CommandSettlement.NOT_EXECUTED if error is None else _failed_settlement(error)
+    if not task.cancelled() and error is None:
+        return CommandSettlement.SUCCESS
+    return CommandSettlement.NOT_EXECUTED if error is None else _failed_page(error).settlement
 
 
 __all__ = ["LeaseCountedRowAccount", "ReferenceTailStream", "SharedCountedWaveIO"]

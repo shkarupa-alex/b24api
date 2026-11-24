@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Self
+from typing import TYPE_CHECKING, Self
 
 from b24api.contracts.json import FrozenJson, JsonValue, _freeze_json, _is_plain_int, thaw_json
 from b24api.contracts.policy import ReplayDisposition
 from b24api.contracts.request import ReplaySafety, Request
 from b24api.contracts.response import Response
+from b24api.execution.facts import Execution, settled_as, settlement
+
+if TYPE_CHECKING:
+    from b24api.contracts.completion import CommandSettlement
+
+if TYPE_CHECKING:
+    from b24api.errors import B24ApiError
 
 STABLE_KEY_MAXIMUM = 100
 
@@ -133,7 +140,7 @@ class BatchFailure:
     command_index: int
     stable_key: str
     request: Request = field(repr=False)
-    error: object = field(repr=False)
+    error: B24ApiError = field(repr=False)
     replay_safety: ReplaySafety = ReplaySafety.UNKNOWN
     replay_disposition: ReplayDisposition = ReplayDisposition.NOT_ELIGIBLE
     correlation: object = field(default=None, repr=False)
@@ -165,3 +172,10 @@ def _validate_batch_correlation(
 
 
 type BatchOutcome = BatchSuccess | BatchFailure
+
+
+def settlement_of(outcome: BatchOutcome) -> CommandSettlement:
+    """Return the completion settlement of a command's final outcome: a success, or what its failure's facts say."""
+    if isinstance(outcome, BatchSuccess):
+        return settled_as(Execution.ANSWERED, succeeded=True)
+    return settlement(outcome.error)

@@ -1,7 +1,7 @@
-# Local QC runs the CI lint and types checks and the default test run. It leaves out the internal
-# benches (pytest marker `slow`: harness contracts and 50k/100k-scale runs, several minutes), which run
-# in `make bench` and in the blocking CI job `slow`; react to them when that job fails rather than
-# running them on every change. The coverage floor, the 3.13 leg, min-deps and wheel-typing run in CI only.
+# Local QC runs the CI lint and types checks and the default test run. It leaves out the internal benches
+# (pytest marker `slow`: harness contracts and 50k/100k-scale runs, several minutes), which run in
+# `make bench` and in the blocking CI job `slow`; react to them when that job fails rather than running them
+# on every change. The coverage floor, the 3.13 and 3.14 legs, min-deps and wheel-typing run in CI only.
 
 .PHONY: qc lint types test bench
 
@@ -15,9 +15,13 @@ types:
 	uv run --locked mypy b24api
 	uv run --locked python .github/scripts/mypy_ratchet.py
 
-# The default addopts in pyproject.toml exclude the `slow` and `benchmark` markers.
+# The default addopts in pyproject.toml exclude the `slow` and `benchmark` markers. The suite runs in parallel
+# worker processes (pytest-xdist), one per CPU by default; `make test PYTEST_WORKERS=2` bounds them and
+# `PYTEST_WORKERS=0` runs it in this process alone.
+PYTEST_WORKERS ?= auto
+
 test:
-	uv run --locked pytest
+	uv run --locked pytest -n $(PYTEST_WORKERS)
 
 bench:
 	uv run --locked pytest -m slow

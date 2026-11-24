@@ -4,13 +4,15 @@
 """
 
 from __future__ import annotations
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, Self
 
 from b24api._error_types import ErrorOrigin
 from b24api.contracts.evidence import ResponseEvidence
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from b24api._diagnostics import DiagnosticContext
     from b24api.contracts.request_summary import RequestSummary
 
@@ -64,6 +66,20 @@ class B24ApiError(Exception):
     def __repr__(self) -> str:
         """Return a safe representation."""
         return f"{type(self).__name__}({self.to_safe_dict()!r})"
+
+    def __reduce__(self) -> tuple[Callable[..., Self], tuple[type[Self], tuple[object, ...]], dict[str, object]]:
+        """Pickle and copy as the rendered message plus attributes, without calling the constructor again.
+
+        ``Exception`` rebuilds an error by calling its class with ``args``, the rendered message alone, which
+        a keyword-only or typed constructor refuses; the attributes are already rendered and are restored as
+        they are.
+        """
+        return _restore_error, (type(self), self.args), dict(vars(self))
+
+
+def _restore_error[E: B24ApiError](error_type: type[E], args: tuple[object, ...]) -> E:
+    """Allocate an error with its ``args``; pickle and copy then restore its attributes."""
+    return error_type.__new__(error_type, *args)
 
 
 class BudgetExceededError(B24ApiError):

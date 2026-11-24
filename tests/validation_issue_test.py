@@ -6,7 +6,7 @@ import json
 import pytest
 
 from b24api import ApiResponseError, Bitrix24, ProtocolError, ReplaySafety, Request, RouteKind, Settings
-from b24api.errors import ValidationIssue
+from b24api.errors import AmbiguousExecutionError, ValidationIssue
 from b24api.testing.scripted import ScriptedExchange, ScriptedTransport
 from b24api.transport.base import WireResponse
 from b24api.transport.protocol import ProtocolCodec
@@ -123,7 +123,7 @@ async def test_a19_fieldless_item_via_unsafe_direct_call_sends_once(status_code:
         (ScriptedExchange(request, WireResponse(status_code, (("content-type", "application/json"),), body)),),
     )
 
-    async with Bitrix24(Settings(webhook_url="https://fixture.invalid/"), transport=transport) as api:
+    async with Bitrix24(Settings(webhook_url="https://fixture.invalid/rest/1/test/"), transport=transport) as api:
         with pytest.raises(ApiResponseError) as raised:
             await api.call(request)
 
@@ -134,7 +134,7 @@ async def test_a19_fieldless_item_via_unsafe_direct_call_sends_once(status_code:
 
 
 @pytest.mark.asyncio
-async def test_a19_present_null_field_via_unsafe_direct_call_is_protocol_error() -> None:
+async def test_a19_present_null_field_via_unsafe_direct_call_leaves_the_call_unknown() -> None:
     request = Request("tasks.task.add", {"fields": {"title": "x"}}, ReplaySafety.UNSAFE, route=RouteKind.API_V3)
     payload = {
         "error": {
@@ -145,10 +145,12 @@ async def test_a19_present_null_field_via_unsafe_direct_call_is_protocol_error()
     }
     transport = ScriptedTransport((ScriptedExchange.json(request, payload),))
 
-    async with Bitrix24(Settings(webhook_url="https://fixture.invalid/"), transport=transport) as api:
-        with pytest.raises(ProtocolError) as raised:
+    async with Bitrix24(Settings(webhook_url="https://fixture.invalid/rest/1/test/"), transport=transport) as api:
+        with pytest.raises(AmbiguousExecutionError) as raised:
             await api.call(request)
 
     transport.assert_exhausted()
     assert len(transport.calls) == 1
-    assert not isinstance(raised.value, ApiResponseError)
+    # A success status whose error object is malformed proves no refusal: the UNSAFE call may have run.
+    assert isinstance(raised.value.__cause__, ProtocolError)
+    assert not isinstance(raised.value.__cause__, ApiResponseError)

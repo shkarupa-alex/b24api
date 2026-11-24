@@ -69,9 +69,15 @@ class ItemCursorStrategy:
         )
 
     def judge(self, ctx: StrategyContext, response: Response, items: tuple[FrozenJson, ...]) -> PageVerdict:
-        """Check the page's cursors are valid, ordered and strictly past the current cursor."""
+        """Check the page's identities, then its cursors: valid, ordered and strictly past the current cursor.
+
+        Identities are read first, so a row breaking its identity, which is the cursor itself when no
+        other identity is declared, fails with ``IdentityContractError`` as on every other traversal.
+        """
         plan, cursor = self._plan, self._cursor
-        cursor_values = self._cursor_values = _cursor_values(ctx.source_page.current(items), plan)
+        source = ctx.source_page.current(items)
+        identities = ctx.extract_identities(source)
+        cursor_values = self._cursor_values = _cursor_values(source, plan)
         for value in cursor_values:
             validate_cursor_progression(value, plan.domain)
         _validate_order(cursor_values, plan.page_order or plan.direction)
@@ -84,7 +90,7 @@ class ItemCursorStrategy:
                 if plan.direction == "desc" and comparison >= 0:
                     raise PaginationError("item cursor page ignored its upper bound")
         self._terminal = self._page_terminal(response, len(items))
-        return PageVerdict(self._terminal is not None)
+        return PageVerdict(self._terminal is not None, identities)
 
     def _page_terminal(self, response: Response, row_count: int) -> str | None:
         """Close on the declared response flag when one exists, else on the empty confirmation page."""

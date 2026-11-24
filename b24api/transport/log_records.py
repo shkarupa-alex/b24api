@@ -1,8 +1,9 @@
 """Rewrite one HTTPX log record in place without changing what carries no secret.
 
-Both shield paths share :func:`rewrite_record`: an owned dispatch scrubs every credential-shaped segment,
-while any other record loses only the registered webhook secrets. A field in which nothing was found keeps
-its original object and type, so a foreign record without a secret is left exactly as it was emitted.
+Both shield paths share :func:`rewrite_record`: an owned dispatch scrubs every credential-shaped segment and
+the query of a Bitrix URL, while any other record loses only the registered webhook secrets. A field in
+which nothing was found keeps its original object and type, so a foreign record without a secret is left
+exactly as it was emitted.
 A traceback is part of the record too: once a record is protected, its exception and stack are rendered,
 scrubbed and stored as text, and the raw ``exc_info`` is dropped, so no later handler can render the
 original exception, with its credential-bearing message or frames, again.
@@ -18,6 +19,8 @@ from b24api.redaction import Redactor
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from b24api._webhook import WebhookSecrets
+
 _REPLACEMENT = "[REDACTED]"
 # Fields logging itself sets; everything else on a record arrived through ``extra``.
 _STANDARD_RECORD_FIELDS = frozenset(
@@ -29,27 +32,27 @@ _HOP_CREDENTIAL = re.compile(
     r"(?P<prefix>/rest/(?:api/)?[^/\s?#\"']+/)(?P<token>[^/\s?#\"']+)(?=[/?#\s\"']|$)",
     re.IGNORECASE,
 )
+# A request's parameters travel in a query only as a ``QUERY_STRING`` request's, which HTTPX logs in its URL; an owned
+# record keeps the path and drops the values, as it never shows a body's.
+_OWNED_QUERY = re.compile(r"(?P<path>/rest/[^\s?#\"']*)\?[^\s#\"']*", re.IGNORECASE)
 _TRACEBACK_FORMATTER = logging.Formatter()
 _UNRENDERABLE_TRACEBACK = "[traceback unavailable]"
 
 
-def redact_registered_value(value: object, credentials: tuple[str, ...]) -> object:
+def redact_registered_value(value: object, secrets: WebhookSecrets) -> object:
     """Remove only the registered secret from a foreign record field, leaving it otherwise untouched."""
     rendered = str(value)
-    if not any(credential in rendered for credential in credentials):
+    if not secrets.found_in(rendered):
         return value
-    for credential in credentials:
-        rendered = rendered.replace(credential, _REPLACEMENT)
-    return rendered
+    return secrets.replaced_in(rendered, _REPLACEMENT)
 
 
-def redact_owned_value(value: object, credentials: tuple[str, ...]) -> object:
+def redact_owned_value(value: object, secrets: WebhookSecrets) -> object:
     """Scrub one field of an owned record, keeping its original type when nothing is secret."""
     rendered = str(value)
-    scrubbed = rendered
-    for credential in credentials:
-        scrubbed = scrubbed.replace(credential, _REPLACEMENT)
+    scrubbed = secrets.replaced_in(rendered, _REPLACEMENT)
     scrubbed = _HOP_CREDENTIAL.sub(lambda match: match.group("prefix") + _REPLACEMENT, scrubbed)
+    scrubbed = _OWNED_QUERY.sub(lambda match: f"{match.group('path')}?{_REPLACEMENT}", scrubbed)
     scrubbed = _RECORD_REDACTOR.redact_text(scrubbed)
     return value if scrubbed == rendered else scrubbed
 

@@ -78,7 +78,7 @@ class SourceAdmission:
             raise TypeError("executor must be an Executor")
         self._executor = executor
         self._dispatch = dispatch
-        self._dispatch_plan = kernel_dispatch(dispatch, policy)
+        self._dispatch_plan = kernel_dispatch(dispatch, client_concurrency=executor.coordinator.max_concurrency)
         self._policy = policy
         # A preflight-only context: request controls are checked against it, it never starts or sends.
         self._preflight = executor.context(policy)
@@ -166,7 +166,7 @@ class SourceAdmission:
             sources,
             accept=self.admit,
             observe=None if audit is None else (lambda reference: audit(reference.request)),
-            failure=lambda _error: _BindingSourceError(),
+            failure=_BindingSourceError,
         )
         scheduler = ReferenceScheduler(
             self._executor,

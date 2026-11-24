@@ -64,7 +64,7 @@ from b24api.contracts import (
 )
 from b24api.contracts.policy import ConfirmationPolicy, DuplicatePolicy, SnapshotRequirement, TotalSemantics
 from b24api.encoding import encode_php_query
-from b24api.errors import CapabilityError, IncompleteTraversalError, PaginationError
+from b24api.errors import CapabilityError, IncompleteTraversalError, InputSourceError, PaginationError
 from b24api.traversal.offset_rules import sequential_offset_plan
 from b24api.traversal.plans import OffsetSequentialPlan, OffsetTerminalRule
 from tests.scripting import ResponderTransport, client_for
@@ -858,7 +858,9 @@ async def test_callback_failure_on_the_terminal_short_page_is_never_exhausted(
     assert report is not None
     assert not report.successful
     assert not report.exhausted
-    assert report.state is (TerminalState.FAILED if dispatch is None else TerminalState.INCOMPLETE)
+    # The failed callback fails its binding, not the evidence: the delivered page is released with it.
+    assert report.state is (TerminalState.FAILED if dispatch is None else TerminalState.COMPLETED_WITH_FAILURES)
+    assert not [violation.code for violation in report.violations if violation.code.startswith("completion_")]
     assert not any(isinstance(item, ReferenceComplete) for item in items)
     if dispatch is not None:
         assert any(isinstance(item, ReferenceFailure) for item in items)
@@ -926,8 +928,10 @@ async def test_cleanup_failure_is_never_an_exhausted_or_stronger_outcome(early: 
                     if early:
                         break
 
-        with pytest.raises(RuntimeError, match="binding source cleanup failed"):
+        # The source's failed close is its failure, raised as a failed pull is.
+        with pytest.raises(InputSourceError) as caught:
             await consume()
+        assert str(caught.value.__cause__) == "binding source cleanup failed"
 
     report = stream.report
     assert report is not None

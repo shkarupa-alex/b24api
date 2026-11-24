@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import asyncio
+import contextvars
 import threading
 from typing import TYPE_CHECKING
 
@@ -12,6 +13,8 @@ from b24api._sources import EXHAUSTED, OwnedSource
 from b24api.contracts import Command
 from b24api.contracts.report import Violation, ViolationSeverity
 from b24api.contracts.violation import MAX_RETAINED_VIOLATIONS
+from b24api.execution.context import CleanupResult
+from tests.scripting import HANG_BOUND, WorkerStarts, reached
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -141,3 +144,117 @@ async def test_cancelled_sync_pull_finishes_before_the_iterator_is_closed() -> N
     result = await source.aclose()
     assert result.error is None
     assert trace == ["pulled", "closed"]
+
+
+_TENANT: contextvars.ContextVar[str] = contextvars.ContextVar("tenant", default="caller")
+
+
+def _tenant_scoped(seen: list[tuple[str, str]]) -> Iterator[int]:
+    """Set a context variable around each yield and reset it with its token, as a scoped generator does."""
+    for index in range(3):
+        token = _TENANT.set(f"tenant-{index}")
+        try:
+            yield index
+            seen.append(("resumed", _TENANT.get()))
+        finally:
+            _TENANT.reset(token)
+            seen.append(("reset", _TENANT.get()))
+
+
+@pytest.mark.asyncio
+async def test_sync_source_keeps_one_context_across_its_pulls_and_close() -> None:
+    # Each pull used to run in a fresh copy of the caller's context, so a token set before a yield belonged
+    # to another context when the generator resumed, and resetting it raised ValueError.
+    seen: list[tuple[str, str]] = []
+    drained = OwnedSource.adapt(_tenant_scoped(seen), accept=_identity)
+    assert await _drain(drained) == 3  # noqa: PLR2004
+    assert seen == [
+        (step, value) for index in range(3) for step, value in (("resumed", f"tenant-{index}"), ("reset", "caller"))
+    ]
+    assert await drained.aclose() == CleanupResult(None, None)
+
+    # A close that interrupts the generator runs its cleanup in the same context as its pulls.
+    seen.clear()
+    interrupted = OwnedSource.adapt(_tenant_scoped(seen), accept=_identity)
+    assert await interrupted.next() == 0
+    assert await interrupted.aclose() == CleanupResult(None, None)
+    assert seen == [("reset", "caller")]
+    # The source's context is its own: the caller's context never sees what the generator sets.
+    assert _TENANT.get() == "caller"
+
+
+async def _tenant_scoped_async(seen: list[tuple[str, str]]) -> AsyncIterator[int]:
+    """The asynchronous scoped generator: a token set before each yield is reset after it."""
+    for index in range(3):
+        token = _TENANT.set(f"tenant-{index}")
+        try:
+            yield index
+            seen.append(("resumed", _TENANT.get()))
+        finally:
+            _TENANT.reset(token)
+            seen.append(("reset", _TENANT.get()))
+
+
+@pytest.mark.asyncio
+async def test_async_source_keeps_one_context_across_its_pulls_and_close() -> None:
+    # Each pull ran in the task that drove it, a fresh copy of the caller's context per pull, so the token set
+    # before a yield belonged to another context when the generator resumed, and resetting it raised ValueError.
+    seen: list[tuple[str, str]] = []
+    drained = OwnedSource.adapt(_tenant_scoped_async(seen), accept=_identity)
+    # Every pull in a task of its own, as the stream families pull.
+    assert [await asyncio.create_task(drained.next()) for _ in range(4)] == [0, 1, 2, EXHAUSTED]
+    assert seen == [
+        (step, value) for index in range(3) for step, value in (("resumed", f"tenant-{index}"), ("reset", "caller"))
+    ]
+    assert await drained.aclose() == CleanupResult(None, None)
+
+    seen.clear()
+    interrupted = OwnedSource.adapt(_tenant_scoped_async(seen), accept=_identity)
+    assert await asyncio.create_task(interrupted.next()) == 0
+    assert await asyncio.create_task(interrupted.aclose()) == CleanupResult(None, None)
+    assert seen == [("reset", "caller")]
+    assert _TENANT.get() == "caller"
+
+
+_PULL: contextvars.ContextVar[str] = contextvars.ContextVar("pull", default="caller")
+
+
+@pytest.mark.asyncio
+async def test_a_close_requested_while_a_sync_pull_runs_waits_for_it_in_the_same_context() -> None:
+    # Only the owner's asyncio ordering kept the close from the pull's context: once that ordering broke (the
+    # loop shutting down cancels every task, the pull's worker task included), the close entered the context
+    # while the pull still ran in it and failed with "cannot enter context ... already entered".
+    loop = asyncio.get_running_loop()
+    workers = WorkerStarts(loop)
+    loop.set_default_executor(workers)
+    release = threading.Event()
+    trace: list[tuple[str, str]] = []
+
+    def items() -> Iterator[int]:
+        try:
+            _PULL.set("pull 1")
+            yield 1
+            _PULL.set("pull 2")
+            release.wait(HANG_BOUND)
+            trace.append(("pulled", _PULL.get()))
+            yield 2
+        finally:
+            trace.append(("closed", _PULL.get()))
+
+    source = OwnedSource.adapt(items(), accept=_identity)
+    assert await source.next() == 1
+    pull = asyncio.create_task(source.next())
+    try:
+        await reached(workers.started(1))
+        close = asyncio.create_task(source.aclose())
+        # The close's worker call has started while the pull still runs: it waits for the pull.
+        await reached(workers.started(2))
+        assert not close.done()
+    finally:
+        release.set()
+    outcome = await asyncio.wait_for(close, timeout=HANG_BOUND)
+    workers.shutdown(wait=True)
+
+    assert await pull == 2  # noqa: PLR2004
+    assert outcome == CleanupResult(None, None)
+    assert trace == [("pulled", "pull 2"), ("closed", "pull 2")]

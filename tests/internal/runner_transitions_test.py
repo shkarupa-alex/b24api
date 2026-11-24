@@ -16,23 +16,29 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, NoReturn
 
 import pytest
 
-from b24api import Bitrix24, ReplaySafety, Request, RouteKind, Settings
+from b24api import Bitrix24, ReplaySafety, Request, RouteKind, Settings, TerminalState
 from b24api.batch.engine import BatchExecutor
 from b24api.batch.logical import LogicalBatchKernelStream
 from b24api.batch.stream import batch_outcome_stream
 from b24api.contracts import Command
-from b24api.contracts.policy import ExecutionPolicy, IdentityCoercion
+from b24api.contracts.policy import ExecutionPolicy, IdentityCoercion, KernelState
 from b24api.contracts.request import IdentitySpec
+from b24api.errors import StreamClosedError
 from b24api.execution import Executor, WireResponse
+from b24api.execution.context import latch_escape
+from b24api.execution.lifecycle import CleanupAttempt, LifecycleHooks, OperationRunner, TerminalCause, kernel_terminal
+from b24api.execution.snapshot import KernelReport
 from b24api.references.outcome import ReferenceRequest
 from b24api.references.stream import iter_references
 from b24api.traversal.plans import KernelDirectDispatch, SingleResponsePlan
 from b24api.traversal.stream import iter_list
+from tests.scripting import HANG_BOUND, ResponderTransport, client_for, raised_driving_the_loop
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
 
-    from b24api.execution.lifecycle import OperationRunner
+    from b24api.execution.context import Settled
+
 
 HOST = "fixture.invalid"
 FAMILIES = ("logical_batch", "operation_stream", "batch_outcomes", "references", "traversal")
@@ -351,28 +357,18 @@ async def test_cancelled_read_with_clean_cleanup_raises_the_cancellation(family:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("family", FAMILIES)
-async def test_cancelled_read_with_failing_cleanup_raises_it_and_rearms_the_cancellation(
+async def test_cancelled_read_with_failing_cleanup_raises_the_cancellation_and_reports_the_cleanup(
     family: Family,
     client: Bitrix24,
 ) -> None:
+    # The cancellation came first, so it outranks the cleanup failure: the read raises it, the report records both.
     harness = _harness(family, client, body="block", cleanup="fail")
-    seen: list[BaseException] = []
-
-    async def consume() -> None:
-        try:
-            await _drain(harness.stream)
-        except _CleanupFailedError as error:
-            seen.append(error)
-        await asyncio.sleep(0)
-        pytest.fail("the deferred cancellation was not re-armed")
-
-    task = asyncio.create_task(consume())
+    task = asyncio.create_task(_drain(harness.stream))
     await _cancel_blocked_read(harness, task)
     error = await _outcome(task)
 
     assert isinstance(error, asyncio.CancelledError)
-    assert len(seen) == 1
-    harness.assert_published_once(seen[0])
+    harness.assert_published_once(error)
     assert "cleanup_failure" in harness.codes()
 
 
@@ -414,7 +410,7 @@ async def test_failed_body_with_clean_cleanup_raises_the_failure(family: Family,
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("family", FAMILIES)
-async def test_failed_body_with_failing_cleanup_keeps_the_failure_and_notes_the_cleanup(
+async def test_failed_body_with_failing_cleanup_keeps_the_failure_and_reports_the_cleanup(
     family: Family,
     client: Bitrix24,
 ) -> None:
@@ -426,7 +422,9 @@ async def test_failed_body_with_failing_cleanup_keeps_the_failure_and_notes_the_
     assert _is_body_failure(error)
     primary = error if isinstance(error, _BodyFailedError) else error.__cause__
     assert primary is not None
-    assert "stream cleanup also failed (_CleanupFailedError)" in getattr(primary, "__notes__", [])
+    # The report the error carries records the cleanup failure; no note repeats it, in any family.
+    assert getattr(primary, "__notes__", []) == []
+    assert getattr(error, "__notes__", []) == []
     harness.assert_published_once(error)
     assert "cleanup_failure" in harness.codes()
 
@@ -491,7 +489,8 @@ async def test_close_during_an_isolated_read_cancels_it_and_terminates_once(clie
     assert await _outcome(closer) is None
     assert await _outcome(second_closer) is None
     read_error = await _outcome(reader)
-    assert isinstance(read_error, asyncio.CancelledError)
+    # The reader's task was not cancelled: the close ended its read, which says so.
+    assert isinstance(read_error, StreamClosedError)
     harness.assert_published_once(read_error)
     with pytest.raises(StopAsyncIteration):
         await anext(harness.stream)
@@ -631,6 +630,8 @@ async def test_failing_finalizer_keeps_a_simultaneous_cleanup_failure(
 
     if body == "exhaust":
         assert isinstance(error, _FinalizeFailedError)
+        # A library error carries the cleanup failure in its report, never as a note.
+        assert getattr(error, "__notes__", []) == []
     else:
         assert _is_body_failure(error)
     assert (harness.finalize_calls, harness.fallback_calls) == (1, 1)
@@ -696,6 +697,44 @@ async def test_failing_kernel_finalizer_still_publishes_one_public_fallback_repo
     assert stream.report is report
 
 
+@pytest.mark.parametrize("family", ["batch_outcomes", "fan_out_outcomes", "iter_list"])
+def test_a_failing_public_finalizer_publishes_its_fallback_in_the_interrupts_shape(family: str) -> None:
+    # The transport interrupts the operation and the public stream's own finalizer then raises: the fallback report
+    # is what is published, in the one shape of an interrupted operation, and the interrupt leaves carrying it.
+    got: list[BaseException] = []
+    streams: list[Any] = []
+
+    async def respond(_request: Request) -> object:
+        raise KeyboardInterrupt("transport")
+
+    def failing_finalize(*_args: Any) -> Any:  # noqa: ANN401
+        raise _FinalizeFailedError
+
+    async def main() -> None:
+        async with client_for(ResponderTransport(respond)) as client:
+            stream = _public(family, client)
+            streams.append(stream)
+            runner: OperationRunner[Any, Any] = stream._runner  # noqa: SLF001 - scripts the public stream's finalizer
+            runner._hooks = dataclasses.replace(runner._hooks, finalize=failing_finalize)  # noqa: SLF001
+            try:
+                async for _item in stream:
+                    pass
+            except KeyboardInterrupt as error:
+                got.append(error)
+
+    asyncio.run(main())
+    report = streams[0].report
+    assert report is not None
+    assert [type(error) for error in got] == [KeyboardInterrupt]
+    assert report.state is TerminalState.FAILED
+    assert report.terminal_reason == "operation interrupted"
+    codes = [violation.code for violation in report.violations]
+    assert "report_finalize_failure" in codes
+    assert codes[-1] == "interrupted"
+    assert report.violations[-1].message == "operation interrupted (KeyboardInterrupt)"
+    assert getattr(got[0], "report", None) is report
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("family", FAMILIES)
 async def test_failing_fallback_hook_still_ends_publication(family: Family, client: Bitrix24) -> None:
@@ -711,3 +750,383 @@ async def test_failing_fallback_hook_still_ends_publication(family: Family, clie
     assert error is not None
     # Publication ended with the failure, so a later close returns instead of waiting for a report.
     await asyncio.wait_for(harness.stream.aclose(), timeout=1)
+
+
+def test_a_read_whose_own_task_latched_an_interrupt_raises_it_instead_of_its_item() -> None:
+    # The read's own task caught the interrupt and went on to an item (a wake cancels no read from inside it): the
+    # read in flight is what raises it, so it ends the stream with it rather than deliver the item and hold it.
+    interrupt = KeyboardInterrupt("in the read")
+    delivered: list[bool] = []
+    causes: list[TerminalCause] = []
+    got: list[object] = []
+
+    async def body() -> AsyncIterator[int]:
+        latch_escape(interrupt)
+        yield 1
+
+    async def cleanup() -> None:
+        return None
+
+    def finalize(cause: TerminalCause, reason: str | None, _attempt: CleanupAttempt) -> KernelReport:
+        causes.append(cause)
+        state, terminal_reason = kernel_terminal(cause, reason)
+        return KernelReport(state=state, terminal_reason=terminal_reason)
+
+    def fallback(_cause: TerminalCause, reason: str, _attempt: CleanupAttempt) -> KernelReport:
+        return KernelReport(state=KernelState.FAILED, terminal_reason=reason)
+
+    runner: OperationRunner[int, KernelReport] = OperationRunner(
+        body(),
+        LifecycleHooks(
+            finalize=finalize, failure_report=fallback, cleanup=cleanup, delivered=lambda: delivered.append(True)
+        ),
+    )
+
+    async def main() -> None:
+        for _read in range(2):
+            try:
+                got.append(await anext(runner))
+            except StopAsyncIteration:
+                break
+            except KeyboardInterrupt as error:
+                got.append(error)
+
+    asyncio.run(main())
+    assert got == [interrupt]
+    assert delivered == []
+    assert causes == [TerminalCause.INTERRUPTED]
+    report = runner.report
+    assert report is not None
+    assert (report.state, report.terminal_reason) == (KernelState.FAILED, "operation interrupted")
+    assert getattr(interrupt, "report", None) is report
+
+
+class _BetweenReads:
+    """A runner whose body starts work latching an interrupt between reads, and whose cleanup waits for a release.
+
+    The work goes on, in the very step that latched the interrupt, with the steps the test adds (``after_latch``).
+    """
+
+    def __init__(self) -> None:
+        self.interrupt = KeyboardInterrupt("between reads")
+        self.go = asyncio.Event()
+        # Set just before the interrupt is latched: a read waiting for it resumes ahead of the end's own task.
+        self.latching = asyncio.Event()
+        self.cleaning = asyncio.Event()
+        self.cleanups = 0
+        self.finalized: list[TerminalCause] = []
+        self.attempts: list[CleanupAttempt] = []
+        self.release = asyncio.Event()
+        self.after_latch: list[Callable[[], Awaitable[None]]] = []
+        # Interrupts the cleanup latches once released, as more of the operation's own work fails.
+        self.latched_in_cleanup: list[BaseException] = []
+        self.runner: OperationRunner[int, KernelReport] = OperationRunner(
+            self._body(),
+            LifecycleHooks(finalize=self._finalize, failure_report=_fallback, cleanup=self._cleanup),
+            works_between_reads=True,
+        )
+        self.work: list[asyncio.Future[None]] = []
+
+    async def _body(self) -> AsyncIterator[int]:
+        # Started in the read, the work is the operation's: it inherits the operation's latch.
+        self.work.append(asyncio.ensure_future(self._latch_later()))
+        yield 1
+        await asyncio.Event().wait()
+
+    async def _latch_later(self) -> None:
+        await self.go.wait()
+        self.latching.set()
+        latch_escape(self.interrupt)
+        for step in self.after_latch:
+            await step()
+
+    def _finalize(self, cause: TerminalCause, reason: str | None, attempt: CleanupAttempt) -> KernelReport:
+        self.finalized.append(cause)
+        self.attempts.append(attempt)
+        return _finalized(cause, reason, attempt)
+
+    async def _cleanup(self) -> None:
+        self.cleanups += 1
+        self.cleaning.set()
+        await self.release.wait()
+        for interrupt in self.latched_in_cleanup:
+            latch_escape(interrupt)
+
+    async def read_one(self) -> None:
+        """Read the one item, let the work latch the interrupt, and go on working past the event loop's raise."""
+        assert await anext(self.runner) == 1
+        self.go.set()
+        await asyncio.sleep(HANG_BOUND)
+
+
+def _finalized(cause: TerminalCause, reason: str | None, _attempt: CleanupAttempt) -> KernelReport:
+    state, terminal_reason = kernel_terminal(cause, reason)
+    return KernelReport(state=state, terminal_reason=terminal_reason)
+
+
+def _fallback(_cause: TerminalCause, reason: str, _attempt: CleanupAttempt) -> KernelReport:
+    return KernelReport(state=KernelState.FAILED, terminal_reason=reason)
+
+
+def _ending(runner: OperationRunner[int, KernelReport]) -> asyncio.Future[Settled[object]]:
+    ending = runner._ending  # noqa: SLF001 - the task the interrupt started for the operation's end
+    assert ending is not None
+    return ending
+
+
+def test_an_interrupt_between_reads_goes_to_the_event_loop_before_its_end_is_over() -> None:
+    # Work the read started latches an interrupt between reads: the event loop raises it at once, while the end that
+    # follows waits for its cleanup. Released, that end publishes the report, in the interrupt's shape and attached
+    # to it; a read then finds the stream ended and a close returns, neither raising the interrupt again.
+    operation = _BetweenReads()
+    after: list[object] = []
+
+    async def finish() -> None:
+        after.append(operation.runner.report)
+        operation.release.set()
+        try:
+            await anext(operation.runner)
+        except StopAsyncIteration as error:
+            after.append(type(error))
+        await operation.runner.aclose()
+        after.append("closed")
+
+    error = raised_driving_the_loop(operation.read_one, finish)
+    assert error is operation.interrupt
+    assert after == [None, StopAsyncIteration, "closed"]
+    report = operation.runner.report
+    assert report is not None
+    assert (report.state, report.terminal_reason) == (KernelState.FAILED, "operation interrupted")
+    assert getattr(error, "report", None) is report
+
+
+def test_a_read_that_resumes_ahead_of_the_ends_task_runs_the_end_once() -> None:
+    # The read resumes in the very turn the interrupt is latched, ahead of the end's own task, and runs the end
+    # itself; the task finds it begun and leaves it. Cleanup runs once, and the report is published once.
+    operation = _BetweenReads()
+    got: list[object] = []
+    read_over = asyncio.Event()
+
+    async def main() -> None:
+        assert await anext(operation.runner) == 1
+        operation.go.set()
+        await operation.latching.wait()
+        try:
+            await anext(operation.runner)
+        except StopAsyncIteration as error:
+            got.append(type(error))
+        read_over.set()
+
+    async def finish() -> None:
+        operation.release.set()
+        await read_over.wait()
+        await _ending(operation.runner)
+
+    error = raised_driving_the_loop(main, finish)
+    assert error is operation.interrupt
+    assert got == [StopAsyncIteration]
+    assert (operation.cleanups, operation.finalized) == (1, [TerminalCause.INTERRUPTED])
+    report = operation.runner.report
+    assert report is not None
+    assert getattr(error, "report", None) is report
+
+
+def test_a_cancelled_read_running_the_end_between_reads_waits_for_its_cleanup_within_the_grace() -> None:
+    # The read that runs the end of an operation an interrupt ended between reads is cancelled while the cleanup
+    # waits. A cleanup that ends within the cancellation grace is waited for, then the read raises its
+    # cancellation, recorded as cleanup's; nothing overran.
+    operation = _BetweenReads()
+    readers: list[asyncio.Task[Any]] = []
+
+    async def main() -> None:
+        reader = asyncio.current_task()
+        assert reader is not None
+        readers.append(reader)
+        assert await anext(operation.runner) == 1
+        operation.go.set()
+        await operation.latching.wait()
+        # Resumed in the turn the interrupt is latched, ahead of the end's own task: this read runs the end.
+        await anext(operation.runner)
+
+    async def cancel_the_reader() -> None:
+        await operation.cleaning.wait()
+        readers[0].cancel()
+        await asyncio.sleep(0.05)  # more than enough for a read that does not wait for the cleanup to end
+        assert not readers[0].done()
+        operation.release.set()
+        await asyncio.gather(readers[0], return_exceptions=True)
+
+    error = raised_driving_the_loop(main, cancel_the_reader)
+    assert error is operation.interrupt
+    assert readers[0].cancelled()
+    assert (operation.cleanups, operation.finalized) == (1, [TerminalCause.INTERRUPTED])
+    [attempt] = operation.attempts
+    assert (attempt.error, attempt.finished) == (None, True)
+    assert isinstance(attempt.cancellation, asyncio.CancelledError)
+
+
+def test_a_read_from_the_operations_own_work_once_an_interrupt_ended_it_between_reads_ends_the_iteration() -> None:
+    # The work that latched the interrupt reads at once, before the end has begun: the operation is over, so the read
+    # ends the iteration rather than wait for an item the operation never yields. The end then runs once.
+    operation = _BetweenReads()
+    operation.release.set()
+    got: list[object] = []
+
+    async def read_from_the_work() -> None:
+        try:
+            async with asyncio.timeout(HANG_BOUND):
+                await anext(operation.runner)
+        except StopAsyncIteration as error:
+            got.append(type(error))
+
+    async def wait_for_the_end() -> None:
+        await operation.runner.aclose()
+
+    operation.after_latch.append(read_from_the_work)
+    error = raised_driving_the_loop(operation.read_one, wait_for_the_end)
+    assert error is operation.interrupt
+    assert got == [StopAsyncIteration]
+    assert (operation.cleanups, operation.finalized) == (1, [TerminalCause.INTERRUPTED])
+
+
+def test_a_close_waiting_for_an_end_whose_fallback_report_fails_still_returns() -> None:
+    # The end of an operation an interrupt ended between reads fails to build any report: its finalizer and its
+    # fallback both fail. Publication still ends, so a close that waits for it while the cleanup runs returns.
+    operation = _BetweenReads()
+
+    def failing(*_args: object) -> NoReturn:
+        raise _FinalizeFailedError
+
+    operation.runner._hooks = dataclasses.replace(  # noqa: SLF001 - both report hooks fail
+        operation.runner._hooks,  # noqa: SLF001
+        finalize=failing,
+        failure_report=failing,
+    )
+    closed: list[object] = []
+
+    async def close_while_the_end_cleans_up() -> None:
+        await operation.cleaning.wait()
+        closing = asyncio.ensure_future(operation.runner.aclose())
+        await asyncio.sleep(0)
+        operation.release.set()
+        async with asyncio.timeout(HANG_BOUND):
+            closed.extend(await asyncio.gather(closing, return_exceptions=True))
+        await asyncio.gather(_ending(operation.runner), return_exceptions=True)
+
+    error = raised_driving_the_loop(operation.read_one, close_while_the_end_cleans_up)
+    assert error is operation.interrupt
+    assert closed == [None]
+    assert operation.cleanups == 1
+
+
+def test_a_close_runs_the_end_whose_own_task_was_cancelled_before_it_ran() -> None:
+    # The task the interrupt started for the operation's end is cancelled before its first step, as a loop's shutdown
+    # may cancel it: the end never began, so the close that comes next runs it, and the report is published all the
+    # same, attached to the interrupt the event loop raised.
+    operation = _BetweenReads()
+    operation.release.set()
+    closed: list[object] = []
+
+    async def cancel_the_end() -> None:
+        _ending(operation.runner).cancel()
+
+    async def close() -> None:
+        closed.append(operation.runner.report)
+        await operation.runner.aclose()
+        closed.append("closed")
+
+    operation.after_latch.append(cancel_the_end)
+    error = raised_driving_the_loop(operation.read_one, close)
+    assert error is operation.interrupt
+    assert _ending(operation.runner).cancelled()
+    assert closed == [None, "closed"]
+    report = operation.runner.report
+    assert report is not None
+    assert report.terminal_reason == "operation interrupted"
+    assert getattr(error, "report", None) is report
+
+
+def test_a_close_cancelled_while_it_runs_the_end_raises_its_cancellation_once_the_end_is_over() -> None:
+    # The close runs the end nobody began (its task was cancelled before its first step) and is cancelled while the
+    # cleanup waits: the end still finishes and publishes, the cancellation recorded as cleanup's, and the close
+    # raises that cancellation rather than return as if nobody had cancelled it.
+    operation = _BetweenReads()
+    got: list[object] = []
+
+    async def cancel_the_end() -> None:
+        _ending(operation.runner).cancel()
+
+    async def close_cancelled() -> None:
+        closing = asyncio.create_task(operation.runner.aclose())
+        await operation.cleaning.wait()
+        closing.cancel()
+        await asyncio.sleep(0)
+        operation.release.set()
+        got.extend(await asyncio.gather(closing, return_exceptions=True))
+        got.append(operation.runner.report)
+
+    operation.after_latch.append(cancel_the_end)
+    error = raised_driving_the_loop(operation.read_one, close_cancelled)
+    assert error is operation.interrupt
+    report = operation.runner.report
+    assert report is not None
+    assert [type(item) for item in got] == [asyncio.CancelledError, KernelReport]
+    assert got[1] is report
+    assert report.terminal_reason == "operation interrupted"
+
+
+def test_the_operations_own_work_cannot_close_it_once_an_interrupt_ended_it_between_reads() -> None:
+    # The work that latched the interrupt closes the stream at once, before the end has begun: that close would run
+    # an end that waits for the operation's work, its own task included, so it is refused, as from the pull or cleanup.
+    operation = _BetweenReads()
+    operation.release.set()
+    refused: list[str] = []
+
+    async def close_from_the_work() -> None:
+        try:
+            await operation.runner.aclose()
+        except RuntimeError as refusal:
+            refused.append(str(refusal))
+
+    async def wait_for_the_end() -> None:
+        await operation.runner.aclose()
+
+    operation.after_latch.append(close_from_the_work)
+    error = raised_driving_the_loop(operation.read_one, wait_for_the_end)
+    assert error is operation.interrupt
+    assert len(refused) == 1
+    assert refused[0].startswith("a stream cannot be closed from inside its own pull or cleanup")
+    report = operation.runner.report
+    assert report is not None
+    assert report.terminal_reason == "operation interrupted"
+
+
+def test_a_second_interrupt_latched_in_the_ends_cleanup_is_reported_after_the_first() -> None:
+    # The end that follows an interrupt between reads begins once the event loop raised it. Its cleanup latches
+    # another interrupt, twice, and the first again: nobody reads to raise them, and the operation raised its one
+    # interrupt already, so the other goes to the loop's exception handler, once; the first is never raised again.
+    operation = _BetweenReads()
+    second = SystemExit("in cleanup")
+    operation.latched_in_cleanup.extend([second, second, operation.interrupt])
+    operation.release.set()
+    raised: list[BaseException] = []
+    reported: list[object] = []
+    loop = asyncio.new_event_loop()
+    loop.set_exception_handler(lambda _loop, context: reported.append(context["exception"]))
+    try:
+        work = loop.create_task(operation.read_one())
+        for step in (lambda: work, lambda: _ending(operation.runner)):
+            try:
+                loop.run_until_complete(step())
+            except BaseException as error:  # noqa: BLE001 - the test inspects what the loop raised
+                raised.append(error)
+        loop.run_until_complete(asyncio.wait_for(operation.runner.aclose(), HANG_BOUND))
+        work.cancel()
+        loop.run_until_complete(asyncio.gather(work, return_exceptions=True))
+    finally:
+        loop.close()
+    assert (raised, reported) == ([operation.interrupt], [second])
+    assert (operation.cleanups, operation.finalized) == (1, [TerminalCause.INTERRUPTED])
+    report = operation.runner.report
+    assert report is not None
+    assert getattr(operation.interrupt, "report", None) is report

@@ -40,7 +40,7 @@ from b24api.contracts.report import PageDispatch, PageOutcome, PageRecord
 from b24api.errors import ContinuationError, ContinuationReason
 from b24api.testing.scripted import ScriptedExchange, ScriptedTransport
 from b24api.traversal.inclusive_window import parse_window_timestamp
-from tests.scripting import BatchPortal
+from tests.scripting import UNREACHABLE_COALESCE_WAIT, BatchPortal, on_loop
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -776,7 +776,11 @@ async def test_page_metadata_of_sibling_commands_in_one_shared_batch_stays_with_
     bindings = [Binding(f"chat {chat}", (ParameterUpdate(ParameterPath(("chatId",)), chat),), chat) for chat in (1, 2)]
     popups = _Popups()
     stream = scripted_client(portal).iter_reference_outcomes(
-        _request(), bindings, traversal=_window(), dispatch=BatchDispatch(), page_stop=popups
+        _request(),
+        on_loop(bindings),
+        traversal=_window(),
+        dispatch=BatchDispatch(coalesce_wait=UNREACHABLE_COALESCE_WAIT),
+        page_stop=popups,
     )
     outcomes, failure = await _drain(stream)
     assert failure is None

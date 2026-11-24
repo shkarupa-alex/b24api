@@ -12,11 +12,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
 from b24api.batch.engine import BatchExecutor
-from b24api.batch.outcome import BatchFailure, BatchSuccess
+from b24api.batch.outcome import BatchFailure, BatchSuccess, settlement_of
 from b24api.batch.stream import _BatchOutcomeStream
 from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.report import PageDispatch
-from b24api.errors import B24ApiError, CapabilityError, IncompleteTraversalError
+from b24api.errors import B24ApiError, BudgetExceededError, CapabilityError, IncompleteTraversalError
+from b24api.execution.facts import settlement
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -39,18 +40,21 @@ class HeadAttempt:
     error: BaseException | None = field(repr=False)
     dispatch: PageDispatch
     batch_index: int | None
-    dispatch_started: bool
     settlement: CommandSettlement
 
 
 @dataclass(frozen=True, slots=True)
 class TailReceipt:
-    """One dense tail command outcome, yielded in planned offset order: a response or a failure."""
+    """One dense tail page, yielded in planned offset order: its response, or how it failed, and how it settles."""
 
     ordinal: int
     response: Response | None = field(repr=False)
-    failure: BatchFailure | None = field(repr=False)
     batch_index: int | None
+    settlement: CommandSettlement
+    # A failed page: what it reports, which its trace records, and its command's own failure when the batch
+    # answered or ended it (``None`` for a page that failed with its whole chunk).
+    error: BaseException | None = field(default=None, repr=False)
+    failure: BatchFailure | None = field(default=None, repr=False)
 
 
 class CountedRowAccount(Protocol):
@@ -81,8 +85,8 @@ class CountedTailStream(Protocol):
         """Record the receipt's settlement and focus the completion recorder on its page."""
         ...
 
-    def failure(self, receipt: TailReceipt, outcome: BatchFailure) -> BaseException:
-        """Return the error a failed tail command raises."""
+    def failure(self, receipt: TailReceipt) -> BaseException:
+        """Return the error a failed tail page raises."""
         ...
 
     async def aclose(self) -> None:
@@ -137,11 +141,12 @@ class CountedWaveIO(Protocol):
         self,
         requests: Iterator[_BatchInput],
         *,
+        pages: int,
         batch_size: int,
         policy: ExecutionPolicy,
         context: ExecutionContext,
     ) -> CountedTailStream:
-        """Start the dense tail over lazily planned page requests."""
+        """Start the dense tail over ``pages`` lazily planned page requests."""
         ...
 
 
@@ -164,31 +169,73 @@ class FlatCountedRowAccount:
 class _FlatTailStream:
     """Adapt the private batch outcome stream to ordered tail receipts."""
 
-    def __init__(self, outcomes: _BatchOutcomeStream, recorder: CountedCompletionRecorder | None) -> None:
+    def __init__(
+        self,
+        outcomes: _BatchOutcomeStream,
+        recorder: CountedCompletionRecorder | None,
+        context: ExecutionContext,
+    ) -> None:
         self._outcomes = outcomes
         self._recorder = recorder
+        self._context = context
 
     @property
     def report(self) -> KernelReport:
         return self._outcomes.report
 
     async def __aiter__(self) -> AsyncIterator[TailReceipt]:
+        try:
+            async for receipt in self._receipts():
+                yield receipt
+        except BaseException as error:
+            start = self._outcomes.failed_chunk(error)
+            if start is None:
+                raise
+            # The batch failed as a whole: the traversal stops at its first page, which reports the batch's error and
+            # settles from what its command did, as a reference tail page that fails with its chunk does.
+            yield TailReceipt(start, None, 0, self._outcomes.settlement(start), error=error)
+
+    async def _receipts(self) -> AsyncIterator[TailReceipt]:
         async for outcome in self._outcomes:
+            # The page's ordinal in the tail is its command's index in the whole stream; its batch index is the
+            # command's index in its own batch, as every page trace records it.
+            index = outcome.command_index
+            batch_index = index - self._outcomes.chunk_start
             if isinstance(outcome, BatchFailure):
-                yield TailReceipt(outcome.command_index, None, outcome, outcome.command_index)
+                error = outcome.error
+                reported = (
+                    error
+                    if isinstance(error, BaseException)
+                    else CapabilityError("parallel counted batch command failed")
+                )
+                yield TailReceipt(
+                    index,
+                    None,
+                    batch_index,
+                    settlement_of(outcome),
+                    error=reported,
+                    failure=outcome,
+                )
                 continue
             if not isinstance(outcome, BatchSuccess) or outcome.response is None:
                 raise CapabilityError("parallel counted batch outcome lacks correlated response evidence")
-            yield TailReceipt(outcome.command_index, outcome.response, None, outcome.command_index)
+            yield TailReceipt(index, outcome.response, batch_index, CommandSettlement.SUCCESS)
 
     def settle(self, receipt: TailReceipt) -> None:
         if self._recorder is not None:
             self._recorder.activate(receipt.ordinal + 1)
-            self._recorder.settled(CommandSettlement.SUCCESS if receipt.failure is None else CommandSettlement.FAILURE)
+            self._recorder.settled(receipt.settlement)
 
-    def failure(self, receipt: TailReceipt, outcome: BatchFailure) -> BaseException:
-        del receipt
+    def failure(self, receipt: TailReceipt) -> BaseException:
+        outcome = receipt.failure
+        if outcome is None:  # a page that failed with its whole batch reports the batch's error
+            if receipt.error is None:
+                raise RuntimeError("flat counted tail failure lacks its error")
+            return receipt.error
         error = outcome.error
+        if self._context.ended_by(error):
+            # The operation's budget refused the page's send and ends the operation: its end, not a failed page.
+            return error
         if isinstance(error, B24ApiError):
             failure = IncompleteTraversalError(
                 report=self._outcomes.report,
@@ -201,7 +248,13 @@ class _FlatTailStream:
         return error if isinstance(error, BaseException) else CapabilityError("parallel counted batch command failed")
 
     async def aclose(self) -> None:
-        await self._outcomes.aclose()
+        try:
+            await self._outcomes.aclose()
+        finally:
+            # Once the stream has stopped, each page it read but the traversal did not consume settles from its
+            # command's execution facts, as on the reference tail; a tail page's id follows the head's.
+            if self._recorder is not None:
+                self._recorder.settle_unobserved(lambda page_id: self._outcomes.settlement(page_id - 1))
 
 
 class DirectCountedWaveIO:
@@ -236,20 +289,17 @@ class DirectCountedWaveIO:
             None,
             PageDispatch.DIRECT,
             None,
-            dispatch_started=True,
             settlement=CommandSettlement.SUCCESS,
         )
 
     def head_failure(self, error: BaseException) -> HeadAttempt:
-        """Classify a failed direct head: possibly executed once dispatch started, else not executed."""
-        dispatched = bool(getattr(error, "_b24api_dispatch_started", False))
+        """Classify a failed direct head from its execution facts: possibly run, failed, or never sent."""
         return HeadAttempt(
             None,
             error,
             PageDispatch.DIRECT,
             None,
-            dispatch_started=dispatched,
-            settlement=CommandSettlement.UNKNOWN if dispatched else CommandSettlement.NOT_EXECUTED,
+            settlement=settlement(error),
         )
 
     async def tail_batch_size(
@@ -261,29 +311,36 @@ class DirectCountedWaveIO:
         head_rows: int,
         batch_size: int,
     ) -> int:
-        """Refuse a tail the operation budgets cannot hold; return the physical batch size that fits."""
+        """Refuse a range the operation budgets cannot hold; return the physical batch size that fits.
+
+        The exact total is known from the head, so a range the page, row buffer, request or identity budget
+        cannot hold is refused before any of its rows is delivered.
+        """
         policy = ctx.context.policy
         tail_pages = (total - 1) // stride if total > head_rows else 0
         budget = await ctx.context.snapshot()
         if budget.counters.logical_pages + tail_pages > policy.max_pages:
-            raise CapabilityError("parallel counted traversal exceeds the logical page budget")
+            raise BudgetExceededError("parallel counted traversal exceeds the logical page budget")
         if tail_pages and stride > policy.max_buffered_rows:
-            raise CapabilityError("parallel counted page exceeds the decoded row buffer budget")
+            raise BudgetExceededError("parallel counted page exceeds the decoded row buffer budget")
         fitted = min(batch_size, max(1, policy.max_buffered_rows // stride))
         minimum_tail_requests = (tail_pages + fitted - 1) // fitted
         if budget.counters.physical_requests + minimum_tail_requests > policy.max_requests:
-            raise CapabilityError("parallel counted traversal exceeds the physical request budget")
+            raise BudgetExceededError("parallel counted traversal exceeds the physical request budget")
+        ctx.ensure_identity_capacity(total)
         return fitted
 
     def open_tail(
         self,
         requests: Iterator[_BatchInput],
         *,
+        pages: int,
         batch_size: int,
         policy: ExecutionPolicy,
         context: ExecutionContext,
     ) -> _FlatTailStream:
         """Stream the tail through a private bounded batch outcome stream."""
+        del pages  # the stream reads the requests as it sends them
         outcomes = _BatchOutcomeStream(
             BatchExecutor(self._ctx.executor),
             requests,
@@ -292,7 +349,7 @@ class DirectCountedWaveIO:
             context=context,
             logical_page_per_command=True,
         )
-        return _FlatTailStream(outcomes, self._recorder)
+        return _FlatTailStream(outcomes, self._recorder, context)
 
 
 __all__ = [

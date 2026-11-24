@@ -5,6 +5,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, TypedDict, Unpack, cast
 
 from b24api.batch.facade import resolve_batch_size
+from b24api.completion.fast_recorder import FastCompletionRecorder
 from b24api.completion.operation_stream import MappedOperationStream, _ClosableIterator
 from b24api.contracts.keyset_execution import (
     AutoKeysetExecution,
@@ -23,7 +24,13 @@ from b24api.contracts.policy import (
     TotalSemantics,
 )
 from b24api.contracts.report import KeysetSelectionSummary, TraversalAssurance, Violation
-from b24api.contracts.request import IdentitySpec, RequestLike, ResultSelector, TraversalIdentity, canonical_request
+from b24api.contracts.request import (
+    IdentitySpec,
+    RequestLike,
+    ResultSelector,
+    TraversalIdentity,
+    canonical_request,
+)
 from b24api.contracts.request_summary import RouteKind
 from b24api.contracts.traversal import (
     ContinuationTraversal,
@@ -38,11 +45,10 @@ from b24api.traversal.counted import CountedItemStream
 from b24api.traversal.facade_support import (
     _checked_identity_store,
     _collection_selector,
-    _cursor_page_contract,
-    _direction,
+    cursor_traversal_plan,
     declared_traversal_plan,
 )
-from b24api.traversal.keyset_eligibility import validate_fast_keyset
+from b24api.traversal.keyset_eligibility import reject_unencodable_fast_request, validate_fast_keyset
 from b24api.traversal.keyset_engine import FlatWaveEngine
 from b24api.traversal.keyset_fast_stream import KeysetFastStream
 from b24api.traversal.keyset_observation import FastTraceRecorder
@@ -52,7 +58,6 @@ from b24api.traversal.offset_rules import sequential_offset_plan
 from b24api.traversal.plans import (
     CountedOffsetMode,
     CountedOffsetPlan,
-    CursorTerminalRule,
     ItemCursorPlan,
     KeysetPlan,
     OffsetSequentialPlan,
@@ -116,6 +121,9 @@ def sequential_stream(  # noqa: PLR0913
 ) -> OperationStream[JsonValue]:
     """Compose conservative sequential offset/server-next traversal."""
     ledger = _checked_identity_store(identity_store, identity)
+    # The plan's duplicate policy is the most lenient one it admits: the stronger of it and the caller's
+    # ``ConsistencyPolicy.duplicate_policy`` applies, so duplicates fail the traversal unless the caller
+    # asks to report them.
     plan = sequential_offset_plan(offset, page_size=page_size, duplicate_policy=DuplicatePolicy.REPORT)
     if offset.short_page_termination is ShortPageTermination.DECLARED_TERMINAL:
         # A declared short page proves the endpoint's stop rule, not that later windows are empty.
@@ -178,6 +186,11 @@ def keyset_stream(  # noqa: PLR0913
         # A page stop needs the ordered page stream, so AUTO settles on sequential before planning.
         requested, reason = KeysetExecutionKind.AUTO, KeysetSelectionReason.PAGE_STOP
         execution = SequentialKeysetExecution()
+    if isinstance(execution, AutoKeysetExecution) and canonical_request(request).classic_batch_obstacle is not None:
+        # AUTO sends its boundary wave, probes and lanes as classic batch commands; a request they would carry
+        # differently from a direct call settles on sequential direct pages before planning.
+        requested, reason = KeysetExecutionKind.AUTO, KeysetSelectionReason.BATCH_UNREPRESENTABLE
+        execution = SequentialKeysetExecution()
     if page_stop is not None and not isinstance(execution, SequentialKeysetExecution):
         raise CapabilityError("page stop requires sequential keyset execution")
     if not isinstance(execution, SequentialKeysetExecution):
@@ -191,8 +204,10 @@ def keyset_stream(  # noqa: PLR0913
             execution=execution,
             policy=policy,
         )
+        reject_unencodable_fast_request(canonical)
         context = executor.context(policy)
         trace = FastTraceRecorder(policy.page_trace_limit)
+        ledger = FastCompletionRecorder()
         runtime = KeysetRuntime(
             request=canonical,
             identity=identity,
@@ -203,9 +218,10 @@ def keyset_stream(  # noqa: PLR0913
             effective_page_cap=effective_cap,
             execution=execution,
             context=context,
-            engine=FlatWaveEngine(executor),
+            engine=FlatWaveEngine(executor, ledger),
             trace=trace,
             page_adapter=page_adapter,
+            completion_recorder=ledger,
         )
         return _mapped_stream(
             KeysetFastStream(runtime),
@@ -273,6 +289,12 @@ def counted_stream(  # noqa: PLR0913
         or canonical.positional is not None
     ):
         raise CapabilityError("counted traversal supports JSON requests without scoped headers")
+    obstacle = canonical.classic_batch_obstacle
+    if obstacle is not None:
+        # The head goes direct and the tail in classic batch: both must send the same request.
+        raise CapabilityError(
+            f"counted traversal sends its tail in classic batch, which cannot carry {obstacle}; use iter_list"
+        )
     executor.preflight_request(canonical)
     plan = CountedOffsetPlan(
         offset_path=offset.parameter_path,
@@ -330,31 +352,7 @@ def cursor_stream(  # noqa: PLR0913
     audit_violations: tuple[Violation, ...] = (),
 ) -> OperationStream[JsonValue]:
     """Compose strict dependent cursor traversal with empty confirmation."""
-    cursor_identity = identity or IdentitySpec(
-        item_path=cursor.item_path,
-        filter_key="cursor",
-        order_key="cursor",
-        coercion=cursor.coercion,
-    )
-    direction = _direction(cursor.direction)
-    page_order, order_semantics = _cursor_page_contract(cursor)
-    plan = ItemCursorPlan(
-        cursor_request_path=cursor.parameter_path,
-        cursor_item_path=cursor.item_path,
-        cursor_coercion=cursor.coercion,
-        direction=direction,
-        cursor_take=cursor.take,
-        limit_path=cursor.limit_path,
-        requested_page_size=page_size if cursor.limit_path is not None else None,
-        terminal=CursorTerminalRule.EMPTY_CONFIRMATION,
-        allow_create_controls=cursor.allow_create_controls,
-        domain=cursor.domain,
-        identity_requirement=IdentityRequirement.REQUIRED,
-        order_semantics=order_semantics,
-        duplicate_policy=DuplicatePolicy.ERROR,
-        page_order=page_order,
-        response_terminal=cursor.continuation,
-    )
+    plan, cursor_identity = cursor_traversal_plan(cursor, identity, page_size=page_size)
     return _plan_stream(
         executor,
         request,

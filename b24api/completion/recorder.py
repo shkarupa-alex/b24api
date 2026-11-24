@@ -1,11 +1,12 @@
 """One-binding event adapter for direct sequential traversal mechanics."""
 
 from __future__ import annotations
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
 
 from b24api.completion.closure import qualified_closure
 from b24api.completion.gate import CompletionGate
+from b24api.completion.page_failure import unconsumed_rejection
 from b24api.contracts.completion import (
     BindingAdmitted,
     BindingClosure,
@@ -23,6 +24,9 @@ from b24api.contracts.completion import (
     StreamTerminal,
 )
 from b24api.contracts.policy import KernelState
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 class CompletionSink(Protocol):
@@ -90,7 +94,11 @@ class CompletionRecorder:
 
     def settled(self, outcome: CommandSettlement) -> None:
         """Record dispatch success or a terminal negative command outcome."""
-        page_id = self._require_page()
+        self._settle(self._require_page(), outcome)
+        if outcome is not CommandSettlement.SUCCESS:
+            self._current = None
+
+    def _settle(self, page_id: int, outcome: CommandSettlement) -> None:
         self.gate.emit(
             PageCommandOutcome(
                 operation_id=self.gate.operation_id,
@@ -100,9 +108,7 @@ class CompletionRecorder:
                 outcome=outcome,
             )
         )
-        if outcome is not CommandSettlement.SUCCESS:
-            self._unknown = self._unknown or outcome is CommandSettlement.UNKNOWN
-            self._current = None
+        self._unknown = self._unknown or outcome is CommandSettlement.UNKNOWN
 
     def validated(self, row_count: int) -> None:
         """Record the validated row count of the current page without retaining values."""
@@ -122,7 +128,10 @@ class CompletionRecorder:
 
     def rejected(self, reason: str) -> None:
         """Retire one settled but unadmitted page."""
-        page_id = self._require_page()
+        self._reject(self._require_page(), reason)
+        self._current = None
+
+    def _reject(self, page_id: int, reason: str) -> None:
         self.gate.emit(
             PageRejected(
                 operation_id=self.gate.operation_id,
@@ -132,7 +141,6 @@ class CompletionRecorder:
                 reason=reason,
             )
         )
-        self._current = None
 
     def delivered(self) -> None:
         """Mark the complete validated page delivered to the consumer."""
@@ -263,11 +271,22 @@ class CountedCompletionRecorder(CompletionRecorder):
         self._reserved.add(page_id)
         return page_id
 
-    def settle_unobserved(self) -> None:
-        """Retire scheduled tail pages whose dispatch outcome was not observed."""
-        for page_id in tuple(sorted(self._reserved - {self._current})):
-            self.activate(page_id)
-            self.settled(CommandSettlement.UNKNOWN)
+    def settle_unobserved(self, settlement: Callable[[int], CommandSettlement]) -> None:
+        """Retire the scheduled pages the traversal will not consume, each as its dispatch proved (``settlement``).
+
+        ``settlement`` gives a page's settlement by page id from its command's execution facts: a page answered
+        with a success settles as a success and is rejected as aborted with the traversal, one never sent was
+        not executed, and only one that may have run is unknown. The page being delivered, if any, stays
+        active: its outcome is known, and the binding's terminal releases it when the stream ends before the
+        consumer accepted it.
+        """
+        for page_id in sorted(self._reserved - {self._current}):
+            outcome = settlement(page_id)
+            self._settle(page_id, outcome)
+            reason = unconsumed_rejection(outcome)
+            if reason is not None:
+                self._reject(page_id, reason)
+            self._reserved.discard(page_id)
 
     def activate(self, page_id: int) -> None:
         """Select one returned logical page for settlement and validation."""

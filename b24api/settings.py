@@ -1,15 +1,31 @@
-"""Environment-backed credential and transport settings."""
+"""Environment-backed credential and transport settings.
 
+The library reads the process environment only; no file is read implicitly. The ``b24api`` command line
+reads a ``.env`` file in its working directory as well (``b24api.cli``).
+"""
+
+import contextlib
 from collections.abc import Generator
+from types import MappingProxyType
 from typing import Any, Self, cast
 
-from pydantic import Field, HttpUrl, TypeAdapter, ValidationError, field_serializer, field_validator
+from pydantic import AnyUrl, Field, HttpUrl, ValidationError, field_serializer, field_validator
 from pydantic.config import ExtraValues
 from pydantic_core import InitErrorDetails, PydanticCustomError
 from pydantic_settings import BaseSettings, SettingsConfigDict, SettingsError
 
-_WEBHOOK_ADAPTER = TypeAdapter(HttpUrl)
+from b24api._webhook import WebhookRefusal, parse_webhook
+
 _REDACTED = "[REDACTED]"
+# The error type of each refusal; its message is the refusal's own, which quotes no part of the URL.
+_WEBHOOK_ERROR_TYPES = MappingProxyType(
+    {
+        WebhookRefusal.INVALID: "webhook_url",
+        WebhookRefusal.USERINFO: "webhook_url_userinfo",
+        WebhookRefusal.HOST: "webhook_url_host",
+        WebhookRefusal.SHAPE: "webhook_url_shape",
+    }
+)
 
 
 def _settings_validation_error(error: ValidationError | None = None) -> ValidationError:
@@ -25,8 +41,8 @@ def _settings_validation_error(error: ValidationError | None = None) -> Validati
         details = []
         for item in error.errors(include_url=False):
             safe_item = dict(item, input=_REDACTED)
-            if item["type"] == "webhook_url":
-                safe_item["type"] = PydanticCustomError("webhook_url", "Webhook URL is invalid")
+            if item["type"] in _WEBHOOK_ERROR_TYPES.values():
+                safe_item["type"] = PydanticCustomError(item["type"], item["msg"])
             details.append(cast("InitErrorDetails", safe_item))
     return ValidationError.from_exception_data("Settings", details)
 
@@ -48,14 +64,31 @@ def _unknown_settings_error(fields: set[str]) -> ValidationError:
 
 
 class Settings(BaseSettings):
-    """Environment-backed webhook credential and request timeout."""
+    """Environment-backed webhook credential, attempt timeout and request concurrency of one client.
+
+    ``http_timeout`` bounds each attempt of the client's own HTTPX transport: each of its phases (connecting,
+    TLS included, waiting for a pooled connection, writing the request, each read of the answer) times out after
+    it, and earlier when the request's retry window (``ExecutionPolicy.max_retry_elapsed_per_request``) has less
+    left. An attempt that times out before it was sent is retried whatever the request's safety. It must be a
+    finite number of seconds; an injected transport keeps its own timeouts.
+
+    ``max_concurrent_requests`` is how many requests the client keeps in flight at once, all its calls,
+    streams and retries together: the number of permits of its shared rate limiter. An operation's own limits
+    only narrow it, per dispatch: a ``DirectDispatch`` sends at most the smallest of its ``concurrency``,
+    ``ExecutionPolicy.max_direct_concurrency``, ``ExecutionPolicy.max_active_references`` and this limit; a
+    ``BatchDispatch`` keeps at most the smallest of its ``concurrency``, ``max_active_references`` and this
+    limit of physical batches in flight, and ``max_direct_concurrency`` does not limit it. The isolation of a
+    REST 3.0 envelope of SAFE commands that may have run re-sends its unresolved commands one by one at once,
+    bounded only by this limit.
+    """
 
     webhook_url: HttpUrl = Field(repr=False)
-    http_timeout: float = Field(default=30.0, gt=0)
+    http_timeout: float = Field(default=30.0, gt=0, allow_inf_nan=False)
+    max_concurrent_requests: int = Field(default=10, ge=1)
 
+    # No ``env_file``: a library never reads credentials or limits from whatever directory it runs in.
     model_config = SettingsConfigDict(
         env_prefix="bitrix24_api_",
-        env_file=".env",
         extra="ignore",
         hide_input_in_errors=True,
     )
@@ -64,7 +97,7 @@ class Settings(BaseSettings):
         """Validate without retaining credential-bearing framework traceback frames."""
         validation_failure: ValidationError | None = None
         loading_failed = False
-        unknown = set(data) - {"webhook_url", "http_timeout"}
+        unknown = set(data) - set(type(self).model_fields)
         if unknown:
             validation_failure = _unknown_settings_error(unknown)
         else:
@@ -177,12 +210,23 @@ class Settings(BaseSettings):
 
     @field_validator("webhook_url", mode="before")
     @classmethod
-    def _sanitize_invalid_webhook_input(cls, value: Any) -> HttpUrl | str:  # noqa: ANN401
-        """Keep invalid credential-bearing input out of validation errors."""
-        try:
-            return _WEBHOOK_ADAPTER.validate_python(value)
-        except (TypeError, ValueError, ValidationError):
-            raise PydanticCustomError("webhook_url", "Webhook URL is invalid") from None
+    def _sanitize_invalid_webhook_input(cls, value: Any) -> str:  # noqa: ANN401
+        """Accept exactly what the transport accepts and store its canonical base; keep the input out of errors.
+
+        The returned base is what pydantic then validates as ``HttpUrl``; the shared parse admits only
+        bases it represents.
+        """
+        # A pydantic URL (a copied or re-validated Settings) is read back from its string form; bytes are
+        # read as UTF-8, as pydantic reads them.
+        if isinstance(value, AnyUrl):
+            value = str(value)
+        elif isinstance(value, bytes | bytearray):
+            with contextlib.suppress(UnicodeDecodeError):
+                value = bytes(value).decode()
+        webhook = parse_webhook(value)
+        if isinstance(webhook, WebhookRefusal):
+            raise PydanticCustomError(_WEBHOOK_ERROR_TYPES[webhook], webhook.value)
+        return webhook.url
 
     @field_serializer("webhook_url")
     def _serialize_webhook_url(self, _value: HttpUrl) -> str:
@@ -195,12 +239,11 @@ class Settings(BaseSettings):
             yield name, _REDACTED if name == "webhook_url" else value
 
     def __getstate__(self) -> dict[str, Any]:
-        """Return pickle state without credential-bearing settings."""
-        state = super().__getstate__()
-        values = dict(state["__dict__"])
-        values["webhook_url"] = _REDACTED
-        state["__dict__"] = values
-        return state
+        """Refuse pickling: the webhook is a credential, and a copy without it would be a broken ``Settings``.
+
+        Build ``Settings`` in each process (from its environment, or from the URL passed to it) instead.
+        """
+        raise TypeError("Settings holds a webhook credential and cannot be pickled; build it in each process")
 
 
 def api_settings(**kwargs: Any) -> Settings:  # noqa: ANN401

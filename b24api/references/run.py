@@ -35,9 +35,13 @@ class _ReferenceRun:
     tail_active: bool = False
     # A fast keyset binding prepares its own terminal failure before re-raising into the scheduler.
     failure: _FailureEvent | None = None
+    # A page-stream cleanup failure that a binding failure outranked: raised after that failure is emitted.
+    deferred_cleanup_error: BaseException | None = None
+    # Set once the binding's terminal event is published: its task publishes one on every way it leaves.
+    ended: bool = False
 
     def admit_page(self) -> None:
-        """Release the dispatcher's admission slot once the page is in the row buffer."""
+        """Release the dispatcher's admission slot once the page is in the row buffer, or waits in it to grow."""
         if self.page_admission is not None and not self.page_admission.done():
             self.page_admission.set_result(None)
         self.page_admission = None

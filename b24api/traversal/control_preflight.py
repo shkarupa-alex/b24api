@@ -8,6 +8,7 @@ from b24api.traversal import offset_rules
 from b24api.traversal.cursor_domain import cursor_controls_replace, cursor_probe_updates
 from b24api.traversal.identity import _child_path, _request_with_controls
 from b24api.traversal.inclusive_window import initial_window_boundary
+from b24api.traversal.keyset_step import reject_caller_order
 from b24api.traversal.plans import (
     ContinuationPlan,
     CountedOffsetPlan,
@@ -94,6 +95,7 @@ def _preflight_traversal_controls(driver: StrategyContext) -> None:
         second[plan.offset_path] = 1
     elif isinstance(plan, KeysetPlan):
         identity = driver.require_identity("keyset")
+        reject_caller_order(driver.request, plan, identity)
         if plan.split_order is None:
             if plan.order_path is None:
                 raise RuntimeError("keyset plan lacks ordering controls")

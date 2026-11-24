@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from b24api.completion.gate import CompletionGate
+from b24api.completion.page_failure import unconsumed_rejection
 from b24api.contracts.completion import (
     BindingAdmitted,
     BindingClosure,
@@ -22,7 +23,6 @@ from b24api.contracts.completion import (
     StreamTerminal,
 )
 from b24api.contracts.policy import KernelState
-from b24api.contracts.report import PageOutcome
 
 
 @dataclass(slots=True)
@@ -45,11 +45,17 @@ class FastPageLedger:
         """Start with no scheduled command."""
         self._active: dict[str, _CommandPage] = {}
         self._negative = False
+        self._unknown = False
 
     @property
     def negative(self) -> bool:
         """Return whether any page of this binding settled or was retired negatively."""
         return self._negative
+
+    @property
+    def unknown(self) -> bool:
+        """Return whether any page of this binding settled with an unknown outcome."""
+        return self._unknown
 
     def _new_page(self) -> int:
         """Return the next page id of this binding."""
@@ -76,6 +82,7 @@ class FastPageLedger:
         self._emit_page(PageCommandOutcome, page.page_id, outcome=outcome)
         if outcome is not CommandSettlement.SUCCESS:
             self._negative = True
+            self._unknown = self._unknown or outcome is CommandSettlement.UNKNOWN
             del self._active[command_id]
 
     def validated(self, command_id: str) -> None:
@@ -85,19 +92,19 @@ class FastPageLedger:
             raise RuntimeError("fast page validation lacks a unique successful settlement")
         page.validated = True
 
-    def recorded(self, command_id: str, outcome: PageOutcome) -> None:
-        """Retire a semantically accepted or rejected scheduler page."""
+    def recorded(self, command_id: str, rejected: str | None) -> None:
+        """Retire a semantically accepted page, or one ``rejected`` with that reason (its trace's code)."""
         page = self._active.get(command_id)
         if page is None:
             return  # a negative physical settlement already retired it
         if not page.settled:
             raise RuntimeError("fast observation preceded physical settlement")
-        if outcome is PageOutcome.COMMITTED:
+        if rejected is None:
             if not page.validated:
                 raise RuntimeError("fast accepted page was not validated")
             page.recorded = True
         else:
-            self._emit_page(PageRejected, page.page_id, reason=outcome.value)
+            self._emit_page(PageRejected, page.page_id, reason=rejected)
             self._negative = True
             del self._active[command_id]
 
@@ -134,10 +141,24 @@ class FastPageLedger:
             if page.recorded and page.remaining is None:
                 self.admit(command_id, 0)
 
-    def _reject_active(self, reason: str) -> None:
-        """Retire every page still open after an unsuccessful traversal."""
+    def close(self, *, successful: bool) -> None:
+        """Retire every open page before the binding terminal: discarded probes, or a failed traversal.
+
+        Only a settled page can be rejected. A wave engine settles each page it was handed from what its command
+        did, also when its call raises, so a page still unsettled here was never handed to one: it settles as not
+        executed. Every page still open then succeeded and was read but never consumed: it is rejected as aborted
+        with the traversal (``unconsumed_rejection``), as the counted and reference ledgers reject one. This is the
+        one rule for every path, flat or reference, whatever ended the traversal.
+        """
+        if successful:
+            self.discard_unadmitted()
+            if not self._active:
+                return
         for command_id, page in tuple(self._active.items()):
-            self._emit_page(PageRejected, page.page_id, reason=reason)
+            if not page.settled:
+                self.settle(command_id, CommandSettlement.NOT_EXECUTED)
+        for command_id, page in tuple(self._active.items()):
+            self._emit_page(PageRejected, page.page_id, reason=unconsumed_rejection(CommandSettlement.SUCCESS))
             self._negative = True
             del self._active[command_id]
 
@@ -186,17 +207,16 @@ class FastCompletionRecorder(FastPageLedger):
         if self._terminal:
             return
         self._terminal = True
-        if state is KernelState.COMPLETED and rows_emitted == rows_admitted:
-            self.discard_unadmitted()
-        else:
-            self._reject_active(state.value)
         successful = state is KernelState.COMPLETED and rows_emitted == rows_admitted
+        self.close(successful=successful)
         if successful and closure not in {BindingClosure.SOURCE_EMPTY, BindingClosure.KEYSET_PLAN_COVERED}:
             closure = BindingClosure.FAILURE
             self._negative = True
         elif not successful:
             closure = (
-                BindingClosure.CALLER_STOP
+                BindingClosure.UNKNOWN
+                if self._unknown
+                else BindingClosure.CALLER_STOP
                 if state is KernelState.CANCELLED and not self._negative
                 else BindingClosure.FAILURE
             )

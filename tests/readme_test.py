@@ -334,7 +334,6 @@ async def test_quickstart_runs_exactly_against_a_scripted_portal(
                 Request.bare("crm.deal.list", {**deals, "start": 0}),
                 {"result": [{"ID": "1", "TITLE": "Kitchen"}, {"ID": "2", "TITLE": "Office"}], "total": 2},
             ),
-            ScriptedExchange.json(Request.bare("crm.deal.list", {**deals, "start": 2}), {"result": [], "total": 2}),
             ScriptedExchange.json(Request.bare("user.get", {"ID": 1}), {"result": [{"ID": "1", "NAME": "Ada"}]}),
         ),
         host=PORTAL,

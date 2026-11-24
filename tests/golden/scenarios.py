@@ -37,6 +37,7 @@ from b24api import (
 from b24api.contracts import CallerStop, Command, DeliveryOrder, PageBoundary
 from b24api.errors import TransportError
 from b24api.transport import TransportCapabilities, WireResponse
+from tests.scripting import on_loop
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
@@ -313,7 +314,7 @@ async def fan_out_outcomes_batch(portal: GoldenPortal) -> None:
     """Tolerant batched fan-out in input order, including the failing command."""
     async with _client(portal) as client:
         dispatch = BatchDispatch(batch_size=3, concurrency=1, output_order=DeliveryOrder.INPUT)
-        await _drain(client.fan_out_outcomes(_commands(range(1, 12)), dispatch=dispatch))
+        await _drain(client.fan_out_outcomes(on_loop(_commands(range(1, 12))), dispatch=dispatch))
 
 
 def _bindings() -> list[Binding[int]]:
@@ -340,7 +341,7 @@ async def references_counted(portal: GoldenPortal) -> None:
     async with _client(portal) as client:
         stream = client.iter_reference_outcomes(
             _list_request(),
-            _bindings(),
+            on_loop(_bindings()),
             traversal=CountedTraversal(identity=_identity()),
             dispatch=BatchDispatch(batch_size=10, concurrency=1, output_order=DeliveryOrder.INPUT),
         )

@@ -1,4 +1,4 @@
-"""Keep b24api webhook URLs out of HTTPX INFO and hpack DEBUG records before handler formatting.
+"""Keep b24api webhook URLs out of HTTPX INFO, httpcore and hpack DEBUG records before handler formatting.
 
 A b24api request can emit several records, including redirect hops whose URLs b24api never built,
 so the filter scrubs any credential-shaped Bitrix URL segment and sensitive query value, not only the
@@ -27,7 +27,6 @@ suppression cannot be guaranteed.
 
 from __future__ import annotations
 import logging
-import re
 import sys
 import threading
 import weakref
@@ -38,6 +37,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 
+from b24api._webhook import Webhook, WebhookSecrets
 from b24api.errors import CapabilityError
 from b24api.transport.log_records import redact_owned_value, redact_registered_value, rewrite_record
 
@@ -45,7 +45,17 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Iterator
     from types import FrameType
 
-_LOGGER = logging.getLogger("httpx")
+#: Every logger an owned send writes request or response data to: HTTPX's own, and httpcore's trace loggers,
+#: whose DEBUG records carry response headers such as a redirect's ``Location``. The shield test pins the
+#: httpcore names against the installed httpcore.
+HTTPCORE_LOGGER_NAMES = (
+    "httpcore.connection",
+    "httpcore.http11",
+    "httpcore.http2",
+    "httpcore.proxy",
+    "httpcore.socks",
+)
+_LOGGERS = tuple(logging.getLogger(name) for name in ("httpx", *HTTPCORE_LOGGER_NAMES))
 #: Every hpack logger that can write a header; the shield test pins this list against the installed hpack.
 HPACK_LOGGER_NAMES = ("hpack.hpack", "hpack.table")
 _HPACK_LOGGERS = tuple(logging.getLogger(name) for name in HPACK_LOGGER_NAMES)
@@ -57,19 +67,10 @@ _EMITTING_METHOD = "_send_handling_auth"
 _EMITTING_MODULE = ("httpx", "_client.py")
 _OWNER_EXTENSION = "b24api_log_owner"
 _UNATTRIBUTED = object()
-_CREDENTIAL_PATH = re.compile(r"/rest/(?:api/)?[^/]+/([^/]+)/", re.IGNORECASE)
 _UNREGISTERED_CLIENT = "HTTP/2 send refused: the HTTPX client cannot be weakly registered for hpack log suppression"
 _MISSING_HPACK_FILTER = "HTTP/2 send refused: the hpack log filter was removed from its logger"
 
 type _Client = httpx.AsyncClient | httpx.Client
-
-
-def webhook_credentials(url: str) -> tuple[str, ...]:
-    """Extract the credential segment shared by classic webhook bases and classic and V3 method URLs."""
-    match = _CREDENTIAL_PATH.search(url)
-    if match is None or not match.group(1):
-        raise ValueError("HTTPX log shield requires a credentialed Bitrix method URL")
-    return (match.group(1),)
 
 
 def _emitting_root() -> object:
@@ -100,14 +101,25 @@ def _may_negotiate_http2(client: _Client) -> bool:
 
 
 class LogOwnership:
-    """Recognize the redirect chains of one owned dispatch by the identity of its root request."""
+    """Recognize the redirect chains of one owned dispatch by the identity of its root request.
 
-    __slots__ = ("_request", "credentials")
+    The webhook the request is sent with travels as its ``Webhook`` and is kept as ``WebhookSecrets``, whose
+    ``repr`` leaves the token out, so no frame that holds either renders the credential.
+    """
 
-    def __init__(self, url: str) -> None:
-        """Bind the owned webhook credential segment."""
-        self.credentials = webhook_credentials(url)
+    __slots__ = ("_credentials", "_request")
+
+    def __init__(self, webhook: Webhook) -> None:
+        """Bind the webhook the owned request is sent with."""
+        self._credentials = WebhookSecrets((webhook,))
+        if not self._credentials:
+            raise ValueError("HTTPX log shield requires the webhook credential of the owned request")
         self._request: weakref.ref[httpx.Request] | None = None
+
+    @property
+    def credentials(self) -> WebhookSecrets:
+        """Return the owned webhook credential, its token, kept out of every rendering."""
+        return self._credentials
 
     def claim(self, request: httpx.Request) -> None:
         """Bind the exact owned request before it is sent; the extension only labels it for observers."""
@@ -170,7 +182,7 @@ class _OwnedRequestAuth(httpx.Auth):
 class _OwnedRequestFilter(logging.Filter):
     """Rewrite records of an in-flight owned dispatch and its redirect hops; keep the secret out of all others."""
 
-    def __init__(self, registered: Callable[[], tuple[str, ...]]) -> None:
+    def __init__(self, registered: Callable[[], WebhookSecrets]) -> None:
         super().__init__()
         self._registered = registered
 
@@ -182,7 +194,8 @@ class _OwnedRequestFilter(logging.Filter):
                 rewrite_record(record, lambda value: redact_registered_value(value, registered), protected=False)
             return True
         root = _emitting_root()
-        credentials = tuple(dict.fromkeys((*owner.credentials, *registered)))
+        # Built once per registry state: the registered carrier is replaced only when a registration changes.
+        credentials = owner.credentials | registered
         if root is _UNATTRIBUTED or owner.owns(root):
             rewrite_record(record, lambda value: redact_owned_value(value, credentials), protected=True)
         else:
@@ -203,12 +216,12 @@ class _HpackRecordFilter(logging.Filter):
 
 
 class _ClientRegistration:
-    """One live client's registered secrets; it never refers back to the client it is keyed by."""
+    """One live client's registered webhooks; it never refers back to the client it is keyed by."""
 
-    __slots__ = ("credentials", "finalizer")
+    __slots__ = ("finalizer", "webhooks")
 
     def __init__(self) -> None:
-        self.credentials: set[str] = set()
+        self.webhooks: set[Webhook] = set()
         self.finalizer: weakref.finalize[[_ClientRegistration], _Client] | None = None
 
 
@@ -223,13 +236,17 @@ class HttpxLogShield:
         self._transports = 0
         self._in_flight = 0
         self._clients: weakref.WeakKeyDictionary[_Client, _ClientRegistration] = weakref.WeakKeyDictionary()
-        self._secrets: dict[str, int] = {}
+        # How many open clients registered each webhook, and the secrets of them all, built on the first read after
+        # a change (``None`` until then), so a registration costs O(1); a ``Webhook`` and the carrier keep its token
+        # out of every rendering.
+        self._webhooks: dict[Webhook, int] = {}
+        self._registered: WebhookSecrets | None = WebhookSecrets()
 
-    def register_transport(self, *, credentials: tuple[str, ...] = (), client: _Client | None = None) -> bool:
+    def register_transport(self, *, webhook: Webhook | None = None, client: _Client | None = None) -> bool:
         """Install both filters while a transport can issue requests, before it creates or uses a client.
 
         Args:
-            credentials: Webhook secrets registered for the lifetime of ``client``.
+            webhook: The webhook whose secret is registered for the lifetime of ``client``.
             client: A client that already exists; a transport creating its own binds it afterwards.
 
         Returns:
@@ -238,9 +255,9 @@ class HttpxLogShield:
         with self._lock:
             self._transports += 1
             self._ensure_installed()
-        return True if client is None else self.bind_client(client, credentials=credentials)
+        return True if client is None else self.bind_client(client, webhook=webhook)
 
-    def bind_client(self, client: _Client, *, credentials: tuple[str, ...]) -> bool:
+    def bind_client(self, client: _Client, *, webhook: Webhook | None) -> bool:
         """Tie hpack suppression and registered secrets to the client's own life, once per client and secret.
 
         Returns:
@@ -255,10 +272,10 @@ class HttpxLogShield:
                     registration.finalizer = weakref.finalize(client, self._forget, registration)
             except TypeError:
                 return False
-            for credential in credentials:
-                if credential not in registration.credentials:
-                    registration.credentials.add(credential)
-                    self._secrets[credential] = self._secrets.get(credential, 0) + 1
+            if webhook is not None and webhook not in registration.webhooks:
+                registration.webhooks.add(webhook)
+                self._webhooks[webhook] = self._webhooks.get(webhook, 0) + 1
+                self._registered = None
             self._ensure_installed()
             return True
 
@@ -291,12 +308,15 @@ class HttpxLogShield:
         if not installed:
             raise CapabilityError(_MISSING_HPACK_FILTER)
 
-    def registered_secrets(self) -> tuple[str, ...]:
-        """Return each registered webhook secret of a still-open client once."""
+    def registered_secrets(self) -> WebhookSecrets:
+        """Return the registered webhook secrets of the still-open clients."""
         with self._lock:
             # Pruning touches only the registries, never a logger's filter list, so it is safe while logging.
             self._prune_closed()
-            return tuple(self._secrets)
+            if self._registered is None:
+                # A set of the webhooks; the carrier compiles its matcher on first use, outside this lock.
+                self._registered = WebhookSecrets(self._webhooks)
+            return self._registered
 
     def suppresses_hpack(self) -> bool:
         """Report whether a library HTTPX client is alive, dropping clients that were closed meanwhile."""
@@ -305,15 +325,14 @@ class HttpxLogShield:
             return bool(self._transports or self._in_flight or len(self._clients))
 
     @contextmanager
-    def request(self, url: str) -> Iterator[LogOwnership]:
-        """Protect one dispatch; the caller claims its HTTPX request with the yielded marker."""
-        ownership = LogOwnership(url)
+    def request(self, *, webhook: Webhook) -> Iterator[LogOwnership]:
+        """Protect one dispatch with ``webhook``; the caller claims its HTTPX request with the yielded marker."""
+        ownership = LogOwnership(webhook)
         with self._lock:
             if self._transports < 1:
                 raise RuntimeError("HTTPX log shield has no registered transport")
             self._in_flight += 1
-            if self._filter not in _LOGGER.filters:
-                _LOGGER.addFilter(self._filter)
+            self._install_url_filter()
         token = _ACTIVE_OWNERSHIP.set(ownership)
         try:
             yield ownership
@@ -327,13 +346,15 @@ class HttpxLogShield:
         # Runs on explicit pruning or when the client is collected; it never touches logger filter lists,
         # because collection can interrupt a logger that is iterating them.
         with self._lock:
-            for credential in registration.credentials:
-                remaining = self._secrets[credential] - 1
+            for webhook in registration.webhooks:
+                remaining = self._webhooks[webhook] - 1
                 if remaining:
-                    self._secrets[credential] = remaining
+                    self._webhooks[webhook] = remaining
                 else:
-                    del self._secrets[credential]
-            registration.credentials.clear()
+                    del self._webhooks[webhook]
+            if registration.webhooks:
+                registration.webhooks.clear()
+                self._registered = None
 
     def _prune_closed(self) -> None:
         for client, registration in list(self._clients.items()):
@@ -342,10 +363,14 @@ class HttpxLogShield:
                 if registration.finalizer is not None:
                     registration.finalizer()
 
+    def _install_url_filter(self) -> None:
+        for logger in _LOGGERS:
+            if self._filter not in logger.filters:
+                logger.addFilter(self._filter)
+
     def _ensure_installed(self) -> None:
         # The hpack filter is (re)installed only at registration: a filter removed later refuses HTTP/2 sends.
-        if self._filter not in _LOGGER.filters:
-            _LOGGER.addFilter(self._filter)
+        self._install_url_filter()
         for logger in _HPACK_LOGGERS:
             if self._hpack_filter not in logger.filters:
                 logger.addFilter(self._hpack_filter)
@@ -358,7 +383,8 @@ class HttpxLogShield:
             # An open injected client keeps its registered secret, so both scrubbers stay with it. Once it
             # closes, its secret is pruned at once; the next transport release or request exit removes them.
             return
-        _LOGGER.removeFilter(self._filter)
+        for logger in _LOGGERS:
+            logger.removeFilter(self._filter)
         for logger in _HPACK_LOGGERS:
             logger.removeFilter(self._hpack_filter)
 

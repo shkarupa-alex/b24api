@@ -13,7 +13,7 @@ from b24api.contracts.policy import (
     TotalSemantics,
 )
 from b24api.errors import CapabilityError, PaginationError
-from b24api.traversal.identity import _child_path, _request_with_controls
+from b24api.traversal.identity import _child_path, _path_lookup, _request_with_controls
 from b24api.traversal.plans import KeysetPlan, KeysetTerminalRule
 from b24api.traversal.values import IdentityValue, _compare_identities
 
@@ -43,6 +43,40 @@ def sequential_keyset_plan(keyset: KeysetSpec, page_size: int) -> KeysetPlan:
         duplicate_policy=DuplicatePolicy.ERROR,
         total_semantics=TotalSemantics.IGNORE,
     )
+
+
+def reject_caller_order(request: Request, plan: KeysetPlan, identity: IdentitySpec) -> None:
+    """Refuse a caller order beside the identity: the cursor only continues rows ordered by the identity.
+
+    The traversal writes the identity's order key into the order container; another key ahead of it
+    would make the server order by that field first, so the cursor would skip rows while the report
+    still claimed exact identity coverage.
+    """
+    if plan.split_order is not None or plan.order_path is None:
+        return
+    positional_arguments = request.positional
+    positional = positional_arguments is not None
+    parameters = positional_arguments.to_wire_slots() if positional_arguments is not None else request.copy_parameters()
+    exists, order = _path_lookup(parameters, plan.order_path, case_sensitive=positional)
+    if not exists:
+        return
+    if not isinstance(order, dict):
+        raise CapabilityError("keyset order path must contain an object")
+    if any(str(key).casefold() != identity.order_key.casefold() for key in order):
+        raise CapabilityError("caller order conflicts with keyset traversal, which orders by the identity alone")
+
+
+def reject_caller_controls(request: Request, keyset: KeysetSpec, identity: IdentitySpec, page_size: int) -> None:
+    """Refuse caller values at the order, start and limit controls that sequential keyset would refuse.
+
+    The one rule for both executions: a caller may leave each control out or set it to the value
+    sequential traversal writes on every page, and may order by nothing but the identity. Sequential
+    traversal then writes that same value; a fast command writes its own (its direction, a probe's
+    limit), replacing the caller's.
+    """
+    plan = sequential_keyset_plan(keyset, page_size)
+    reject_caller_order(request, plan, identity)
+    keyset_page_request(request, plan=plan, identity=identity, cursor=None)
 
 
 def validate_bounded_keyset(request: Request, plan: KeysetPlan, identity: IdentitySpec) -> None:
@@ -131,7 +165,11 @@ def bounded_keyset_request(  # noqa: PLR0913
         updates[keyset.start_suppression_path] = 0 if advisory_start else -1
     if keyset.limit_path is not None and limit is not None:
         updates[keyset.limit_path] = limit
-    return _request_with_controls(request, updates, allow_create=keyset.allow_create_controls)
+    # A caller value at an owned control was admitted only as what sequential traversal writes
+    # (``reject_caller_controls``): each command writes its own value there.
+    return _request_with_controls(
+        request, updates, allow_create=keyset.allow_create_controls, replace=frozenset(updates)
+    )
 
 
 def validate_keyset_continuation(

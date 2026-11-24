@@ -34,9 +34,10 @@ class _BindingContext:
 class _BindingSourceError(Exception):
     """Carry a failed binding source; reports name the public failure it maps to (``report_cause``)."""
 
-    def __init__(self) -> None:
+    def __init__(self, source_error: BaseException) -> None:
         super().__init__("reference input source failed")
         self.report_cause = InputSourceError("Reference input source failed")
+        self.report_cause.__cause__ = source_error
 
 
 class _BindingLocalValidationError(ValueError):
@@ -213,7 +214,7 @@ def binding_source[C](
         source,
         accept=accept,
         observe=None if audit is None else (lambda reference: audit(reference.request)),
-        failure=lambda _error: _BindingSourceError(),
+        failure=_BindingSourceError,
     )
 
 

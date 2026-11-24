@@ -15,34 +15,39 @@ from b24api.contracts.report import PageDispatch, PageRecord, Violation, Violati
 from b24api.contracts.request import ReplaySafety, Request, ResultSelector, TraversalIdentity
 from b24api.contracts.response import result_snapshot
 from b24api.contracts.violation import retain_violations
-from b24api.errors import BudgetExceededError, CapabilityError
-from b24api.execution import (
-    AsyncIteratorController,
-    Executor,
-    await_cleanup_resistant,
-    rearm_cancellation,
+from b24api.errors import BudgetExceededError, CapabilityError, CleanupOverrunError
+from b24api.execution.context import (
+    cancelled_here,
+    is_escape,
+    is_interrupt,
+    latch_escape,
+    own_failure,
+    spawn_settled,
 )
+from b24api.execution.facts import dropped_result
 from b24api.references.counted_io import SharedCountedWaveIO
 from b24api.references.dispatch import (
     ReferenceStreamItem,
     _AdmissionState,
     _BatchPageDispatcher,
-    _BatchPageError,
     _DirectPageDispatcher,
     _DispatchedPage,
     _DoneEvent,
+    _EndedEvent,
     _Event,
-    _failed_dispatch,
-    _failed_settlement,
+    _failed_page,
     _FailureEvent,
+    _Hold,
     _KernelFanOutSuccess,
     _KernelReferenceComplete,
     _PageEvent,
     _ProducerState,
+    _Producing,
     _ReferenceWindowError,
     _RowBuffer,
     _Work,
 )
+from b24api.references.dispatch_plan import bound_dispatch
 from b24api.references.keyset_run import run_fast_keyset
 from b24api.references.outcome import (
     KernelReferenceFailure,
@@ -59,7 +64,6 @@ from b24api.references.support import (
     _finish_task,
     _new_page_records,
     _page_cap,
-    _record_cleanup_failure,
     _wait_for_admission,
     _wait_for_cleanup_tasks,
     _wait_for_event,
@@ -77,15 +81,21 @@ from b24api.traversal.plans import (
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
-    from b24api._sources import OwnedSource
     from b24api.contracts.policy import ExecutionPolicy
     from b24api.contracts.report import KeysetSelectionSummary
     from b24api.contracts.response import Response
+    from b24api.execution import AsyncIteratorController, Executor
+    from b24api.execution.context import Settled
     from b24api.references.dispatch import _Reservation
     from b24api.traversal.identity import _Page
 
 type _PageDispatcher = _DirectPageDispatcher | _BatchPageDispatcher
 _IDENTITY_PAGE_ADAPTER = IdentityPageAdapter()
+
+
+def _producer_key(index: int) -> str:
+    """Return the dispatcher's producer key of the binding admitted at ``index``."""
+    return f"r{index}"
 
 
 class ReferenceScheduler:
@@ -112,10 +122,10 @@ class ReferenceScheduler:
         fast: FastKeysetProgram | None = None,
         keyset_selection: KeysetSelectionSummary | None = None,
     ) -> None:
-        """Initialize instance state."""
+        """Initialize instance state; the dispatch plan is bounded here by the operation policy, once for every path."""
         self.executor = executor
         self.plan = plan
-        self.dispatch = dispatch
+        self.dispatch = dispatch = bound_dispatch(dispatch, policy)
         self.selector = selector
         self.identity = identity
         self.output_order = output_order
@@ -152,8 +162,7 @@ class ReferenceScheduler:
             if self.default_program is None
             else _active_limit(output_order, policy, self.page_cap)
         )
-        self.producer_state = _ProducerState(set(), {})
-        self._caps: dict[int, int] = {}
+        self.producer_state = _ProducerState({}, default_cap=self.page_cap)
         head_reserve = (
             self.page_cap if output_order is ReferenceOutputOrder.INPUT and self.default_program is not None else 0
         )
@@ -174,25 +183,31 @@ class ReferenceScheduler:
                 dispatch,
                 producer_state=self.producer_state,
                 buffer=self.buffer,
-                page_cap=self.page_cap,
                 pending_continuations_can_progress=output_order is ReferenceOutputOrder.READY,
             )
         self.violations: list[Violation] = []
         self.page_trace: list[PageRecord] = []
         self.page_trace_truncated = False
         self._delivery_uniqueness: dict[int, tuple[KernelReferenceItem, bool]] = {}
-        self._source_controller: AsyncIteratorController[ReferenceRequest] | None = None
         self.active_references_high_water = 0
         self._next_page_sequence = 0
-        # Lease decisions read the admitted set, source exhaustion and the fast bindings holding or
-        # awaiting a lease; a change of either wakes lease waiters only while one is waiting.
+        # Lease decisions read the admitted set, whether the source has ended (read out, or closed by the spent
+        # request budget: no binding follows either way) and the fast bindings holding or awaiting a lease; a
+        # change of either wakes lease waiters only while one is waiting.
         self._admission: _AdmissionState | None = None
-        self._source_exhausted = False
+        self._producer: asyncio.Task[Settled[None]] | None = None
+        self._source_ended = False
         self._fast_active: set[int] = set()
         self._fast_waiting = 0
 
-    async def outcomes(self, source: OwnedSource[ReferenceRequest]) -> AsyncGenerator[ReferenceStreamItem]:  # noqa: C901, PLR0912
-        """Yield correlated operation outcomes."""
+    async def outcomes(
+        self, iterator: AsyncIteratorController[ReferenceRequest]
+    ) -> AsyncGenerator[ReferenceStreamItem]:
+        """Yield correlated operation outcomes, reading bindings through ``iterator``.
+
+        Only reads: the stream that owns this scheduler stops its work and closes ``iterator`` with ``aclose()``, as
+        the cleanup step of its lifecycle, however the outcomes ended.
+        """
         if self.default_program is not None:
             PaginationDriver.validate_contract(
                 self.default_program.plan,
@@ -200,12 +215,6 @@ class ReferenceScheduler:
                 self.context.policy,
             )
         await self.context.start()
-        iterator = AsyncIteratorController(
-            source,
-            input_error="reference input exceeded operation time budget",
-            cleanup_error="reference source cleanup exceeded operation time budget",
-        )
-        self._source_controller = iterator
         admission = _AdmissionState(
             tasks={},
             queues={},
@@ -214,145 +223,159 @@ class ReferenceScheduler:
             changed=asyncio.Event(),
         )
         self._admission = admission
-        producer = asyncio.create_task(self._produce(iterator, admission))
-        primary_error: BaseException | None = None
-        pending_cancellation: asyncio.CancelledError | None = None
+        # The producer pulls the caller's source: like every library task around caller code, it returns how it
+        # ended (``Settled``) and its consumer raises the failure, so the task never ends in one.
+        producer = self._producer = spawn_settled(self._produce(iterator, admission))
+        if self.output_order is ReferenceOutputOrder.READY:
+            async for outcome in self._ready(admission, producer):
+                yield outcome
+        else:
+            async for outcome in self._input(admission, producer):
+                yield outcome
 
-        try:
-            if self.output_order is ReferenceOutputOrder.READY:
-                async for outcome in self._ready(admission, producer):
-                    yield outcome
-            else:
-                async for outcome in self._input(admission, producer):
-                    yield outcome
-        except BaseException as error:
-            primary_error = error
-            raise
-        finally:
-            cleanup = await await_cleanup_resistant(self._cleanup(iterator, admission, producer, primary_error))
-            if cleanup.error is not None:
-                cleanup_error = cleanup.error
-                if primary_error is None or isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
-                    _record_cleanup_failure(self.violations, cleanup_error)
-                    pending = cleanup.cancellation
-                    if pending is None and isinstance(primary_error, asyncio.CancelledError):
-                        pending = primary_error
-                    rearm_cancellation(pending)
-                    raise cleanup_error
-                _record_cleanup_failure(self.violations, cleanup_error)
-                if isinstance(cleanup_error, asyncio.CancelledError):
-                    pending_cancellation = cleanup_error
-                if cleanup.cancellation is not None:
-                    pending_cancellation = cleanup.cancellation
-            elif cleanup.cancellation is not None and primary_error is None:
-                raise cleanup.cancellation
-            elif cleanup.cancellation is not None and not isinstance(
-                primary_error,
-                asyncio.CancelledError | GeneratorExit,
-            ):
-                _record_cleanup_failure(self.violations, cleanup.cancellation)
-                pending_cancellation = cleanup.cancellation
-            if primary_error is not None and not isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
-                rearm_cancellation(pending_cancellation)
-
-    async def _cleanup(
+    async def aclose(
         self,
         iterator: AsyncIteratorController[ReferenceRequest],
-        admission: _AdmissionState,
-        producer: asyncio.Task[None],
         primary_error: BaseException | None,
+    ) -> None:
+        """Stop the producer and every binding, then close the source; raise the first cleanup failure.
+
+        Each wait is bounded by the operation's cleanup window. The source is closed even when a task outlived its
+        window: its controller cancels a pull still running and closes the source once that pull ends. A failure
+        that is ``primary_error`` itself (a binding task ending in the failure that ended the stream) is no cleanup
+        failure.
+        """
+        cleanup_errors: list[BaseException] = []
+        admission, producer = self._admission, self._producer
+        if admission is not None and producer is not None:
+            await self._stop_work(admission, producer, primary_error, cleanup_errors)
+        self._delivery_uniqueness.clear()
+        try:
+            await iterator.aclose(self.context)
+        except BaseException as error:  # noqa: BLE001 - every owned resource is closed before the first failure
+            _keep_cleanup_failure(cleanup_errors, error, primary_error)
+        if cleanup_errors:
+            raise cleanup_errors[0]
+
+    async def _stop_work(
+        self,
+        admission: _AdmissionState,
+        producer: asyncio.Task[Settled[None]],
+        primary_error: BaseException | None,
+        cleanup_errors: list[BaseException],
     ) -> None:
         self.producer_state.closing = True
         self.producer_state.touch()
         producer.cancel()
         for task in admission.tasks.values():
             task.cancel()
-        cleanup_errors: list[BaseException] = []
         try:
             await self.buffer.close()
         except BaseException as error:  # noqa: BLE001 - cleanup continues across owned resources
-            if error is not primary_error:
-                cleanup_errors.append(error)
+            _keep_cleanup_failure(cleanup_errors, error, primary_error)
         try:
             await self.dispatcher.aclose()
         except BaseException as error:  # noqa: BLE001 - cleanup continues across owned resources
-            if error is not primary_error:
-                cleanup_errors.append(error)
+            _keep_cleanup_failure(cleanup_errors, error, primary_error)
         pending, task_errors = await _wait_for_cleanup_tasks(
             (producer, *admission.tasks.values()),
-            remaining=max(0.0, self.context.policy.max_elapsed - self.context.elapsed),
+            remaining=self.context.cleanup_window(),
         )
-        cleanup_errors.extend(error for error in task_errors if error is not primary_error)
+        # The producer only reads the source: a failure it ended in is the source's (or the reading's), which the
+        # close ends the stream before the reader reached, as an unread binding's failure; none of this cleanup.
+        source_failure = own_failure(producer)
+        for task_error in task_errors:
+            if task_error is not source_failure:
+                _keep_cleanup_failure(cleanup_errors, task_error, primary_error)
         if pending:
-            cleanup_errors.append(BudgetExceededError("reference task cleanup exceeded operation time budget"))
-        else:
-            try:
-                await iterator.aclose(
-                    remaining=max(0.0, self.context.policy.max_elapsed - self.context.elapsed),
-                )
-            except BaseException as error:  # noqa: BLE001 - attach at the stream boundary
-                if error is not primary_error:
-                    cleanup_errors.append(error)
-        self._delivery_uniqueness.clear()
-        if cleanup_errors:
-            raise cleanup_errors[0]
+            cleanup_errors.append(CleanupOverrunError("reference task cleanup exceeded operation time budget"))
 
     async def _produce(
         self,
         iterator: AsyncIteratorController[ReferenceRequest],
         admission: _AdmissionState,
     ) -> None:
+        """Read and admit bindings until the source ends: read out, or closed by the budget's refusal.
+
+        A pull the operation's budget refuses (``ExecutionContext.ended_by``: the request budget refused a send, or
+        the deadline passed before the pull or while it ran; once either has refused work, it refuses every later
+        pull) ends the source as a read-out source ends, although the source's end was not read, so the operation
+        cannot complete. The producer's own task ends without error either way, so a fail-fast window's failure
+        stays the operation's only error and its cleanup records nothing. Whether the operation ends with the
+        budget is decided by the consumer from the budget itself (``_raise_if_budget_refused``), not from how the
+        source ended: a source may be read out before the budget refuses work.
+        """
         next_index = 0
         try:
             while True:
                 await admission.slots.acquire()
-                self.producer_state.next_key = f"r{next_index}"
+                self.producer_state.next_key = _producer_key(next_index)
                 self.producer_state.next_index = next_index
                 self.producer_state.source_pull_in_flight = True
                 self.producer_state.touch()
                 try:
                     reference = await iterator.get(self.context)
                 except StopAsyncIteration:
-                    self.producer_state.source_pull_in_flight = False
-                    self.producer_state.next_key = None
-                    self.producer_state.next_index = None
-                    self.producer_state.touch()
-                    admission.slots.release()
-                    self._source_exhausted = True
-                    await self._wake_lease_waiters()
+                    await self._end_source(admission)
                     return
-                except BaseException:
-                    self.producer_state.source_pull_in_flight = False
-                    self.producer_state.next_key = None
-                    self.producer_state.next_index = None
-                    self.producer_state.touch()
+                except BaseException as error:
+                    if self.context.ended_by(error):
+                        await self._end_source(admission)
+                        return
+                    self._clear_pending_pull()
                     admission.slots.release()
                     raise
-                self.producer_state.source_pull_in_flight = False
-                self.producer_state.next_key = None
-                self.producer_state.next_index = None
-                self.producer_state.touch()
                 work = _Work(next_index, reference)
                 self.completion.admit(next_index)
                 next_index += 1
+                self.producer_state.admitted = next_index
                 if reference.not_executed_reason is None:
                     self._admit_program(work)
-                queue = admission.ready if self.output_order is ReferenceOutputOrder.READY else asyncio.Queue(maxsize=1)
-                admission.queues[work.index] = queue
-                run = (
-                    self._emit_local_non_execution(work, queue)
-                    if reference.not_executed_reason is not None
-                    else self._run_reference(work, queue)
-                )
-                admission.tasks[work.index] = asyncio.create_task(run)
-                self.active_references_high_water = max(self.active_references_high_water, len(admission.tasks))
-                admission.changed.set()
+                # The pulled binding stops counting as a pending pull in the same step it starts counting
+                # as a producer: no coalescing check sees it as neither.
+                self._clear_pending_pull()
+                self._start_binding(work, admission)
         finally:
-            self.producer_state.source_pull_in_flight = False
-            self.producer_state.next_key = None
-            self.producer_state.next_index = None
-            self.producer_state.touch()
+            self._clear_pending_pull()
             admission.changed.set()
+
+    def _clear_pending_pull(self) -> None:
+        self.producer_state.source_pull_in_flight = False
+        self.producer_state.next_key = None
+        self.producer_state.next_index = None
+        self.producer_state.touch()
+
+    async def _end_source(self, admission: _AdmissionState) -> None:
+        """End the source: no pull is pending, its slot is free, and lease waiters see that no binding follows."""
+        self._clear_pending_pull()
+        admission.slots.release()
+        self._source_ended = True
+        self.producer_state.source_exhausted = True
+        await self._wake_lease_waiters()
+
+    def _raise_if_budget_refused(self) -> None:
+        """End the operation with its budget once every binding read is settled, if the budget refused work.
+
+        The refusal the budget recorded (``ExecutionContext.raise_if_refused``) decides, whether the source was read
+        out before the refusal or closed by it.
+        """
+        self.context.raise_if_refused()
+
+    def _start_binding(self, work: _Work, admission: _AdmissionState) -> None:
+        """Start an admitted binding's task: its local non-execution, or the run that retires its producer."""
+        # Under INPUT a binding's queue holds the pages it read ahead; the row pool bounds them.
+        queue = admission.ready if self.output_order is ReferenceOutputOrder.READY else asyncio.Queue[_Event]()
+        admission.queues[work.index] = queue
+        # A binding's task runs caller code (a transport, a page stop): it returns how it ended (``Settled``).
+        if work.reference.not_executed_reason is not None:
+            task = spawn_settled(self._emit_local_non_execution(work, queue))
+        else:
+            task = spawn_settled(self._run_reference(work, queue))
+            # A task cancelled before it reaches its own retirement leaves its producer to this callback.
+            task.add_done_callback(functools.partial(self._retire_ended_producer, _producer_key(work.index)))
+        admission.tasks[work.index] = task
+        self.active_references_high_water = max(self.active_references_high_water, len(admission.tasks))
+        admission.changed.set()
 
     def _program(self, work: _Work) -> SourceProgram:
         program = work.reference.program or self.default_program
@@ -361,48 +384,119 @@ class ReferenceScheduler:
         return program
 
     def _admit_program(self, work: _Work) -> None:
-        """Record an admitted reference's row cap; under INPUT the frontier reserve covers every admitted cap.
+        """Record an admitted reference's row cap and register it as a producer the dispatcher counts.
 
-        Any admitted binding may become the frontier while rows behind it stay held, so the reserve
-        is the largest admitted cap, not only the current head's.
+        Under INPUT the frontier reserve covers every admitted cap: any admitted binding may become the
+        frontier while rows behind it stay held, so the reserve is the largest cap of the producers still
+        adding pages (``_head_reserve``), not only the current head's. The binding is runnable from the
+        moment it leaves the source, before its task first runs, so a wave never closes short in between;
+        its task retires it.
         """
         cap = self._program(work).page_cap
-        self._caps[work.index] = cap
         if self.output_order is ReferenceOutputOrder.INPUT:
             self.buffer.raise_head_reserve(cap)
+        self.producer_state.register(_producer_key(work.index), work.index, cap)
 
-    def _head_cap(self, index: int) -> int:
-        return self._caps.get(index, self.page_cap if self.default_program is not None else 0)
+    def _head_reserve(self) -> int:
+        """Return the rows the INPUT frontier keeps free: the largest page cap among the producers.
+
+        A binding the source has not yielded yet may become the frontier with no producer left: its default cap.
+        """
+        default = self.page_cap if self.default_program is not None else 0
+        return max(self.producer_state.caps.values(), default=default)
 
     async def _run_reference(self, work: _Work, output: asyncio.Queue[_Event]) -> None:
-        """Own one reference transaction from its first page to its terminal event."""
+        """Own one reference transaction from its first page to its terminal event, published on every way out.
+
+        The consumer waits for each binding's terminal event, so the event is the run's structure, not a convention of
+        its paths: a run that leaves without one (``_publish_missing_terminal``) still publishes it, unless the
+        operation is stopping its bindings or an escape ends it, when nobody waits for it.
+        """
         program = self._program(work)
-        run = _ReferenceRun(work, output, self.completion.binding(work.index), f"r{work.index}", program)
-        self.producer_state.runnable.add(run.producer_key)
-        self.producer_state.indexes[run.producer_key] = work.index
-        self.producer_state.caps[run.producer_key] = program.page_cap
-        self.producer_state.touch()
-        await asyncio.sleep(0)
+        run = _ReferenceRun(work, output, self.completion.binding(work.index), _producer_key(work.index), program)
+        left: BaseException | None = None
+        try:
+            await asyncio.sleep(0)
+            await self._run_pages(run)
+        except BaseException as error:
+            left = error
+            raise
+        finally:
+            await self._publish_missing_terminal(run, left)
+        if run.deferred_cleanup_error is not None:
+            raise run.deferred_cleanup_error
+
+    async def _run_pages(self, run: _ReferenceRun) -> None:
+        """Drive the binding's pages, end it by what its run raised, then release what it held."""
+        program, work = run.program, run.work
         pages = None if program.fast is not None else self._driven_pages(run)
         try:
             if program.fast is not None:
                 await run_fast_keyset(self, run, program.fast)
             elif pages is not None:
                 await self._drive(run, pages)
-        except asyncio.CancelledError:
-            raise
-        except _BatchPageError as error:
-            failure = self._failure_event(run, cast("BaseException", error.failure.error))
-            await output.put(replace(failure, replay_disposition=error.failure.replay_disposition))
-        except Exception as error:  # noqa: BLE001 - per-reference tolerant outcome boundary
-            await output.put(self._failure_event(run, error))
+        except BaseException as error:  # noqa: BLE001 - per-reference tolerant outcome boundary
+            await self._end_binding(run, error)
         finally:
-            if pages is not None:
-                await pages.aclose()
-            self._retire_producer(run)
-            self._fast_active.discard(work.index)
-            if run.reservation is not None:
-                await self.buffer.abort(run.reservation)
+            try:
+                if pages is not None:
+                    await pages.aclose()
+            finally:
+                self._retire_producer(run)
+                self._fast_active.discard(work.index)
+                if run.reservation is not None:
+                    await self.buffer.abort(run.reservation)
+
+    async def _publish_missing_terminal(self, run: _ReferenceRun, left: BaseException | None) -> None:
+        """Publish the terminal event of a run that left without one: a failure carrying what it left with.
+
+        Only a run that returned, failed or was cancelled by something it awaited can still publish. Nobody waits for
+        the event of a run whose operation is closing or whose own task is cancelled (the operation's stop, the loop's
+        shutdown). An escape is no binding's end (the operation's end raises it), and a coroutine being closed
+        (``GeneratorExit``: a dropped loop's) must not await.
+        """
+        if run.ended or isinstance(left, GeneratorExit) or is_escape(left):
+            return
+        if self.producer_state.closing or cancelled_here():
+            return
+        error: Exception
+        if isinstance(left, Exception):
+            error = left
+        else:
+            error = CapabilityError("reference binding ended without an outcome")
+            error.__cause__ = left
+        await self.publish_terminal(run, self._failure_event(run, error))
+
+    async def _end_binding(self, run: _ReferenceRun, error: BaseException) -> None:
+        """End a binding by what its run raised: its terminal event, unless that is no way a binding ends.
+
+        A failure (an ``Exception``) is its failure event. A cancellation (how the operation stops its bindings,
+        ``_stop_work``) and the close of a coroutine a dropped loop left go on as they are. An escape (``is_escape``)
+        is no failure and no outcome: the operation's latch has it, and the binding's task ends in it. An interrupt
+        ends the operation; any other escape is raised by a read that finishes the task where the binding's end
+        comes (``_EndedEvent``, ``_finish_task``), or else by the operation's end.
+        """
+        if isinstance(error, asyncio.CancelledError) and not cancelled_here():
+            # Only a cancellation of the binding's own task stops it (the operation's ``_stop_work``, or the loop's
+            # shutdown): one its task was not asked for is a foreign cancellation of something it awaited, so the
+            # binding fails with it.
+            carried = CapabilityError("reference binding was cancelled while its operation was running")
+            carried.__cause__ = error
+            error = carried
+        if isinstance(error, Exception):
+            # The binding fails with what its failed page reports, and its command's replay disposition, if any: a
+            # failure's page reports a failure.
+            failed = _failed_page(error)
+            event = self._failure_event(run, cast("Exception", failed.error))
+            if failed.failure is not None:
+                event = replace(event, replay_disposition=failed.failure.replay_disposition)
+            await self.publish_terminal(run, event)
+            return
+        if is_escape(error):
+            latch_escape(error)
+            if not is_interrupt(error):
+                await self.publish_terminal(run, _EndedEvent(run.work))
+        raise error
 
     def _driven_pages(self, run: _ReferenceRun) -> AsyncGenerator[_Page]:
         """Build the binding's pagination driver and return its page stream."""
@@ -426,13 +520,24 @@ class ReferenceScheduler:
     async def _drive(self, run: _ReferenceRun, pages: AsyncGenerator[_Page]) -> None:
         """Deliver the driver's pages, then the binding's terminal event."""
         driver, program = run.driver, run.program
-        async for page in pages:
-            if not await self._deliver_page(run, page):
-                break
+        primary_error: BaseException | None = None
+        try:
+            async for page in pages:
+                if not await self._deliver_page(run, page):
+                    break
+        except BaseException as error:
+            primary_error = error
+            latch_escape(error)  # Latched before the await, so no cancellation of it can ever replace it.
+            raise
+        finally:
+            # Cleanup comes before the terminal event: the pages a stopped binding abandons are cancelled
+            # before it stops counting as a producer, so no wave leaves with them meanwhile.
+            run.deferred_cleanup_error = await _close_pages(pages, primary_error)
         if run.reservation is not None:
             await self.buffer.abort(run.reservation)
             run.reservation = None
-        await run.output.put(
+        await self.publish_terminal(
+            run,
             _DoneEvent(
                 run.work,
                 run.partial_rows,
@@ -446,16 +551,26 @@ class ReferenceScheduler:
             ),
         )
 
+    async def publish_terminal(self, run: _ReferenceRun, event: _DoneEvent | _FailureEvent | _EndedEvent) -> None:
+        """Publish the binding's terminal event once it has cleaned up; it adds no command any more.
+
+        It stops counting as a producer first, so no wave waits for it while the event waits for room,
+        and the ordered pool stops keeping room for its next page.
+        """
+        run.ended = True
+        self.producer_state.retire(run.producer_key)
+        await run.output.put(event)
+
     def _retire_producer(self, run: _ReferenceRun) -> None:
-        """Release the run's dispatcher waits and remove it from the advisory producer state."""
+        """Release the run's dispatcher waits, remove it from the advisory producer state and close its page ledger."""
         run.admit_page()
         run.settle_page()
-        self.producer_state.runnable.discard(run.producer_key)
-        self.producer_state.admitting.discard(run.producer_key)
-        self.producer_state.pending_continuations.discard(run.producer_key)
-        self.producer_state.indexes.pop(run.producer_key, None)
-        self.producer_state.caps.pop(run.producer_key, None)
-        self.producer_state.touch()
+        self.context.close_reference(run.producer_key)
+        self.producer_state.retire(run.producer_key)
+
+    def _retire_ended_producer(self, key: str, _task: asyncio.Task[Settled[None]]) -> None:
+        """Retire a producer registered at its pull whose task ended without retiring it."""
+        self.producer_state.retire(key)
 
     @property
     def batch_dispatcher(self) -> _BatchPageDispatcher:
@@ -472,29 +587,21 @@ class ReferenceScheduler:
         return self.dispatch.batch_size
 
     async def lease_rows(self, run: _ReferenceRun, fast: FastKeysetProgram) -> _Reservation:
-        """Wait for the binding's row lease ``G``; it is held, never grown, until the binding's terminal."""
+        """Wait for the binding's row lease ``G``; it grows only as its binding plans, and is held until terminal."""
         index = run.work.index
         self._fast_active.add(index)
         self._fast_waiting += 1
         # A binding waiting for its lease cannot add a command, so no wave may wait to coalesce with it.
-        self.producer_state.runnable.discard(run.producer_key)
-        self.producer_state.touch()
+        self.producer_state.move(run.producer_key, _Producing.WAITING)
         try:
             # The wait is bounded by the operation's elapsed budget, as every dispatch wait is.
-            remaining = self.context.policy.max_elapsed - self.context.elapsed
-            if remaining <= 0:
-                raise BudgetExceededError("operation elapsed budget exhausted before the fast keyset lease")
-            try:
-                async with asyncio.timeout(remaining):
-                    lease = await self.buffer.lease(index, functools.partial(self._lease_size, fast, index))
-            except TimeoutError as error:
-                raise BudgetExceededError("fast keyset lease wait exceeded the operation time budget") from error
+            async with self.context.deadline("fast keyset lease wait exceeded the operation time budget"):
+                lease = await self.buffer.lease(index, functools.partial(self._lease_size, fast, index))
         finally:
             self._fast_waiting -= 1
         # Every page of a leased binding is charged to its lease, none to the free pool rows.
-        self.producer_state.caps[run.producer_key] = 0
-        self.producer_state.runnable.add(run.producer_key)
-        self.producer_state.touch()
+        self.producer_state.charge_to_lease(run.producer_key)
+        self.producer_state.move(run.producer_key, _Producing.RUNNABLE)
         return lease
 
     async def settle_lease(self, lease: _Reservation, rows: int) -> None:
@@ -526,11 +633,7 @@ class ReferenceScheduler:
                     return free
                 raise BudgetExceededError("fast keyset lease cannot fit the boundary wave at the INPUT frontier")
             return None
-        admission = self._admission
-        others = admission is not None and len(admission.tasks) > 1
-        keep = 0 if frontier or not (others or not self._source_exhausted) else self.buffer.head_reserve
-        sources = len(self._fast_active) + (0 if self._source_exhausted else 1)
-        cap = max(fast.floor, (pool - keep) // sources)
+        keep, cap = self._share(fast, frontier=frontier)
         available = free - keep
         # G = clamp(free - R_keep, P, G_cap): a share below the quota Q starts from the floor P, while a
         # share that can hold Q waits for it rather than plan below the comfortable quota.
@@ -541,6 +644,33 @@ class ReferenceScheduler:
                 return min(free, cap)
             raise BudgetExceededError("fast keyset lease cannot fit its plan at the INPUT frontier")
         return None
+
+    def grow_lease(self, run: _ReferenceRun, fast: FastKeysetProgram, lease: _Reservation) -> int:
+        """Grow the binding's lease to the share the facts known as it plans give; return the rows it holds.
+
+        A lease is sized at admission, while the source may still hold bindings that would share the pool. Once
+        the binding's boundary wave has landed, the source may have ended and other bindings finished: the
+        lease takes up to its share of the free rows, keeping the frontier reserve as ``_lease_size`` does.
+        AUTO below the floor already holds the whole pool, or all the frontier could take.
+        """
+        if not (fast.automatic and self.buffer.maximum < fast.floor):
+            frontier = self.output_order is ReferenceOutputOrder.INPUT and run.work.index == self.buffer.head_index
+            keep, cap = self._share(fast, frontier=frontier)
+            self.buffer.grow_lease(lease, lambda free: min(free - keep, cap - lease.amount))
+        return lease.amount
+
+    def _share(self, fast: FastKeysetProgram, *, frontier: bool) -> tuple[int, int]:
+        """Return the rows a lease keeps free for the INPUT frontier, and the most it may hold.
+
+        A binding keeps the frontier reserve R free while any other source is active or unread, and takes at
+        most an even share of the pool among the fast sources that are active or may still arrive.
+        """
+        admission = self._admission
+        others = admission is not None and len(admission.tasks) > 1
+        unread = not self._source_ended
+        keep = 0 if frontier or not (others or unread) else self.buffer.head_reserve
+        sources = len(self._fast_active) + (1 if unread else 0)
+        return keep, max(fast.floor, (self.buffer.maximum - keep) // sources)
 
     async def _wake_lease_waiters(self) -> None:
         if self._fast_waiting:
@@ -565,12 +695,13 @@ class ReferenceScheduler:
 
     async def dispatch_page(self, run: _ReferenceRun, request: Request) -> _DispatchedPage:
         """Schedule one page, reserve its row capacity and dispatch it; the caller settles it."""
-        self.producer_state.runnable.discard(run.producer_key)
-        self.producer_state.admitting.add(run.producer_key)
-        self.producer_state.touch()
+        self.producer_state.move(run.producer_key, _Producing.ADMITTING)
         run.scheduled_sequences.append(self.take_page_sequence())
         run.completion.scheduled()
         run.reservation = await self.buffer.reserve(run.work.index, run.program.page_cap)
+        if run.program.whole_result:
+            # A whole result is its binding's only page: the ordered pool keeps no room for another.
+            self.producer_state.reserve_last(run.producer_key)
         dispatched = await self.dispatcher.fetch(request, run.producer_key)
         run.page_admission = dispatched.admission
         run.settlement = dispatched.settlement
@@ -579,8 +710,7 @@ class ReferenceScheduler:
 
     async def abandon_page(self, run: _ReferenceRun) -> None:
         """Return the row capacity of a page whose dispatch raised."""
-        self.producer_state.admitting.discard(run.producer_key)
-        self.producer_state.touch()
+        self.producer_state.leave(run.producer_key, _Producing.ADMITTING)
         if run.reservation is not None:
             await self.buffer.abort(run.reservation)
         run.reservation = None
@@ -595,28 +725,51 @@ class ReferenceScheduler:
         try:
             dispatched = await self.dispatch_page(run, request)
         except BaseException as error:
-            run.completion.settled(_failed_settlement(error))
+            failed = _failed_page(error)
+            run.completion.settled(failed.settlement)
             await self.abandon_page(run)
-            if isinstance(error, _BatchPageError) or bool(getattr(error, "_b24api_dispatch_started", False)):
-                failed = _failed_dispatch(self.page_dispatch, error)
-                run.driver.set_page_dispatch(dispatch=failed.dispatch, batch_index=failed.batch_index)
-                run.driver.record_unknown_page(
-                    dispatch=failed.dispatch,
-                    batch_index=failed.batch_index,
-                    error=failed.error or error,
-                )
+            run.driver.record_failed_page(
+                dispatch=self.page_dispatch,
+                batch_index=failed.batch_index,
+                error=failed.error,
+                settled=failed.settlement,
+            )
             raise
         run.driver.set_page_dispatch(dispatch=dispatched.dispatch, batch_index=dispatched.batch_index)
         run.completion.settled(CommandSettlement.SUCCESS)
         return dispatched.response
 
-    async def _deliver_page(self, run: _ReferenceRun, page: _Page) -> bool:
-        """Hand one validated page to the consumer; return False when the caller stops the reference."""
+    async def _accept_rows(self, run: _ReferenceRun, page: _Page) -> None:
+        """Charge a validated page's rows to its reservation, before the page is queued for the consumer."""
         if run.reservation is None:
             raise RuntimeError("page completed without a buffer reservation")
-        if not run.reservation.accepted:
+        if run.reservation.hold is _Hold.IN_FLIGHT:
             # A counted head's rows were already charged when it was selected (LeaseCountedRowAccount).
+            if page.retained_rows > run.reservation.amount:
+                # The page was answered with more rows than it reserved, a whole result of a call that does not
+                # page: it grows into free rows, or, if the pool can never hold them, is dropped, its command run.
+                # While it waits its rows are the pool's first claim and no page reserves more, so it frees its
+                # sender's slot: the pages reserved before it are sent, and their unused rows come back to it.
+                run.admit_page()
+                limit = await self.buffer.grow(run.reservation, page.retained_rows)
+                if limit is not None:
+                    raise dropped_result(
+                        rows=page.retained_rows,
+                        limit=limit,
+                        request_summary=run.work.reference.request.summary,
+                        evidence=page.response.evidence,
+                    )
             await self.buffer.accept(run.reservation, page.retained_rows)
+
+    async def _deliver_page(self, run: _ReferenceRun, page: _Page) -> bool:
+        """Hand one validated page to the consumer; return False when the caller stops the reference.
+
+        Under INPUT delivery a binding reads ahead: its page waits in its queue, its rows held in the
+        row pool, while the binding goes on to its next page, so the bindings behind the frontier
+        fill the waves the frontier's pages travel in. It waits for the consumer only when a page stop
+        must see the page first, and under READY delivery, whose consumer takes pages as they come.
+        """
+        await self._accept_rows(run, page)
         # The physical sender owns capacity only until the decoded page is
         # admitted to the bounded row buffer.  Holding that slot until a
         # READY consumer acknowledges every row would serialize consumer
@@ -624,41 +777,45 @@ class ReferenceScheduler:
         run.admit_page()
         if self.output_order is ReferenceOutputOrder.INPUT:
             run.settle_page()
-        acknowledged = asyncio.get_running_loop().create_future()
+        awaits_consumer = self.output_order is ReferenceOutputOrder.READY or run.program.page_stop is not None
+        acknowledged = asyncio.get_running_loop().create_future() if awaits_consumer else None
         # A dense counted tail reports its own pending pages to the dispatcher (ReferenceTailStream).
-        if page.continuing and not run.tail_active:
-            self.producer_state.pending_continuations.add(run.producer_key)
-            self.producer_state.touch()
+        if acknowledged is not None and page.continuing and not run.tail_active:
+            self.producer_state.move(run.producer_key, _Producing.AWAITING_CONSUMER)
         page_violations = tuple(run.driver.violations[run.violation_offset :])
         run.violation_offset = len(run.driver.violations)
         page_records = self._pending_page_records(run)
+        page_id = run.completion.hand_over()
         await run.output.put(
             _PageEvent(
                 run.work,
                 page.items,
-                page.response,
+                # Only a fan-out consumer takes the response; a page read ahead holds just its rows.
+                page.response if self.emit_response else None,
                 page.item_weights,
                 run.driver.last_page_unique_mask,
                 page_violations,
                 page_records,
                 run.reservation,
                 acknowledged,
+                page_id=page_id,
             ),
         )
         run.trace_offset = run.driver.page_trace_count
-        await acknowledged
-        if self.output_order is ReferenceOutputOrder.READY:
-            run.settle_page()
-        self.producer_state.pending_continuations.discard(run.producer_key)
+        if acknowledged is not None:
+            await acknowledged
+            if self.output_order is ReferenceOutputOrder.READY:
+                run.settle_page()
+        self.producer_state.leave(run.producer_key, _Producing.AWAITING_CONSUMER)
         run.partial_rows += len(page.items)
         run.reservation = None
-        if await self._caller_stopped(run, page, page_records):
-            run.completion.acknowledged()
+        stopped = await self._caller_stopped(run, page, page_records)
+        if acknowledged is not None:
+            run.completion.acknowledged(page_id)
+        if stopped:
             return False
-        run.completion.acknowledged()
         if page.continuing and not run.tail_active:
-            self.producer_state.runnable.add(run.producer_key)
-            self.producer_state.touch()
+            self.producer_state.move(run.producer_key, _Producing.RUNNABLE)
         return True
 
     async def _caller_stopped(self, run: _ReferenceRun, page: _Page, page_records: tuple[PageRecord, ...]) -> bool:
@@ -693,17 +850,21 @@ class ReferenceScheduler:
             run.scheduled_sequences,
         )
 
-    def _failure_event(self, run: _ReferenceRun, error: BaseException) -> _FailureEvent:
+    def _failure_event(self, run: _ReferenceRun, error: Exception) -> _FailureEvent:
         """Build the terminal failure event with the partial progress the reference reached."""
         if run.failure is not None:
             return run.failure  # a fast keyset binding prepared its own evidence before re-raising
+        driver = getattr(run, "driver", None)
+        if driver is None:
+            # A run that left before its pages were built has no progress to report.
+            return _FailureEvent(run.work, error, None, run.page_state, run.partial_rows, ())
         return _FailureEvent(
             run.work,
             error,
-            run.driver.cursor_state,
+            driver.cursor_state,
             run.page_state,
             run.partial_rows,
-            tuple(run.driver.violations[run.violation_offset :]),
+            tuple(driver.violations[run.violation_offset :]),
             self._pending_page_records(run),
         )
 
@@ -727,7 +888,7 @@ class ReferenceScheduler:
     async def _ready(
         self,
         admission: _AdmissionState,
-        producer: asyncio.Task[None],
+        producer: asyncio.Task[Settled[None]],
     ) -> AsyncGenerator[ReferenceStreamItem]:
         while admission.tasks or not producer.done():
             if not admission.tasks:
@@ -741,15 +902,15 @@ class ReferenceScheduler:
                 continue
             await _finish_task(admission.tasks, event.work.index)
             admission.queues.pop(event.work.index, None)
-            self._caps.pop(event.work.index, None)
             admission.slots.release()
             await self._wake_lease_waiters()
-        await producer
+        (await producer).unwrap()
+        self._raise_if_budget_refused()
 
     async def _input(
         self,
         admission: _AdmissionState,
-        producer: asyncio.Task[None],
+        producer: asyncio.Task[Settled[None]],
     ) -> AsyncGenerator[ReferenceStreamItem]:
         while admission.tasks or not producer.done():
             if not admission.tasks:
@@ -764,14 +925,16 @@ class ReferenceScheduler:
                 continue
             await _finish_task(admission.tasks, head)
             admission.queues.pop(head, None)
-            self._caps.pop(head, None)
             admission.slots.release()
             await self._wake_lease_waiters()
             next_head = min(admission.tasks) if admission.tasks else head + 1
-            await self.buffer.advance_head(next_head, max(self._caps.values(), default=self._head_cap(next_head)))
-        await producer
+            await self.buffer.advance_head(next_head, self._head_reserve())
+        (await producer).unwrap()
+        self._raise_if_budget_refused()
 
     def _record_event_violations(self, event: _Event) -> None:
+        if isinstance(event, _EndedEvent):
+            return
         self.violations = list(retain_violations((*self.violations, *event.violations)))
         combined = tuple(sorted((*self.page_trace, *event.page_records), key=lambda record: record.sequence))
         retained, truncated = retain_page_trace(combined, self.context.policy.page_trace_limit)
@@ -805,7 +968,7 @@ class ReferenceScheduler:
                 yield _KernelFanOutSuccess(event.work.reference, event.response)
                 for weight in event.item_weights:
                     await self.buffer.release(reservation, weight)
-                self.completion.binding(event.work.index).delivered()
+                self._page_delivered(event)
                 return
             for item, weight, is_unique in zip(
                 event.items,
@@ -826,12 +989,23 @@ class ReferenceScheduler:
                 elif reservation is not None:
                     await self.buffer.release(reservation, weight)
             if event.emitted is None:
-                self.completion.binding(event.work.index).delivered()
+                self._page_delivered(event)
         finally:
-            if not event.acknowledged.done():
+            if event.acknowledged is not None and not event.acknowledged.done():
                 event.acknowledged.set_result(None)
 
+    def _page_delivered(self, event: _PageEvent) -> None:
+        """Record a whole page delivered; acknowledge it too unless its binding waits to do so."""
+        if event.page_id is None:
+            raise RuntimeError("reference page lacks its completion page")
+        binding = self.completion.binding(event.work.index)
+        binding.delivered(event.page_id)
+        if event.acknowledged is None:
+            binding.acknowledged(event.page_id)
+
     async def _consume_event(self, event: _Event) -> AsyncGenerator[ReferenceStreamItem]:
+        if isinstance(event, _EndedEvent):
+            return  # no outcome: finishing the binding's task raises what it ended in (``_finish_task``)
         if isinstance(event, _PageEvent):
             async for outcome in self._consume_page(event):
                 yield outcome
@@ -882,3 +1056,28 @@ class ReferenceScheduler:
         """Record one delivered reference item."""
         stored = self._delivery_uniqueness.pop(id(item), None)
         return stored is not None and stored[0] is item and stored[1]
+
+
+def _keep_cleanup_failure(
+    cleanup_errors: list[BaseException], error: BaseException, primary_error: BaseException | None
+) -> None:
+    """Keep a failure of the cleanup, unless it is what ended the stream; an escape is the operation's latch's."""
+    if is_escape(error):
+        latch_escape(error)
+    elif error is not primary_error:
+        cleanup_errors.append(error)
+
+
+async def _close_pages(pages: AsyncGenerator[_Page], primary_error: BaseException | None) -> BaseException | None:
+    """Close a binding's page stream; return a cleanup failure that the failure ending it outranks.
+
+    The binding then fails with its own error, and the cleanup failure is raised once that failure
+    is emitted and the binding is retired, as it was when the stream was closed only after that.
+    """
+    try:
+        await pages.aclose()
+    except Exception as cleanup_error:
+        if primary_error is None or isinstance(primary_error, asyncio.CancelledError | GeneratorExit):
+            raise
+        return cleanup_error
+    return None

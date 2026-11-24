@@ -31,6 +31,7 @@ from b24api.contracts import (
     OperationStream,
     ResultCollectionShape,
     TotalHintMode,
+    TotalTermination,
 )
 from b24api.contracts.dispatch import PORTAL_BATCH_CAP
 from b24api.contracts.keyset_execution import KeysetExecutionJson
@@ -77,7 +78,9 @@ def decode_one_object(text: str, *, label: str) -> dict[str, object]:
     )
     try:
         value, end = decoder.raw_decode(text.lstrip())
-    except (json.JSONDecodeError, _DuplicateKeyError, _NonFiniteNumberError) as error:
+    except (ValueError, RecursionError) as error:
+        # Malformed JSON, a duplicate key, a non-finite number, an integer past the digit limit, or nesting
+        # deeper than the decoder recurses: each is the caller's local input.
         raise CliUsageError(f"{label} is not valid closed JSON") from error
     leading = len(text) - len(text.lstrip())
     if text[leading + end :].strip():
@@ -105,28 +108,33 @@ def read_json_source(raw: str | None, *, label: str, stdin: TextIO) -> dict[str,
     if raw is None:
         return {}
     if raw == "-":
-        text = stdin.read()
+        try:
+            text = stdin.read()
+        except (OSError, UnicodeDecodeError) as error:
+            raise CliUsageError(f"cannot read {label} from stdin as UTF-8") from error
     elif raw.startswith("@"):
         path = raw[1:]
         if not path:
             raise CliUsageError(f"{label} file path is empty")
         try:
             text = Path(path).read_text(encoding="utf-8")
-        except OSError as error:
-            raise CliUsageError(f"cannot read {label} file") from error
+        except (OSError, UnicodeDecodeError) as error:
+            raise CliUsageError(f"cannot read {label} file as UTF-8") from error
     else:
         text = raw
     return decode_one_object(text, label=label)
 
 
-def default_contract(strategy: str, raw: str | None, stdin: TextIO) -> dict[str, object]:
-    """Return the closed default sequential contract or read an explicit file."""
+def default_contract(strategy: str, raw: str | None, stdin: TextIO, *, params: str | None = None) -> dict[str, object]:
+    """Return the closed default sequential contract or read an explicit one from ``@FILE`` or ``-`` (stdin)."""
     if raw is None:
         if strategy != "sequential":
-            raise CliUsageError(f"{strategy} strategy requires --contract @FILE")
+            raise CliUsageError(f"{strategy} strategy requires --contract @FILE or -")
         return {"version": 1}
-    if not raw.startswith("@"):
-        raise CliUsageError("--contract must use @FILE")
+    if raw != "-" and not raw.startswith("@"):
+        raise CliUsageError("--contract must use @FILE or -")
+    if raw == "-" and params == "-":
+        raise CliUsageError("--contract and --params cannot both read stdin")
     return read_json_source(raw, label="contract", stdin=stdin)
 
 
@@ -195,15 +203,17 @@ def _control_options(raw: Mapping[str, object], *, label: str) -> tuple[Paramete
     return limit_path, allow_create
 
 
-def _offset(raw: object) -> OffsetSpec:
+def _offset(raw: object, *, counted: bool) -> OffsetSpec:
+    # A counted traversal ends at the server's exact total, which it requires; a sequential one ends at an empty page.
+    termination = TotalTermination.EXACT_QUALIFIED if counted else TotalTermination.DISABLED
     if raw is None:
-        return OffsetSpec()
+        return OffsetSpec(total_termination=termination)
     if not isinstance(raw, dict):
         raise CliUsageError("offset must be an object")
     _closed(raw, {"parameter_path", "limit_path", "allow_create_controls"}, label="offset")
     path = _path(raw.get("parameter_path"), label="offset.parameter_path")
     limit_path, allow_create = _control_options(raw, label="offset")
-    return OffsetSpec(cast("ParameterPath", path), limit_path, allow_create)
+    return OffsetSpec(cast("ParameterPath", path), limit_path, allow_create, total_termination=termination)
 
 
 def _keyset(raw: object) -> KeysetSpec:
@@ -247,7 +257,7 @@ def parse_keyset_execution(payload: Mapping[str, JsonValue] | None) -> KeysetExe
         "sequential": {"kind"},
         "range": common | {"window_width"},
         "partitioned": common | {"target_lanes"},
-        "auto": common | {"target_lanes", "range_window_width", "max_range_waves", "total_hint"},
+        "auto": common | {"target_lanes", "range_window_width", "total_hint"},
     }
     _closed(payload, allowed[kind], label="execution")
     if kind == "sequential":
@@ -277,7 +287,6 @@ def parse_keyset_execution(payload: Mapping[str, JsonValue] | None) -> KeysetExe
             batch_size=batch_size,
             target_lanes=cast("int", payload.get("target_lanes", 20)),
             range_window_width=cast("int | None", payload.get("range_window_width")),
-            max_range_waves=cast("int", payload.get("max_range_waves", 2)),
             total_hint=TotalHintMode(payload.get("total_hint", TotalHintMode.IGNORE.value)),
         )
     except (TypeError, ValueError) as error:
@@ -377,7 +386,7 @@ def parse_list_contract(strategy: str, contract: dict[str, object]) -> ListContr
     identity = _identity(contract.get("identity"), required=strategy in {"counted", "keyset"})
     mechanics: OffsetSpec | KeysetSpec | CursorSpec
     if strategy in {"sequential", "counted"}:
-        mechanics = _offset(contract.get("offset"))
+        mechanics = _offset(contract.get("offset"), counted=strategy == "counted")
     elif strategy == "keyset":
         mechanics = _keyset(contract.get("keyset"))
     else:

@@ -6,10 +6,12 @@ import gc
 import gzip
 import json
 import logging
+import traceback
 import tracemalloc
 import weakref
 import zlib
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal
 
 import httpx
 import pytest
@@ -31,7 +33,8 @@ from .live import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
-    from pathlib import Path
+
+    from b24api._webhook import WebhookSecrets
 
 EXPECTED_PREFLIGHT_CALLS = 2
 
@@ -136,6 +139,63 @@ def test_live_transport_error_drops_credentialed_httpx_cause_and_locals(
     _assert_live_error_redacted(captured.value, sensitive_fragment)
 
 
+@pytest.mark.parametrize("hook_point", ["request", "response"])
+def test_live_non_httpx_client_failure_drops_credentialed_request_text_and_locals(
+    monkeypatch: pytest.MonkeyPatch,
+    hook_point: str,
+) -> None:
+    # An event hook, auth flow or mounted transport may raise any exception, quoting the method URL. Only
+    # HTTPX errors used to be caught: the exception escaped with the token in its text, and the frame's
+    # request local rendered it under capture_locals.
+    sensitive_fragment = "not-a-secret"
+
+    def hook(message: httpx.Request | httpx.Response) -> None:
+        url = message.url if isinstance(message, httpx.Request) else message.request.url
+        raise RuntimeError(f"synthetic hook failure for {url}")
+
+    with _portal(monkeypatch, lambda _request: httpx.Response(200, json={"result": []})) as portal:
+        portal._client.event_hooks[hook_point] = [hook]  # noqa: SLF001 - inject a hook into the owned client
+        with pytest.raises(LiveCorrectnessError, match="live HTTP client raised RuntimeError") as captured:
+            portal.call("scope")
+
+    # The text, the chain and every local of the harness frames are checked, which capture_locals renders.
+    _assert_live_error_redacted(captured.value, sensitive_fragment)
+
+
+def _refuse_connection(request: httpx.Request) -> None:
+    raise httpx.ConnectError("synthetic", request=request)
+
+
+@pytest.mark.parametrize("chain", ["none", "context", "cause"])
+@pytest.mark.parametrize("escape", [KeyboardInterrupt, SystemExit])
+def test_live_interrupt_leaves_without_credentialed_frames_or_locals(
+    monkeypatch: pytest.MonkeyPatch,
+    escape: type[BaseException],
+    chain: Literal["none", "context", "cause"],
+) -> None:
+    # An interrupt raised inside the HTTP client is no failure to classify: it leaves as it is, but without the
+    # frames it was raised through, whose locals held the credential-bearing request, and without its chain,
+    # which may be HTTPX's own error holding that request, implicitly or as the cause.
+    sensitive_fragment = "not-a-secret"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if chain == "none":
+            raise escape("synthetic interrupt")
+        try:
+            _refuse_connection(request)
+        except httpx.ConnectError as interrupted:
+            if chain == "cause":
+                raise escape("synthetic interrupt") from interrupted
+            raise escape("synthetic interrupt")  # noqa: B904 - the implicit context is what is under test
+
+    with _portal(monkeypatch, handler) as portal, pytest.raises(escape) as captured:
+        portal.call("scope")
+
+    _assert_live_error_redacted(captured.value, sensitive_fragment)
+    frames = traceback.extract_tb(captured.value.__traceback__)
+    assert {Path(frame.filename).name for frame in frames} <= {"live.py", Path(__file__).name}
+
+
 @pytest.mark.parametrize("configuration_case", ["fingerprint", "webhook"])
 def test_live_portal_configuration_error_drops_credential_locals(
     monkeypatch: pytest.MonkeyPatch,
@@ -197,7 +257,7 @@ def test_live_portal_webhook_vault_is_opaque_and_gc_bounded(monkeypatch: pytest.
 
     assert reference() is None
     with pytest.raises(LiveUnavailableError, match="credential is unavailable"):
-        live_module._webhook_for(handle)  # noqa: SLF001 - lifecycle regression
+        live_module._token_for(handle)  # noqa: SLF001 - lifecycle regression
     client.close()
 
 
@@ -622,6 +682,22 @@ def test_live_deflate_fed_one_byte_at_a_time_decodes_once(wbits: int) -> None:
     assert _bounded_response_payload(response, method="scope") == payload
 
 
+def test_live_gzip_cut_before_its_trailer_is_a_decoding_failure() -> None:
+    encoded = gzip.compress(json.dumps({"result": ["x" * 1024]}).encode())
+    response = httpx.Response(200, headers={"content-encoding": "gzip"}, stream=_RawSyncStream(encoded[:-8]))
+
+    with pytest.raises(LiveCorrectnessError, match="decoding failed"):
+        _bounded_response_payload(response, method="scope")
+
+
+def test_live_multi_member_gzip_is_decoded_whole() -> None:
+    payload = json.dumps({"result": ["x" * 1024]}).encode()
+    encoded = gzip.compress(payload[:10]) + gzip.compress(payload[10:])
+    response = httpx.Response(200, headers={"content-encoding": "gzip"}, stream=_RawSyncStream(encoded))
+
+    assert _bounded_response_payload(response, method="scope") == payload
+
+
 @pytest.mark.parametrize("coding", ["br", "zstd", "unknown"])
 def test_live_unbounded_codings_are_refused_as_decoding_failures(coding: str) -> None:
     stream = _RawSyncStream(b"opaque")
@@ -723,3 +799,36 @@ def test_live_portal_holds_its_shield_registration_exactly_for_its_lifetime(
     with pytest.raises(LiveUnavailableError, match="client configuration"):
         LivePortal(role="admin_full")
     assert HTTPX_LOG_SHIELD._transports == initial  # noqa: SLF001 - a failed initialization leaves none
+
+
+def test_live_portal_registers_and_claims_only_the_webhook_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    token = "live" + "-token-" + "xyz"
+    claimed: list[WebhookSecrets] = []
+    network_client = httpx.Client
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        claimed.append(request.extensions["b24api_log_owner"].credentials)
+        return httpx.Response(200, json={"result": {"ID": "7"}})
+
+    def offline_client(**options: float | bool) -> httpx.Client:
+        return network_client(transport=httpx.MockTransport(handler), **options)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(httpx, "Client", offline_client)
+    key = base64.urlsafe_b64encode(bytes(range(32))).decode().rstrip("=")
+    monkeypatch.setenv("BITRIX24_EVIDENCE_FINGERPRINT_KEY", key)
+    monkeypatch.setenv("BITRIX24_API_WEBHOOK_URL", "https://example.invalid" + "/rest/7/" + token + "/")
+    with LivePortal(role="admin_full") as portal:
+        registered = HTTPX_LOG_SHIELD.registered_secrets()
+        assert registered.found_in(token)
+        assert not registered.found_in("7")
+        assert portal.call_envelope("profile")["result"] == {"ID": "7"}
+    assert [(len(credentials), credentials.found_in(token)) for credentials in claimed] == [(1, True)]
+
+
+def test_live_refused_shield_entry_drops_the_method_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    with _portal(monkeypatch, lambda _request: httpx.Response(200, json={"result": []})) as portal:
+        monkeypatch.setattr(HTTPX_LOG_SHIELD, "_transports", 0)
+        with pytest.raises(RuntimeError, match="no registered transport") as refused:
+            portal.call_envelope("profile")
+        monkeypatch.undo()
+    _assert_live_error_redacted(refused.value, "not-a-secret")

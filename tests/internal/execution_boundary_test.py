@@ -1,7 +1,6 @@
 """Executor boundary: replay decision matrix, foreign transport failures and the response ceiling."""
 
 from __future__ import annotations
-import asyncio
 import json
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
@@ -11,8 +10,9 @@ import pytest
 
 from b24api import BatchFailed, Bitrix24, ReplaySafety, Request, Settings, TerminalState
 from b24api._error_types import FailurePhase
-from b24api.batch.engine import BatchExecutor
-from b24api.batch.outcome import BatchFailure
+from b24api.batch.correlation import _Command
+from b24api.batch.engine import BatchExecutor, _Follows, _Lineup, _Round, _Waiting
+from b24api.batch.outcome import BatchFailure, BatchSuccess
 from b24api.contracts import Command, CommandFailure, CommandOutcomeUnknown, CommandSuccess, ReplayDisposition
 from b24api.contracts.policy import AmbiguityPolicy, AmbiguityReason, ExecutionPolicy, RetryPolicy
 from b24api.contracts.request import RouteKind
@@ -22,6 +22,7 @@ from b24api.errors import (
     BatchCommandError,
     BudgetExceededError,
     CapabilityError,
+    ClientClosedError,
     EnvelopeContractError,
     HTTPGatewayError,
     ResponseTooLargeError,
@@ -29,8 +30,11 @@ from b24api.errors import (
 )
 from b24api.execution import Executor, HttpxTransport, WireResponse
 from b24api.execution import executor as executor_module
+from b24api.execution.executor import _Lineage, _Pause, _RequestAttempts, _RoundPlan, _SendPlan, _Settled
+from b24api.execution.facts import Execution, execution
 from b24api.transport.base import TransportCapabilities, WireRequest
 from b24api.transport.protocol import ProtocolCodec
+from tests.scripting import ResponderTransport, always, drain_to_failure
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
@@ -94,6 +98,13 @@ def _request(safety: ReplaySafety, name: str = "sample.get") -> Request:
 
 async def _drain(stream: OperationStream[CommandOutcome[int]]) -> list[CommandOutcome[int]]:
     return [outcome async for outcome in stream]
+
+
+async def _drain_to_request_budget(stream: OperationStream[CommandOutcome[int]]) -> list[CommandOutcome[int]]:
+    """Drain a stream the request budget ends: each admitted command's outcome, then the budget's own failure."""
+    outcomes, error = await drain_to_failure(stream, BudgetExceededError)
+    assert str(error) == "physical request budget exhausted"
+    return outcomes
 
 
 # --- A3 --------------------------------------------------------------------------------------
@@ -240,7 +251,9 @@ async def test_physical_batch_replay_matrix(
             assert outcome.error is raised[0]
             assert outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
         assert stream.report.failures == count
-    assert stream.report.physical_requests == len(transport.sent)
+    # A transport that refuses a send for good before it leaves the process sent nothing: no physical request.
+    refused_unsent = phase is FailurePhase.NOT_DISPATCHED and not retryable
+    assert stream.report.physical_requests == (0 if refused_unsent else len(transport.sent))
     assert stream.report.batch_requests == 1
 
 
@@ -657,7 +670,7 @@ async def test_a_replay_round_that_was_sent_keeps_its_own_outcome_when_the_budge
         [Command(_request(ReplaySafety.SAFE, "user.get"), 0)], policy=_policy(max_requests=2)
     )
 
-    (outcome,) = await _drain(stream)
+    (outcome,) = await _drain_to_request_budget(stream)
 
     assert len(transport.sent) == 2  # noqa: PLR2004 - the refused batch and the replay the budget ends
     assert isinstance(outcome, CommandOutcomeUnknown)
@@ -671,7 +684,7 @@ async def test_a_replay_round_that_was_sent_keeps_its_own_outcome_when_the_budge
     # A replay refused with a listed status ran nothing, so the stop after it keeps the refusal.
     refused = _Script([])
     _refused_then(refused, _status(refused, HTTP_TOO_MANY_REQUESTS))
-    (still_refused,) = await _drain(
+    (still_refused,) = await _drain_to_request_budget(
         _client(refused).batch_outcomes(
             [Command(_request(ReplaySafety.UNSAFE, "tasks.task.add"), 0)], policy=_policy(max_requests=2)
         )
@@ -683,7 +696,7 @@ async def test_a_replay_round_that_was_sent_keeps_its_own_outcome_when_the_budge
     # Control: a budget that stops the replay before it is sent leaves the refusal the command received.
     stopped = _Script([])
     _refused_then(stopped, _counting(stopped))
-    (kept,) = await _drain(
+    (kept,) = await _drain_to_request_budget(
         _client(stopped).batch_outcomes(
             [Command(_request(ReplaySafety.UNSAFE, "tasks.task.add"), 0)], policy=_policy(max_requests=1)
         )
@@ -769,11 +782,10 @@ async def test_an_unknown_outcome_is_explained_by_the_send_that_may_have_run() -
 @pytest.mark.asyncio
 @pytest.mark.parametrize("replay", ["success", "status"])
 @pytest.mark.parametrize("rounds", [1, 2], ids=["first-round", "replay-round"])
-async def test_a_batch_answered_after_the_time_budget_reports_its_unsafe_command_unknown(
-    replay: str, rounds: int
-) -> None:
-    # Bitrix answered, but the time budget ran out before the answer was classified: an UNSAFE creation in that
-    # batch may have run, whether it was the first batch or a replay after a quota refusal.
+async def test_a_batch_answered_after_the_time_budget_keeps_its_answer(replay: str, rounds: int) -> None:
+    # Bitrix answered, but the time budget ran out before the answer was classified, whether it was the first
+    # batch or a replay after a quota refusal. A success is returned, and a failure meets the ambiguity rules:
+    # an UNSAFE creation answered by a 502 may have run.
     now = [0.0]
     transport = _Script([])
 
@@ -793,13 +805,14 @@ async def test_a_batch_answered_after_the_time_budget_reports_its_unsafe_command
     (outcome,) = await BatchExecutor(executor).execute_requests((request,), context=executor.context(_policy()))
 
     assert len(transport.sent) == rounds
+    if replay == "success":
+        assert isinstance(outcome, BatchSuccess)
+        return
     assert isinstance(outcome, BatchFailure)
     assert isinstance(outcome.error, AmbiguousExecutionError)
-    assert isinstance(outcome.error.__cause__, BudgetExceededError)
+    assert isinstance(outcome.error.__cause__, HTTPGatewayError)
     assert outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
-    assert outcome.error.reason is (
-        AmbiguityReason.DEADLINE_AFTER_DISPATCH if replay == "success" else AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
-    )
+    assert outcome.error.reason is AmbiguityReason.HTTP_STATUS_AFTER_DISPATCH
 
 
 @pytest.mark.asyncio
@@ -1069,8 +1082,11 @@ class _ForeignBaseException(BaseException):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("signal", [asyncio.CancelledError, _ForeignBaseException])
-async def test_cancellation_and_base_exceptions_are_never_converted(signal: type[BaseException]) -> None:
+async def test_base_exceptions_are_never_converted() -> None:
+    # A cancellation is never converted either when its task was cancelled; one nobody requested ends the send it
+    # reached as a transport failure (tests/lifecycle_close_test.py covers both).
+    signal = _ForeignBaseException
+
     def behavior(_request: Request) -> WireResponse:
         raise signal("stop")
 
@@ -1376,7 +1392,7 @@ async def test_closed_default_transport_refuses_before_dispatch_without_implying
         sends.clear()
         await (transport.aclose() if closed == "transport" else http_client.aclose())
         for safety in (ReplaySafety.UNSAFE, ReplaySafety.SAFE):
-            with pytest.raises(TransportError, match=refusal) as refused:
+            with pytest.raises(ClientClosedError, match=refusal) as refused:
                 await client.call(_request(safety), policy=_policy())
             assert refused.value.phase is FailurePhase.NOT_DISPATCHED
             assert refused.value.retryable is False
@@ -1387,10 +1403,82 @@ async def test_closed_default_transport_refuses_before_dispatch_without_implying
         assert len(outcomes) == 2  # noqa: PLR2004
         for outcome in outcomes:
             assert isinstance(outcome, CommandFailure)
-            assert isinstance(outcome.error, TransportError)
+            assert isinstance(outcome.error, ClientClosedError)
             assert outcome.error.phase is FailurePhase.NOT_DISPATCHED
             assert outcome.error.retryable is False
         assert sends == []
     finally:
         await transport.aclose()
         await http_client.aclose()
+
+
+def test_a_send_consumes_the_wait_before_it() -> None:
+    # A wait that left a send too little window is the next send's own: once sent, it limits no later send.
+    attempts = _RequestAttempts()
+    attempts.pause = _Pause(backoff=1.0, held=0.0, window=3.0, planned_at=0.0)
+    with pytest.raises(BudgetExceededError, match="shorter than the wait") as refused:
+        attempts.admit(0.5, ReplaySafety.UNSAFE, now=1.0)
+    # The refusal belongs to its round alone.
+    assert attempts.refusal is refused.value
+    attempts.start_round()
+    assert attempts.refusal is None
+    attempts.dispatched()
+    attempts.admit(0.5, ReplaySafety.UNSAFE, now=1.0)
+    assert attempts.pause is None
+
+
+_SAFE_HOLD = 20.0
+
+
+@pytest.mark.asyncio
+async def test_a_replay_round_carries_a_safe_send_only_when_its_unrepeatable_sends_cannot_wait_for_it() -> None:
+    # A SAFE command's method is held 20 seconds, which fits a 30-second window for SAFE work; an UNSAFE command's
+    # 1-second backoff fits too. The round waits the UNSAFE send's second and carries the SAFE one to a later
+    # round; fail-fast, it waits the 20 seconds, which the UNSAFE send cannot fit twice, so nothing is sent. With
+    # SAFE sends alone the round waits the 20 seconds and sends both, since its sends share their attempts.
+    executor = Executor(ResponderTransport(always(WireResponse(200, (), b"{}"))), clock=lambda: 0.0)
+    executor.coordinator.hold_method("crm.item.get", _SAFE_HOLD)
+    policy = ExecutionPolicy(max_retry_elapsed_per_request=30.0, retry=RetryPolicy(initial_delay=1.0, jitter=0))
+    context = executor.context(policy)
+    sends = ((ReplaySafety.SAFE, frozenset({"crm.item.get"})), (ReplaySafety.UNSAFE, frozenset({"crm.item.add"})))
+    safe_only = ((ReplaySafety.SAFE, frozenset({"crm.item.get"})), (ReplaySafety.SAFE, frozenset({"crm.item.list"})))
+
+    plan = executor.plan_replay(context, attempts=_RequestAttempts(started=0.0, used=1), sends=sends)
+    whole = executor.plan_replay(context, attempts=_RequestAttempts(started=0.0, used=1), sends=sends, whole=True)
+    safe = executor.plan_replay(context, attempts=_RequestAttempts(started=0.0, used=1), sends=safe_only)
+    await executor.coordinator.close()
+
+    assert plan is not None
+    assert plan.plans == (_SendPlan.CARRY, _SendPlan.SEND)
+    assert plan.pause.delay == 1.0
+    assert whole is not None
+    assert whole.plans == (_SendPlan.REFUSE, _SendPlan.REFUSE)
+    assert safe is not None
+    assert safe.plans == (_SendPlan.SEND, _SendPlan.SEND)
+    assert safe.pause.delay == _SAFE_HOLD
+
+
+def test_a_replay_round_that_carries_a_send_must_send_one() -> None:
+    pause = _Pause(backoff=1.0, held=0.0, window=3.0, planned_at=0.0)
+    with pytest.raises(ValueError, match="must send one"):
+        _RoundPlan(pause, (_SendPlan.CARRY, _SendPlan.REFUSE))
+    assert _RoundPlan(pause, (_SendPlan.CARRY, _SendPlan.SEND)).sends(_SendPlan.SEND) == (1,)
+
+
+def test_a_round_refused_at_its_send_leaves_its_commands_following_the_envelope_refusal() -> None:
+    # The SAFE command followed a 429 refusal of its envelope; its next round is refused at its send, and its
+    # replay is then stopped: it ends caused by the 429, not by the refusal at the send, which proved nothing.
+    command = _Command(0, "c000000000000", Request("crm.item.get", {}, ReplaySafety.SAFE, route=RouteKind.BARE), None)
+    refusal = HTTPGatewayError("HTTP gateway error 429")
+    lineup = _Lineup(waiting={0: _Waiting(_Follows(refusal), _Lineage(_Settled.ANSWERED))})
+    withheld = BudgetExceededError("retry window left after the wait is shorter than the wait")
+    unsent = _Round((BatchFailure(0, command.stable_key, command.request, withheld),), _Lineage(), (command,), withheld)
+
+    candidates = lineup.after_round(unsent, (command,))
+    lineup.stop(candidates, BudgetExceededError("per-request attempt budget exhausted"))
+
+    (outcome,) = lineup.settled.values()
+    assert isinstance(outcome, BatchFailure)
+    assert isinstance(outcome.error, BudgetExceededError)
+    assert outcome.error.__cause__ is refusal
+    assert execution(outcome.error) is Execution.ANSWERED

@@ -15,7 +15,7 @@ from b24api.contracts.policy import (
 from b24api.contracts.positional import PositionalControlError
 from b24api.contracts.request import IdentitySpec, ParameterPath, Request, TraversalIdentity
 from b24api.contracts.response import Response, inject_controls
-from b24api.errors import CapabilityError, PaginationError
+from b24api.errors import CapabilityError
 from b24api.traversal.identity_ledger import _ExternalIdentityStore
 from b24api.traversal.plans import (
     ContinuationPlan,
@@ -36,7 +36,6 @@ if TYPE_CHECKING:
 
     from b24api.contracts.identity_store import IdentityStore
     from b24api.contracts.json import JsonValue
-    from b24api.contracts.report import PageRejectionCode
     from b24api.execution import ExecutionContext
     from b24api.traversal.values import IdentityValue
 
@@ -51,16 +50,6 @@ _PLAN_TYPES = (
     ContinuationPlan,
     InclusiveWindowPlan,
 )
-
-
-class _PageRejectionError(PaginationError):
-    """Pagination error carrying a stable page-evidence category."""
-
-    report_name = "PaginationError"
-
-    def __init__(self, message: str, rejection_code: PageRejectionCode) -> None:
-        self.rejection_code = rejection_code
-        super().__init__(message)
 
 
 class _IdentityStore(Protocol):
@@ -189,9 +178,10 @@ def _request_with_controls(
         )
     try:
         parameters = request.copy_parameters()
-        for path in replace:
-            if path in updates:
-                _replace_owned_control(parameters, path, updates[path], allow_create=allow_create)
+        # In the order of ``updates``: a control missing from the request is created in that order.
+        for path, value in updates.items():
+            if path in replace:
+                _replace_owned_control(parameters, path, value, allow_create=allow_create)
         remaining = {path: value for path, value in updates.items() if path not in replace}
         parameters = inject_controls(parameters, remaining, allow_create=allow_create)
     except (KeyError, TypeError, ValueError) as error:
@@ -245,6 +235,34 @@ def _replace_owned_control(  # noqa: C901, PLR0912 - exact nested path replaceme
         current[final] = replacement
 
 
+def _path_lookup(
+    parameters: object,
+    path: ParameterPath,
+    *,
+    case_sensitive: bool = False,
+) -> tuple[bool, object]:
+    current = parameters
+    for part in path.path:
+        if isinstance(part, str):
+            if not isinstance(current, dict):
+                return False, None
+            matches = (
+                [part]
+                if case_sensitive and part in current
+                else ([] if case_sensitive else [key for key in current if key.casefold() == part.casefold()])
+            )
+            if len(matches) > 1:
+                raise CapabilityError("request contains a case-insensitively ambiguous traversal control")
+            if not matches:
+                return False, None
+            current = current[matches[0]]
+        else:
+            if not isinstance(current, list) or part >= len(current):
+                return False, None
+            current = current[part]
+    return True, current
+
+
 def _child_path(parent: ParameterPath, child: str) -> ParameterPath:
     return ParameterPath((*parent.path, child))
 
@@ -288,8 +306,6 @@ def _validate_confirmation_policy(
 ) -> None:
     if policy is ConfirmationPolicy.NONE:
         return
-    if policy is ConfirmationPolicy.INDEPENDENT_ORACLE:
-        raise CapabilityError("independent oracle confirmation is unavailable inside traversal")
     if policy is ConfirmationPolicy.QUALIFIED_TOTAL:
         if total_semantics is not TotalSemantics.FILTERED_EXACT:
             raise CapabilityError("qualified-total confirmation requires filtered exact total semantics")
@@ -301,11 +317,9 @@ def _validate_confirmation_policy(
             or (isinstance(plan, ItemCursorPlan) and plan.terminal is CursorTerminalRule.EMPTY_CONFIRMATION)
         )
         if not empty_confirmed:
+            # A server-next offset traversal ends at its page without next: a request past it would be
+            # answered by a rounding endpoint with its last page again, so no empty page can confirm it.
             raise CapabilityError("plan does not provide the requested empty-boundary confirmation")
-        return
-    if policy is ConfirmationPolicy.BOUNDARY_ID_SEEN:
-        if not isinstance(plan, KeysetPlan) or plan.terminal is not KeysetTerminalRule.BOUNDARY_ID_SEEN:
-            raise CapabilityError("plan does not provide the requested boundary identity confirmation")
         return
     raise AssertionError("unhandled confirmation policy")
 

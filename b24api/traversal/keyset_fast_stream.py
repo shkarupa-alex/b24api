@@ -1,15 +1,11 @@
 """Fast-keyset lifecycle adapter and terminal report construction."""
 
-# ruff: noqa: TRY301
-
 from __future__ import annotations
-import asyncio
-from collections import deque
 from typing import TYPE_CHECKING, Self
 
 from b24api.completion.fast_recorder import FastCompletionRecorder
 from b24api.contracts.completion import CleanupState
-from b24api.contracts.json import FrozenJson, JsonValue, thaw_json
+from b24api.contracts.json import JsonValue, thaw_json
 from b24api.contracts.policy import (
     CompletionAssurance,
     KernelState,
@@ -17,22 +13,35 @@ from b24api.contracts.policy import (
     SnapshotRequirement,
     SnapshotState,
 )
-from b24api.contracts.report import (
-    Violation,
-    ViolationSeverity,
-)
 from b24api.errors import B24ApiError, BudgetExceededError, IncompleteTraversalError, PaginationError
-from b24api.execution.context import await_cancellation_resistant, await_cleanup_resistant, rearm_cancellation
-from b24api.execution.failure import attach_report as _attach_report
+from b24api.execution.lifecycle import (
+    CleanupAttempt,
+    LifecycleHooks,
+    OperationRunner,
+    TerminalCause,
+    cleanup_failed,
+    failed_kernel_report,
+    kernel_terminal,
+    with_cleanup_attempt,
+)
 from b24api.execution.snapshot import KernelReport
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+
     from b24api.completion.gate import CompletionGate
+    from b24api.execution.context import ExecutionContext
     from b24api.traversal.keyset_runtime import KeysetRuntime
+
+# The failures that leave a fast keyset traversal incomplete rather than failed.
+_INCOMPLETE = (IncompleteTraversalError, PaginationError, BudgetExceededError)
 
 
 class KeysetFastStream:
-    """Single-use lifecycle shell around the fast keyset runtime."""
+    """Single-use lifecycle shell around the fast keyset runtime; ``OperationRunner`` owns its termination."""
+
+    # Every wave is read inside a read; nothing runs between reads.
+    works_between_reads = False
 
     def __init__(self, runtime: KeysetRuntime) -> None:
         """Initialize without starting planning or I/O."""
@@ -41,95 +50,67 @@ class KeysetFastStream:
             raise TypeError("a flat fast keyset stream owns its own completion gate")
         self._runtime = runtime
         self._recorder = recorder
-        self._buffer: deque[FrozenJson] = deque()
-        self._closed = False
         self.report = KernelReport()
+        self._runner: OperationRunner[JsonValue, KernelReport] = OperationRunner(
+            self._run(),
+            LifecycleHooks(
+                finalize=self._finalize,
+                failure_report=self._failure_report,
+                cleanup=runtime.aclose,
+                propagate=self._propagate,
+            ),
+            isolated_pulls=False,
+        )
 
     def __aiter__(self) -> Self:
         """Return this single-use async iterator."""
         return self
 
     @property
+    def operation_context(self) -> ExecutionContext:
+        """Return the operation context whose elapsed budget bounds the wrapper's cleanup."""
+        return self._runtime.context.execution_context
+
+    @property
     def completion_gate(self) -> CompletionGate:
         """Expose the active fast-keyset completion evidence to the public adapter."""
         return self._recorder.gate
 
+    @property
+    def cleanup_failure(self) -> BaseException | None:
+        """Return the cleanup failure this stream raised as its end (``OperationRunner.cleanup_failure``)."""
+        return self._runner.cleanup_failure
+
     async def __anext__(self) -> JsonValue:
-        """Return the next admitted row or finalize terminal evidence."""
-        if self._closed:
-            raise StopAsyncIteration
-        try:
-            while not self._buffer:
-                rows = await self._runtime.next_rows()
-                if not rows:
-                    await self._terminate(KernelState.COMPLETED, "fast keyset traversal completed")
-                    self._closed = self._runtime.closed
-                    raise StopAsyncIteration
-                self._buffer.extend(rows)
-            item = self._buffer.popleft()
-            self._runtime.mark_emitted(1)
-            return thaw_json(item)
-        except StopAsyncIteration:
-            raise
-        except asyncio.CancelledError as error:
-            await self._terminate(KernelState.CANCELLED, "iteration cancelled", primary=error)
-            _attach_report(error, self.report)
-            self._closed = self._runtime.closed
-            raise
-        except (IncompleteTraversalError, PaginationError, BudgetExceededError) as error:
-            await self._terminate(KernelState.INCOMPLETE, type(error).__name__, primary=error)
-            cause = error.error if isinstance(error, IncompleteTraversalError) else error
-            incomplete = IncompleteTraversalError(
-                report=self.report,
-                error=cause if isinstance(cause, B24ApiError) else None,
-                replay_disposition=(
-                    error.replay_disposition
-                    if isinstance(error, IncompleteTraversalError)
-                    else getattr(error, "replay_disposition", ReplayDisposition.NOT_ELIGIBLE)
-                ),
-            )
-            self._closed = self._runtime.closed
-            raise incomplete from cause
-        except BaseException as error:
-            await self._terminate(KernelState.FAILED, type(error).__name__, primary=error)
-            _attach_report(error, self.report)
-            self._closed = self._runtime.closed
-            raise
+        """Return the next admitted row; the read that ends the traversal publishes the report."""
+        return await anext(self._runner)
 
     async def aclose(self) -> None:
         """Close early, release runtime resources, and freeze the report."""
-        if self._closed:
-            return
-        await self._terminate(KernelState.CANCELLED, "stream closed before exhaustion")
+        await self._runner.aclose()
 
-    async def _terminate(self, state: KernelState, reason: str, *, primary: BaseException | None = None) -> None:
-        self._buffer.clear()
-        outcome = await await_cleanup_resistant(self._runtime.aclose())
-        cleanup = outcome.error
-        if cleanup is not None:
-            self._runtime.violations.append(
-                Violation(ViolationSeverity.BLOCKING, "cleanup_failure", type(cleanup).__name__),
-            )
-        if cleanup is not None and state is KernelState.COMPLETED:
-            state, reason = KernelState.FAILED, "fast keyset cleanup failed"
-        finalize_cancellation = await await_cancellation_resistant(self._finalize(state, reason))
-        cancellation = finalize_cancellation or outcome.cancellation
-        self._closed = self._runtime.closed
-        if cleanup is not None and primary is not None:
-            primary.add_note(f"fast keyset cleanup also failed ({type(cleanup).__name__})")
-        if cleanup is not None and primary is None:
-            _attach_report(cleanup, self.report)
-            rearm_cancellation(cancellation)
-            raise cleanup
-        if cancellation is not None and primary is None:
-            _attach_report(cancellation, self.report)
-            raise cancellation
-        if cancellation is not None and not isinstance(primary, asyncio.CancelledError):
-            rearm_cancellation(cancellation)
+    async def _run(self) -> AsyncGenerator[JsonValue]:
+        while rows := await self._runtime.next_rows():
+            for row in rows:
+                self._runtime.mark_emitted(1)
+                yield thaw_json(row)
 
-    async def _finalize(self, state: KernelState, reason: str) -> None:
-        if self.report.state is not KernelState.NOT_STARTED:
-            return
+    def _propagate(self, error: BaseException, report: KernelReport) -> BaseException:
+        # A failed command's IncompleteTraversalError is raised as is, with the report the runner attaches to it.
+        if isinstance(error, IncompleteTraversalError) or not isinstance(error, _INCOMPLETE):
+            return error
+        return IncompleteTraversalError(
+            report=report,
+            error=error if isinstance(error, B24ApiError) else None,
+            replay_disposition=getattr(error, "replay_disposition", ReplayDisposition.NOT_ELIGIBLE),
+        )
+
+    async def _finalize(self, cause: TerminalCause, failure: str | None, attempt: CleanupAttempt) -> KernelReport:
+        state, reason = kernel_terminal(cause, failure)
+        if cause is TerminalCause.EXHAUSTED:
+            reason = "fast keyset traversal completed"
+        elif isinstance(primary := self._runner.primary_error, _INCOMPLETE):
+            state, reason = KernelState.INCOMPLETE, type(primary).__name__
         snapshot = await self._runtime.context.snapshot()
         snapshot_state = (
             SnapshotState.NOT_REQUESTED
@@ -159,13 +140,12 @@ class KeysetFastStream:
             page_trace_truncated=any(dropped.values()),
             keyset_execution=self._runtime.report_fragment(),
         )
+        self.report = with_cleanup_attempt(self.report, cause, attempt)
         counters = self._runtime.counters
-        cleanup = (
-            CleanupState.FAILURE
-            if any(violation.code == "cleanup_failure" for violation in self._runtime.violations)
-            else CleanupState.SUCCESS
-        )
+        cleanup = CleanupState.FAILURE if cleanup_failed(cause, attempt) else CleanupState.SUCCESS
         closure, qualified_witnesses = self._runtime.completion_closure()
+        # As in every family, the gate gets how the traversal ended before its cleanup and the cleanup's outcome
+        # apart: a traversal read to its end whose close failed is a natural end the failed cleanup leaves incomplete.
         self._recorder.terminal(
             state,
             rows_emitted=counters.emitted_rows,
@@ -174,6 +154,16 @@ class KeysetFastStream:
             closure=closure,
             qualified_witnesses=qualified_witnesses,
         )
+        return self.report
+
+    def _failure_report(self, cause: TerminalCause, reason: str, attempt: CleanupAttempt) -> KernelReport:
+        # The finalizer raised: publish the fallback as this kernel's report and close its completion gate,
+        # so the public adapter over it can still publish its one FAILED report.
+        self.report = failed_kernel_report(cause, reason, attempt)
+        self._recorder.gate.close_after_failure(
+            CleanupState.FAILURE if cleanup_failed(cause, attempt) else CleanupState.SUCCESS
+        )
+        return self.report
 
 
 __all__ = ["KeysetFastStream"]

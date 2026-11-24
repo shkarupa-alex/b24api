@@ -1,7 +1,7 @@
 """One explicit, method-agnostic b24api public surface.
 
 The root exports the names a typical application needs. Every other public name lives in one of the
-public aggregators listed in ``b24api.migration.PUBLIC_NAMESPACES``. A name that left the root in 3.0
+public aggregators listed in ``b24api.migration.PUBLIC_NAMESPACES``. A name that left the root in 2.4
 does not resolve here; ``b24api.Name`` raises an ``AttributeError`` naming its new import path.
 """
 
@@ -131,4 +131,4 @@ if not TYPE_CHECKING:
         # Loaded on first use, so ``python -m b24api.migration`` does not find it already imported.
         package = importlib.import_module("b24api.migration").ROOT_MOVES.get(name)
         message = f"module 'b24api' has no attribute {name!r}"
-        raise AttributeError(message if package is None else f"{message}; it moved to {package}.{name} in 3.0")
+        raise AttributeError(message if package is None else f"{message}; it moved to {package}.{name}")

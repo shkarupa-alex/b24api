@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import warnings
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -27,6 +27,8 @@ from b24api.contracts import (
     KeysetSpec,
     NotExecutedReason,
     OffsetSpec,
+    PageOutcome,
+    PageRejectionCode,
     ParameterPath,
     ParameterUpdate,
     ReferenceComplete,
@@ -49,26 +51,43 @@ from b24api.contracts.completion import PageAcknowledged, PageScheduled
 from b24api.contracts.request import RouteKind
 from b24api.errors import (
     AmbiguousExecutionError,
+    ApiResponseError,
     BatchCommandError,
     BatchFailed,
     BudgetExceededError,
     CapabilityError,
+    ClientClosedError,
     FailurePhase,
     IncompleteTraversalError,
     InputSourceError,
+    PaginationError,
     ReferenceFailed,
+    StreamClosedError,
     TransportError,
 )
+from b24api.execution.facts import Execution, execution
 from b24api.settings import Settings
-from tests.scripting import ResponderTransport, attached_report, client_for
+from b24api.transport import WireResponse
+from tests.scripting import (
+    HANG_BOUND,
+    UNREACHABLE_COALESCE_WAIT,
+    ResponderTransport,
+    attached_report,
+    client_for,
+    drain_to_failure,
+    reached,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Iterator
 
-    from b24api.execution import Transport, WireResponse
+    from b24api.contracts import CommandOutcome, OperationStream
+    from b24api.execution import Transport
     from tests.scripting import ClientFactory
 
 HTTP_OK = 200
+# The permits of a client's shared limiter when Settings.max_concurrent_requests keeps its default.
+_DEFAULT_CONCURRENT_REQUESTS = 10
 COUNTED_ROWS = 500
 EXPECTED_COUNTED_REQUESTS = 2
 PAGE_SIZE = 50
@@ -89,6 +108,8 @@ LARGE_LOGICAL_BATCH_REQUESTS = 2_000
 BOUNDED_LOOKAHEAD_COMMANDS = 2_000
 CUSTOM_INITIAL_OFFSET = 10
 CUSTOM_NEXT_OFFSET = 12
+BUDGET_CHUNK = 5
+BUDGET_SOURCE_COMMANDS = 20
 
 
 class BlockingCloseTransport(ResponderTransport):
@@ -283,7 +304,7 @@ async def test_public_counted_traversal_above_100k_uses_declared_identity_budget
 
 
 @pytest.mark.asyncio
-async def test_counted_identity_budget_stops_before_admitting_an_overflow_page() -> None:
+async def test_counted_identity_budget_refuses_a_range_it_cannot_hold_at_its_head() -> None:
     def handler(request: Request) -> object:
         if request.method != "batch":
             return {
@@ -308,14 +329,16 @@ async def test_counted_identity_budget_stops_before_admitting_an_overflow_page()
         policy=ExecutionPolicy(max_identity_keys=PAGE_SIZE + 1),
     )
 
-    assert len([await anext(stream) for _index in range(PAGE_SIZE)]) == PAGE_SIZE
-    with pytest.raises(IncompleteTraversalError) as captured:
+    # The head's exact total already exceeds the identity budget: the range is refused before any row.
+    with pytest.raises(BudgetExceededError, match="identity evidence budget"):
         await anext(stream)
 
-    assert isinstance(captured.value.error, BudgetExceededError)
     assert stream.report is not None
     assert stream.report.state is TerminalState.INCOMPLETE
-    assert stream.report.emitted == PAGE_SIZE
+    assert stream.report.emitted == 0
+    assert [(record.outcome, record.rejection_code) for record in stream.report.page_trace] == [
+        (PageOutcome.REJECTED, PageRejectionCode.BUDGET_EXHAUSTED)
+    ]
 
 
 @pytest.mark.slow
@@ -473,6 +496,444 @@ async def test_batch_outcomes_retains_typed_failure_without_halting_later_comman
     assert decision.pages_scheduled == SMALL_BATCH_COMMANDS
     assert decision.pages_acknowledged == SMALL_BATCH_COMMANDS - 1
     assert gate.finish() == stream.report
+
+
+class _BudgetSource:
+    """Commands of one SAFE method, ``total`` of them or without end, recording every pull and whether it closed."""
+
+    # Far beyond what any budget of these tests sends: pulling this much means the source is pulled for nothing.
+    runaway = 1_000
+
+    def __init__(self, total: int | None) -> None:
+        self.total = total
+        self.pulled = 0
+        self.closed = False
+        # Set once a finite source has been read to its end.
+        self.read_out = asyncio.Event()
+
+    async def commands(self) -> AsyncGenerator[Command[int]]:
+        try:
+            while self.total is None or self.pulled < self.total:
+                if self.pulled >= self.runaway:
+                    raise AssertionError("the source was pulled after the request budget refused a send")
+                self.pulled += 1
+                yield Command(Request("test.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), self.pulled)
+            self.read_out.set()
+        finally:
+            self.closed = True
+
+
+def _echo_batch(request: Request) -> object:
+    commands = request.copy_parameters()["cmd"]
+    assert isinstance(commands, dict)
+    return {"result": {"result": {key: {"ok": 1} for key in commands}, "result_error": []}}
+
+
+def _assert_ended_by_request_budget(stream: OperationStream[CommandOutcome[int]], error: BaseException) -> None:
+    """The stream ended as the time budget ends it: the budget's failure, an incomplete report that records it."""
+    assert str(error) == "physical request budget exhausted"
+    report = stream.report
+    assert report is not None
+    assert attached_report(error) is report
+    assert report.state is TerminalState.INCOMPLETE
+    assert [violation.code for violation in report.violations] == ["budget_exhausted"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("total", [None, BUDGET_SOURCE_COMMANDS], ids=["without-end", "finite"])
+async def test_batch_outcomes_ends_when_the_request_budget_refuses_a_send(total: int | None) -> None:
+    # Two requests send the first two chunks; the third chunk, already pulled, is refused before its send. Nothing
+    # more is pulled, the refused commands end as never sent, and the stream ends with the budget.
+    source = _BudgetSource(total)
+    transport = ResponderTransport(_echo_batch)
+    stream = _client(transport).batch_outcomes(
+        source.commands(), batch_size=BUDGET_CHUNK, policy=ExecutionPolicy(max_requests=PARTIAL_WINDOW)
+    )
+    outcomes, error = await drain_to_failure(stream, BudgetExceededError)
+
+    admitted = (PARTIAL_WINDOW + 1) * BUDGET_CHUNK
+    assert len(transport.requests) == PARTIAL_WINDOW
+    assert source.pulled == len(outcomes) == admitted
+    assert source.closed
+    sent, refused = outcomes[: PARTIAL_WINDOW * BUDGET_CHUNK], outcomes[PARTIAL_WINDOW * BUDGET_CHUNK :]
+    assert all(isinstance(outcome, CommandSuccess) for outcome in sent)
+    for outcome in refused:
+        assert isinstance(outcome, CommandFailure)
+        assert isinstance(outcome.error, BudgetExceededError)
+        assert execution(outcome.error) is Execution.NOT_SENT
+        assert outcome.replay_disposition is ReplayDisposition.NOT_ELIGIBLE
+    _assert_ended_by_request_budget(stream, error)
+    report = stream.report
+    assert report is not None
+    assert report.admitted == admitted
+    assert (report.successes, report.failures) == (len(sent), len(refused))
+    assert report.physical_requests == PARTIAL_WINDOW
+
+
+@pytest.mark.asyncio
+async def test_batch_outcomes_ends_when_the_request_budget_stops_a_replay() -> None:
+    # The first chunk's command is refused by quota and may be sent again, but its replay is the request the budget
+    # refuses: the command keeps its own refusal, and the operation ends before the second chunk is pulled.
+    def refused(request: Request) -> object:
+        commands = request.copy_parameters()["cmd"]
+        assert isinstance(commands, dict)
+        return {"result": {"result": [], "result_error": {key: {"error": "QUERY_LIMIT_EXCEEDED"} for key in commands}}}
+
+    source = _BudgetSource(PARTIAL_WINDOW)
+    transport = ResponderTransport(refused)
+    stream = _client(transport).batch_outcomes(source.commands(), batch_size=1, policy=ExecutionPolicy(max_requests=1))
+
+    (outcome,), error = await drain_to_failure(stream, BudgetExceededError)
+
+    assert len(transport.requests) == 1
+    assert source.pulled == 1
+    assert source.closed
+    assert isinstance(outcome, CommandFailure)
+    assert isinstance(outcome.error, BatchCommandError)
+    assert outcome.replay_disposition is ReplayDisposition.ELIGIBLE
+    _assert_ended_by_request_budget(stream, error)
+
+    # Control: a budget the operation's last send spends exactly refuses nothing, and the operation completes.
+    exact = _BudgetSource(PARTIAL_WINDOW * BUDGET_CHUNK)
+    fitting = _client(ResponderTransport(_echo_batch)).batch_outcomes(
+        exact.commands(), batch_size=BUDGET_CHUNK, policy=ExecutionPolicy(max_requests=PARTIAL_WINDOW)
+    )
+    assert all([isinstance(each, CommandSuccess) async for each in fitting])
+    assert fitting.report is not None
+    assert fitting.report.state is TerminalState.COMPLETED
+    assert fitting.report.violations == ()
+
+
+def _answer_direct_or_batch(request: Request) -> object:
+    """Answer a direct request with an empty page, and each command of a classic batch with one."""
+    commands = request.copy_parameters().get("cmd")
+    if isinstance(commands, dict):
+        return {"result": {"result": {key: [] for key in commands}, "result_error": []}}
+    return {"result": []}
+
+
+async def _bindings(source: _BudgetSource) -> AsyncGenerator[Binding[int]]:
+    """Bind one reference per command the budget source yields."""
+    async for command in source.commands():
+        yield Binding(str(command.correlation), (), command.correlation)
+
+
+def _assert_reference_stream_ended_by_request_budget(
+    stream: OperationStream[Any], outcomes: list[Any], error: BaseException, transport: ResponderTransport
+) -> None:
+    """Each admitted reference has its outcome, then the request budget ends the stream and its report records it."""
+    report = stream.report
+    assert report is not None
+    assert str(error) == "physical request budget exhausted"
+    assert attached_report(error) is report
+    assert len(transport.requests) == PARTIAL_WINDOW
+    assert report.admitted == len(outcomes)
+    assert report.state is TerminalState.INCOMPLETE
+    assert "budget_exhausted" in {violation.code for violation in report.violations}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("total", [None, BUDGET_SOURCE_COMMANDS * 10], ids=["without-end", "finite"])
+@pytest.mark.parametrize("dispatch", [DirectDispatch(), BatchDispatch()], ids=["direct", "batch"])
+async def test_fan_out_outcomes_ends_when_the_request_budget_refuses_a_send(
+    dispatch: DirectDispatch | BatchDispatch, total: int | None
+) -> None:
+    # Two requests are all the budget allows; the scheduler stops pulling commands once it refuses the third send.
+    source = _BudgetSource(total)
+    transport = ResponderTransport(_answer_direct_or_batch)
+    stream = _client(transport).fan_out_outcomes(
+        source.commands(), dispatch=dispatch, policy=ExecutionPolicy(max_requests=PARTIAL_WINDOW)
+    )
+
+    outcomes, error = await drain_to_failure(stream, BudgetExceededError)
+
+    assert source.pulled == len(outcomes) < (total or _BudgetSource.runaway)
+    assert source.closed
+    refused = [outcome for outcome in outcomes if isinstance(outcome, CommandFailure)]
+    assert refused
+    for outcome in refused:
+        assert isinstance(outcome.error, BudgetExceededError)
+        assert execution(outcome.error) is Execution.NOT_SENT
+    _assert_reference_stream_ended_by_request_budget(stream, outcomes, error, transport)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch", [DirectDispatch(), BatchDispatch()], ids=["direct", "batch"])
+async def test_a_command_waiting_for_a_slot_is_not_read_once_the_request_budget_refused_a_send(
+    dispatch: DirectDispatch | BatchDispatch,
+) -> None:
+    # One active command at a time and a budget of one request. The scheduler reads the second command while the
+    # first is answered, then waits for its slot; meanwhile the second's send is refused. Once the slot is free,
+    # the spent budget is checked before another command is read, so the source is pulled twice, not three times.
+    source = _BudgetSource(None)
+    transport = ResponderTransport(_answer_direct_or_batch)
+    stream = _client(transport).fan_out_outcomes(
+        source.commands(), dispatch=dispatch, policy=ExecutionPolicy(max_requests=1, max_active_references=1)
+    )
+
+    outcomes, error = await drain_to_failure(stream, BudgetExceededError)
+
+    sent, refused = outcomes
+    assert isinstance(sent, CommandSuccess)
+    assert isinstance(refused, CommandFailure)
+    assert execution(refused.error) is Execution.NOT_SENT
+    assert source.pulled == PARTIAL_WINDOW
+    assert source.closed
+    assert len(transport.requests) == 1
+    assert str(error) == "physical request budget exhausted"
+    report = stream.report
+    assert report is not None
+    assert report.state is TerminalState.INCOMPLETE
+    assert "budget_exhausted" in {violation.code for violation in report.violations}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch", [DirectDispatch(), BatchDispatch()], ids=["direct", "batch"])
+async def test_reference_outcomes_end_when_the_request_budget_refuses_a_send(
+    dispatch: DirectDispatch | BatchDispatch,
+) -> None:
+    source = _BudgetSource(None)
+    transport = ResponderTransport(_answer_direct_or_batch)
+    stream = _client(transport).iter_reference_outcomes(
+        Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+        _bindings(source),
+        traversal=SequentialTraversal(),
+        dispatch=dispatch,
+        policy=ExecutionPolicy(max_requests=PARTIAL_WINDOW),
+    )
+
+    outcomes, error = await drain_to_failure(stream, BudgetExceededError)
+
+    assert source.pulled == len(outcomes) < _BudgetSource.runaway
+    assert source.closed
+    assert any(isinstance(outcome, ReferenceFailure) for outcome in outcomes)
+    _assert_reference_stream_ended_by_request_budget(stream, outcomes, error, transport)
+
+
+READ_OUT_SOURCE = 3
+
+
+def _read_ahead(
+    operation: str, dispatch: type[DirectDispatch | BatchDispatch], order: DeliveryOrder, transport: Transport
+) -> tuple[Bitrix24, DirectDispatch | BatchDispatch, ExecutionPolicy]:
+    """Return a client, dispatch and policy that read the whole source ahead of the send the budget refuses.
+
+    The scheduler reads one binding past its active window to see the source end, so the window must exceed the
+    source; under INPUT a whole result's window follows its row share. The sends that follow the first wait for it:
+    one at a time on the client (direct), or on the one wave sender (batch).
+    """
+    if dispatch is DirectDispatch:
+        settings = Settings(webhook_url=f"https://{transport.host}/rest/1/token/", max_concurrent_requests=1)
+        plan: DirectDispatch | BatchDispatch = DirectDispatch(concurrency=READ_OUT_SOURCE, output_order=order)
+        return Bitrix24(settings, transport=transport), plan, ExecutionPolicy(max_requests=PARTIAL_WINDOW)
+    # Two commands a wave: a whole result's share of three rows is one row, so the window holds four bindings.
+    policy = ExecutionPolicy(max_requests=1)
+    if operation == "fan_out_outcomes":
+        policy = ExecutionPolicy(max_requests=1, max_buffered_rows=READ_OUT_SOURCE)
+    plan = BatchDispatch(batch_size=PARTIAL_WINDOW, concurrency=1, output_order=order)
+    return client_for(transport), plan, policy
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("order", [DeliveryOrder.READY, DeliveryOrder.INPUT], ids=["ready", "input"])
+@pytest.mark.parametrize("dispatch", [DirectDispatch, BatchDispatch], ids=["direct", "batch"])
+@pytest.mark.parametrize("operation", ["fan_out_outcomes", "iter_reference_outcomes"])
+async def test_reference_outcomes_end_with_the_request_budget_even_when_their_source_was_read_out_first(
+    operation: str, dispatch: type[DirectDispatch | BatchDispatch], order: DeliveryOrder
+) -> None:
+    # The scheduler reads ahead of its sends: here the whole source is read before the first answer, so a later
+    # send is refused only after the source ended by itself. The budget's refusal still ends the operation.
+    source = _BudgetSource(READ_OUT_SOURCE)
+
+    async def answer(request: Request) -> object:
+        await reached(source.read_out)
+        return _answer_direct_or_batch(request)
+
+    transport = ResponderTransport(answer)
+    client, plan, policy = _read_ahead(operation, dispatch, order, transport)
+    stream: OperationStream[Any] = (
+        client.fan_out_outcomes(source.commands(), dispatch=plan, policy=policy)
+        if operation == "fan_out_outcomes"
+        else client.iter_reference_outcomes(
+            Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+            _bindings(source),
+            traversal=SequentialTraversal(),
+            dispatch=plan,
+            policy=policy,
+        )
+    )
+
+    outcomes, error = await drain_to_failure(stream, BudgetExceededError)
+
+    assert source.pulled == len(outcomes) == READ_OUT_SOURCE
+    assert source.closed
+    refused = [outcome for outcome in outcomes if isinstance(outcome, CommandFailure | ReferenceFailure)]
+    assert refused
+    for outcome in refused:
+        assert isinstance(outcome.error, BudgetExceededError)
+        assert execution(outcome.error) is Execution.NOT_SENT
+    report = stream.report
+    assert report is not None
+    assert str(error) == "physical request budget exhausted"
+    assert attached_report(error) is report
+    assert report.physical_requests == policy.max_requests
+    assert report.state is TerminalState.INCOMPLETE
+    assert "budget_exhausted" in {violation.code for violation in report.violations}
+
+
+# How long a test watches an operation wait for a method hold of two minutes: a stream that does not wait
+# returns at once, so a busy host can only make this look like waiting when it waits.
+HELD_WAIT = 0.2
+
+
+_TIME_LIMIT_FOR_TWO_MINUTES = WireResponse(
+    200,
+    (("content-type", "application/json"), ("retry-after", "120")),
+    json.dumps({"error": "OPERATION_TIME_LIMIT", "error_description": "wait"}).encode(),
+)
+
+
+def _held_portal(method: str) -> ResponderTransport:
+    """Answer the first call to ``method`` with OPERATION_TIME_LIMIT for two minutes, holding it client-wide."""
+
+    def respond(request: Request) -> object:
+        if len(transport.requests) == 1:
+            assert request.method == method
+            return _TIME_LIMIT_FOR_TWO_MINUTES
+        return _answer_direct_or_batch(request)
+
+    transport = ResponderTransport(respond)
+    return transport
+
+
+async def _hold(client: Bitrix24, method: str) -> None:
+    """Hold ``method`` on the client's coordinator for two minutes: the portal limits a call to it.
+
+    The hold outlasts the call's retry window, so the call ends with the portal's refusal.
+    """
+    with pytest.raises(ApiResponseError, match="OPERATION_TIME_LIMIT"):
+        await client.call(Request(method, replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE))
+
+
+async def _waits(stream: OperationStream[Any]) -> bool:
+    """Return whether the stream's first read is still waiting after ``HELD_WAIT``; the stream is closed then."""
+    try:
+        await asyncio.wait_for(anext(stream), timeout=HELD_WAIT)
+    except TimeoutError:
+        return True
+    finally:
+        await stream.aclose()
+    return False
+
+
+@pytest.mark.asyncio
+async def test_batch_outcomes_whose_every_command_is_held_waits_instead_of_draining_its_source() -> None:
+    # Every command's method is held for two minutes, so no command is left out to let another go: the first chunk
+    # waits at its permit, and the source is not pulled past it, where refusing each chunk unsent pulled without end.
+    pulled = 0
+
+    async def updates() -> AsyncGenerator[Command[int]]:
+        nonlocal pulled
+        while True:
+            pulled += 1
+            yield Command(Request.bare("crm.item.update", {"id": pulled}, ReplaySafety.UNSAFE), pulled)
+
+    transport = _held_portal("crm.item.update")
+    async with _client(transport) as client:
+        await _hold(client, "crm.item.update")
+        assert await _waits(client.batch_outcomes(updates()))
+
+    assert len(transport.requests) == 1
+    assert pulled <= PAGE_SIZE
+
+
+@pytest.mark.asyncio
+async def test_batch_outcomes_sends_the_other_methods_of_a_chunk_without_its_held_one() -> None:
+    # The list is held for two minutes, beyond the operation's one minute; the get of the same chunk goes at once
+    # without it, and the list is refused unsent. (A hold the operation outlasts would carry the list to a later
+    # envelope instead.)
+    transport = _held_portal("test.list")
+    held = Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
+    free = Request("test.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
+    async with _client(transport) as client:
+        await _hold(client, "test.list")
+        stream = client.batch_outcomes([Command(held, 0), Command(free, 1)], policy=ExecutionPolicy(max_elapsed=60.0))
+        async with asyncio.timeout(HANG_BOUND):
+            refused, sent = [outcome async for outcome in stream]
+
+    assert isinstance(sent, CommandSuccess)
+    assert isinstance(refused, CommandFailure)
+    assert isinstance(refused.error, BudgetExceededError)
+    assert execution(refused.error) is Execution.NOT_SENT
+    assert len(transport.requests) == PARTIAL_WINDOW
+    assert transport.requests[-1].method == "batch"
+
+
+@pytest.mark.asyncio
+async def test_a_fail_fast_batch_waits_for_a_held_method_instead_of_failing_its_other_commands() -> None:
+    # The same chunk under batch(): leaving the held list out would let the get go only for the batch to fail on
+    # the list, so the chunk is not split. It waits at its permit for the list's hold, within max_elapsed, as a
+    # lone call does, instead of failing at once with BatchFailed.
+    transport = _held_portal("test.list")
+    held = Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
+    free = Request("test.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
+    async with _client(transport) as client:
+        await _hold(client, "test.list")
+        assert await _waits(client.batch([Command(held, 0), Command(free, 1)]))
+
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_spent_request_budget_ends_the_operation_before_a_hold_that_outlasts_it_is_weighed() -> None:
+    # The budget's one request carries the get. The list's method is held two minutes, longer than the minute the
+    # operation has: its chunk is refused by the spent budget, which ends the operation at once, not by the hold,
+    # which would end only that chunk and leave the stream reading and refusing the rest of its source.
+    transport = _held_portal("test.list")
+    get = Request("test.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
+    held = Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
+    pulled = 0
+
+    async def commands() -> AsyncGenerator[Command[int]]:
+        nonlocal pulled
+        for index, request in enumerate((get, held, held)):
+            pulled += 1
+            yield Command(request, index)
+
+    async with _client(transport) as client:
+        await _hold(client, "test.list")
+        stream = client.batch_outcomes(
+            commands(), batch_size=1, policy=ExecutionPolicy(max_requests=1, max_elapsed=60.0)
+        )
+        outcomes, error = await drain_to_failure(stream, BudgetExceededError)
+
+    assert str(error) == "physical request budget exhausted"
+    sent, refused = outcomes
+    assert isinstance(sent, CommandSuccess)
+    assert isinstance(refused, CommandFailure)
+    assert str(refused.error) == "physical request budget exhausted"
+    assert pulled == PARTIAL_WINDOW
+    assert len(transport.requests) == PARTIAL_WINDOW
+
+
+@pytest.mark.asyncio
+async def test_traversal_pages_and_dispatched_commands_wait_for_a_held_method_as_sent_one_by_one() -> None:
+    # A reference's pages and the commands a dispatcher batches are never left out for their method's hold: with
+    # the default BatchDispatch they wait at the permit, as with DirectDispatch, instead of failing at once. A
+    # dispatcher's wave that carries the held list with a get waits whole, rather than sending the get without it.
+    held = Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
+    free = Request("test.get", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE)
+    for dispatch in (BatchDispatch(), DirectDispatch()):
+        transport = _held_portal("test.list")
+        async with _client(transport) as client:
+            await _hold(client, "test.list")
+            references = client.iter_reference_outcomes(
+                held, [Binding("held", (), 1)], traversal=SequentialTraversal(), dispatch=dispatch
+            )
+            assert await _waits(references), dispatch
+            wave = [Command(held, 1), Command(free, 2)] if isinstance(dispatch, BatchDispatch) else [Command(held, 1)]
+            assert await _waits(client.fan_out_outcomes(wave, dispatch=dispatch)), dispatch
+        assert len(transport.requests) == 1
 
 
 @pytest.mark.asyncio
@@ -673,8 +1134,21 @@ async def test_tolerant_batch_distinguishes_user_source_failure_from_local_item_
     assert isinstance(local_outcome, CommandNotExecuted)
     assert local_outcome.correlation is correlation
     assert local_outcome.reason is NotExecutedReason.LOCAL_VALIDATION_FAILED
-    with pytest.raises(InputSourceError):
+    with pytest.raises(InputSourceError) as refused:
         await anext(local)
+    assert type(refused.value.__cause__) is TypeError
+
+    # The source raising a ``TypeError`` of its own is its failure, not the refusal of an item it yielded.
+    def type_failing_source() -> Iterator[Command[object]]:
+        yield Command(Request("test.get", route=RouteKind.BARE), correlation)
+        raise TypeError("caller source failed")
+
+    own = _client(transport).batch_outcomes(type_failing_source(), batch_size=2)
+    own_outcome = await anext(own)
+    assert isinstance(own_outcome, CommandNotExecuted)
+    assert own_outcome.reason is NotExecutedReason.SOURCE_FAILED
+    with pytest.raises(InputSourceError):
+        await anext(own)
 
 
 @pytest.mark.asyncio
@@ -899,7 +1373,7 @@ async def test_homogeneous_reference_chunk_the_budget_stops_still_counts_as_in_2
         policy=ExecutionPolicy(max_requests=1),
     )
 
-    outcomes = [outcome async for outcome in stream]
+    outcomes, _ = await drain_to_failure(stream, BudgetExceededError)
 
     assert isinstance(outcomes[0], ReferenceComplete)
     assert isinstance(outcomes[1], ReferenceFailure)
@@ -994,7 +1468,8 @@ async def test_reference_traversal_enforces_its_local_page_cap_without_a_wire_li
 
 @pytest.mark.asyncio
 async def test_reference_incomplete_maps_to_typed_failure_not_unknown() -> None:
-    transport = ResponderTransport(lambda _request: {"result": [{"ID": 1}]})
+    # Every page names a next offset and returns the same row, so the second page repeats the first.
+    transport = ResponderTransport(lambda _request: {"result": [{"ID": 1}], "next": 1})
     correlation = object()
     stream = _client(transport).iter_reference_outcomes(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
@@ -1134,7 +1609,7 @@ async def test_batch_fanout_spans_physical_windows_and_preserves_global_correlat
             batch_size=FANOUT_BATCH_SIZE,
             concurrency=concurrency,
             output_order=DeliveryOrder.READY,
-            coalesce_wait=1,
+            coalesce_wait=UNREACHABLE_COALESCE_WAIT,
         ),
     )
 
@@ -1236,13 +1711,13 @@ def test_injected_transport_host_must_match_settings_before_io() -> None:
 
 @pytest.mark.asyncio
 async def test_iter_list_is_sequential_mechanics_only_and_report_is_post_cleanup() -> None:
-    pages = {0: [{"ID": 1}, {"ID": 2}], 2: [{"ID": 3}], 3: []}
+    pages = {0: [{"ID": 1}, {"ID": 2}], 2: [{"ID": 3}]}
 
     def handler(request: Request) -> object:
         start = request.copy_parameters().get("start", 0)
         assert isinstance(start, int)
         assert not isinstance(start, bool)
-        return {"result": pages[start]}
+        return {"result": pages[start], "next": 2} if start == 0 else {"result": pages[start]}
 
     transport = ResponderTransport(handler)
     stream = _client(transport).iter_list(Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE))
@@ -1251,7 +1726,7 @@ async def test_iter_list_is_sequential_mechanics_only_and_report_is_post_cleanup
     rows = [item async for item in stream]
 
     assert rows == [{"ID": 1}, {"ID": 2}, {"ID": 3}]
-    assert [request.copy_parameters()["start"] for request in transport.requests] == [0, 2, 3]
+    assert [request.copy_parameters()["start"] for request in transport.requests] == [0, 2]
     assert stream.report is not None
     assert stream.report.state is TerminalState.COMPLETED
     assert stream.report.assurance is TraversalAssurance.MECHANICS_ONLY
@@ -1435,18 +1910,21 @@ async def test_counted_traversal_preserves_frozen_request_shape_and_exact_identi
 
 
 @pytest.mark.asyncio
-async def test_counted_missing_in_band_stride_fails_incomplete() -> None:
+async def test_counted_head_without_next_short_of_its_total_fails_incomplete() -> None:
+    # The head has no next, so it is the source's last page, yet it holds one row of the two the total counts.
     transport = ResponderTransport(lambda _request: {"result": [{"ID": 1}], "total": 2})
     stream = _client(transport).iter_list_counted(
         Request("test.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
         identity=_identity(),
     )
 
-    assert await anext(stream) == {"ID": 1}
     with pytest.raises(IncompleteTraversalError, match="did not complete") as captured:
         await anext(stream)
 
-    assert type(captured.value).__name__ == "IncompleteTraversalError"
+    cause = captured.value.__cause__
+    assert isinstance(cause, PaginationError)
+    assert cause.rejection_code is PageRejectionCode.TOTAL_DRIFT
+    assert len(transport.requests) == 1
     assert stream.report is not None
     assert stream.report.state is TerminalState.INCOMPLETE
 
@@ -1576,8 +2054,50 @@ async def test_client_closes_active_stream_before_owned_transport_but_not_inject
     assert stream.report.state is TerminalState.EARLY_CLOSED
     assert stream._source.completion_gate.finish() == stream.report  # noqa: SLF001 - gate ownership assertion
     assert not transport.closed
-    with pytest.raises(RuntimeError, match="client is closed"):
+    with pytest.raises(ClientClosedError, match="client is closed"):
         await client.call(Request("test.get", route=RouteKind.BARE))
+
+
+@pytest.mark.asyncio
+async def test_a_closed_client_refuses_queued_and_later_work_with_one_typed_error() -> None:
+    # Calls still queued for a permit when the client closes, and every call or stream after the close, get
+    # ClientClosedError: a public TransportError of phase not_dispatched (even an UNSAFE call is proven not
+    # run, never ambiguous), never retried, and still the RuntimeError a closed client used to raise.
+    release = asyncio.Event()
+    all_admitted = asyncio.Event()
+
+    async def respond(_request: object) -> object:
+        if len(transport.requests) == _DEFAULT_CONCURRENT_REQUESTS:
+            all_admitted.set()
+        await release.wait()
+        return {"result": 1}
+
+    transport = ResponderTransport(respond)
+    client = client_for(transport)
+    request = Request.bare("crm.deal.add", {"fields": {"TITLE": "x"}}, ReplaySafety.UNSAFE)
+    in_flight = [asyncio.create_task(client.call(request)) for _ in range(_DEFAULT_CONCURRENT_REQUESTS)]
+    queued = [asyncio.create_task(client.call(request)) for _ in range(2)]
+    await reached(all_admitted)
+
+    close = asyncio.create_task(client.aclose())
+    await asyncio.wait(queued)
+    release.set()
+    await close
+
+    assert await asyncio.gather(*in_flight) == [1] * _DEFAULT_CONCURRENT_REQUESTS
+    refusals = [task.exception() for task in queued]
+    with pytest.raises(ClientClosedError, match="client is closed") as later:
+        await client.call(request)
+    with pytest.raises(ClientClosedError, match="client is closed") as stream:
+        client.batch([Command(request, 0)])
+    for refusal in (*refusals, later.value, stream.value):
+        assert isinstance(refusal, ClientClosedError)
+        assert isinstance(refusal, TransportError)
+        assert isinstance(refusal, RuntimeError)
+        assert refusal.phase is FailurePhase.NOT_DISPATCHED
+        assert not refusal.possible_acceptance
+        assert not refusal.retryable
+    assert len(transport.requests) == _DEFAULT_CONCURRENT_REQUESTS
 
 
 @pytest.mark.asyncio
@@ -1629,8 +2149,9 @@ async def test_client_context_preserves_body_error_when_owned_cleanup_fails(scri
         async with client:
             raise ValueError("primary body failure")
 
-    assert isinstance(captured.value.__cause__, RuntimeError)
-    assert "owned transport cleanup failed" in str(captured.value.__cause__)
+    # The body's exception keeps its own cause; the failed close is noted on it, as a stream's ``async with`` does.
+    assert captured.value.__cause__ is None
+    assert captured.value.__notes__ == ["client close also failed (RuntimeError)"]
     assert transport.closed
 
 
@@ -1643,12 +2164,12 @@ async def test_public_aclose_is_permitted_during_an_inflight_pull_and_cancels_ow
 
     await stream.aclose()
 
-    with pytest.raises(asyncio.CancelledError) as captured:
+    with pytest.raises(StreamClosedError) as captured:
         await pull
     assert attached_report(captured.value) is stream.report
     assert transport.cancelled.is_set()
     assert stream.report is not None
-    # aclose() owns termination, so the cause is an early close even though the read was cancelled.
+    # aclose() owns termination, so the cause is an early close, and the read it ended says so.
     assert stream.report.state is TerminalState.EARLY_CLOSED
 
 
@@ -1663,7 +2184,7 @@ async def test_concurrent_public_pulls_reject_without_stealing_the_owned_pull() 
         await anext(stream)
 
     await stream.aclose()
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(StreamClosedError):
         await owned_pull
 
 

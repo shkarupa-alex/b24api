@@ -15,7 +15,10 @@ from b24api.contracts.command import (
     CommandOutcomeUnknown,
     CommandSuccess,
 )
-from b24api.errors import AmbiguousExecutionError, B24ApiError, BatchFailed, CapabilityError, InputSourceError
+from b24api.contracts.request import ReplaySafety
+from b24api.errors import BatchFailed, InputSourceError
+from b24api.execution.facts import ambiguity_of
+from b24api.execution.failure import outcome_error
 from b24api.references.dispatch import (
     _KernelFanOutSuccess,
     _ReferenceWindowError,
@@ -33,6 +36,7 @@ if TYPE_CHECKING:
     from b24api.contracts.report import OperationReport, Violation
     from b24api.contracts.request import Request
     from b24api.contracts.stream import OperationStream
+    from b24api.execution.context import ExecutionContext
     from b24api.execution.snapshot import KernelReport
 
 type CommandSource[C] = Iterable[Command[C]] | AsyncIterable[Command[C]]
@@ -45,6 +49,17 @@ class FanOutKernelStream(Protocol):
 
     report: KernelReport
     active_references_high_water: int
+    works_between_reads: bool
+
+    @property
+    def operation_context(self) -> ExecutionContext:
+        """Return the operation context."""
+        ...
+
+    @property
+    def cleanup_failure(self) -> BaseException | None:
+        """Return the cleanup failure the stream raised as its end."""
+        ...
 
     def __aiter__(self) -> Self:
         """Return this iterator."""
@@ -68,9 +83,10 @@ class _CommandContext:
 class _CommandSourceError(Exception):
     """Carry a failed fan-out input source; reports name the public failure it maps to (``report_cause``)."""
 
-    def __init__(self) -> None:
+    def __init__(self, source_error: BaseException) -> None:
         super().__init__("fan-out input source failed")
         self.report_cause = InputSourceError("Fan-out input source failed")
+        self.report_cause.__cause__ = source_error
 
 
 def _reference(command: object, index: int) -> ReferenceRequest:
@@ -93,7 +109,7 @@ def command_source[C](
         source,
         accept=_reference,
         observe=observe,
-        failure=lambda _error: _CommandSourceError(),
+        failure=_CommandSourceError,
     )
 
 
@@ -109,10 +125,15 @@ class _FanOutMapper:
                 event.response,
             )
         context = cast("_CommandContext", event.correlation)
-        error = event.error if isinstance(event.error, B24ApiError) else CapabilityError("fan-out command failed")
-        if isinstance(error, AmbiguousExecutionError):
-            return CommandOutcomeUnknown(context.index, context.correlation, event.request.summary, error)
-        return CommandFailure(context.index, context.correlation, event.request.summary, error)
+        error = outcome_error(event.error, "fan-out command failed")
+        summary = event.request.summary
+        # The variant follows the execution facts, not the exception type, which stays the cause.
+        ambiguity = ambiguity_of(
+            error, request_summary=summary, declared_unsafe=event.request.replay_safety is ReplaySafety.UNSAFE
+        )
+        if ambiguity is None:
+            return CommandFailure(context.index, context.correlation, summary, error, event.replay_disposition)
+        return CommandOutcomeUnknown(context.index, context.correlation, summary, ambiguity, event.replay_disposition)
 
 
 def _fanout_variant(outcome: CommandOutcome[object]) -> str:
@@ -169,7 +190,7 @@ def kernel_fanout_stream[C](
 
     if not isinstance(executor, Executor):
         raise TypeError("executor must be an Executor")
-    dispatch_plan = kernel_dispatch(dispatch, policy)
+    dispatch_plan = kernel_dispatch(dispatch, client_concurrency=executor.coordinator.max_concurrency)
     stream = _iter_references(
         executor,
         commands if isinstance(commands, OwnedSource) else command_source(commands),

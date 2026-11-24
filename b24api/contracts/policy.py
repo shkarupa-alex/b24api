@@ -2,22 +2,26 @@
 
 from __future__ import annotations
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
-from b24api.contracts.error_base import BudgetExceededError
-from b24api.contracts.json import _is_plain_int
+from b24api.contracts.json import _is_plain_int, _string_free_tuple
 from b24api.contracts.v3_codes import REFUSAL_V3_ERROR_CODES, TRANSIENT_V3_ERROR_CODES
 
 if TYPE_CHECKING:
     from b24api.contracts.request_summary import RequestSummary
-    from b24api.settings import Settings
 
 HTTP_STATUS_MINIMUM = 100
 HTTP_STATUS_MAXIMUM = 599
 PAGE_TRACE_LIMIT_MAXIMUM = 1024
+
+
+def _api_code_set(codes: object, *, label: str) -> frozenset[str]:
+    """Normalize API error codes for case-free comparison; a bare string is one mistaken code set."""
+    listed = _string_free_tuple(cast("Iterable[object]", codes), label=label)
+    return frozenset(str(code).strip().casefold() for code in listed)
 
 
 class ReplayDisposition(StrEnum):
@@ -82,9 +86,7 @@ class ConfirmationPolicy(StrEnum):
 
     NONE = "none"
     EMPTY_AFTER_BOUNDARY = "empty_after_boundary"
-    BOUNDARY_ID_SEEN = "boundary_id_seen"
     QUALIFIED_TOTAL = "qualified_total"
-    INDEPENDENT_ORACLE = "independent_oracle"
 
 
 class KernelState(StrEnum):
@@ -139,11 +141,7 @@ class AmbiguityPolicy:
         """Validate and freeze the status and code sets."""
         object.__setattr__(self, "ambiguous_unstructured_statuses", frozenset(self.ambiguous_unstructured_statuses))
         object.__setattr__(self, "refusal_http_statuses", frozenset(self.refusal_http_statuses))
-        object.__setattr__(
-            self,
-            "refusal_api_codes",
-            frozenset(str(code).strip().casefold() for code in self.refusal_api_codes),
-        )
+        object.__setattr__(self, "refusal_api_codes", _api_code_set(self.refusal_api_codes, label="refusal_api_codes"))
         if any(
             not _is_plain_int(status) or status < HTTP_STATUS_MINIMUM or status > HTTP_STATUS_MAXIMUM
             for status in (*self.ambiguous_unstructured_statuses, *self.refusal_http_statuses)
@@ -189,9 +187,16 @@ class UnknownRequestCollector:
 
 @dataclass(frozen=True, slots=True)
 class RetryPolicy:
-    """Explicit retry classifications and delay bounds."""
+    """Explicit retry classifications and delay bounds.
 
-    transient_http_statuses: frozenset[int] = frozenset({423, 425, 429, 500, 502, 503, 507})
+    ``transient_http_statuses`` lists the unstructured statuses worth another attempt: the refusals 423, 425 and
+    429, and the timeout or overload of the server or a gateway (408, 500, 502, 503, 504). A status the ambiguity
+    policy holds ambiguous, as 408 and every 5xx are by default, is retried for SAFE work alone, since the request
+    may have run before it; a listed refusal is retried whatever the safety. 507 is not listed: insufficient storage
+    does not pass while a request retries.
+    """
+
+    transient_http_statuses: frozenset[int] = frozenset({408, 423, 425, 429, 500, 502, 503, 504})
     # The classic request and time quotas, and the REST 3.0 load limits; codes compare without letter case.
     transient_api_codes: frozenset[str] = frozenset(
         {"query_limit_exceeded", "operation_time_limit", *TRANSIENT_V3_ERROR_CODES}
@@ -210,9 +215,7 @@ class RetryPolicy:
             raise TypeError("isolate_safe_batch_abort must be a bool")
         object.__setattr__(self, "transient_http_statuses", frozenset(self.transient_http_statuses))
         object.__setattr__(
-            self,
-            "transient_api_codes",
-            frozenset(str(code).strip().casefold() for code in self.transient_api_codes),
+            self, "transient_api_codes", _api_code_set(self.transient_api_codes, label="transient_api_codes")
         )
         if any(
             not _is_plain_int(status) or status < HTTP_STATUS_MINIMUM or status > HTTP_STATUS_MAXIMUM
@@ -262,7 +265,21 @@ class ConsistencyPolicy:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionPolicy:
-    """Universal execution ceilings; every value is checked before scheduling."""
+    """Universal execution ceilings; every value is checked before scheduling.
+
+    ``max_elapsed`` bounds the whole operation, including each request's wait for its first coordinator permit. It
+    is checked at the operation's scheduling points (admission, permits, its own waits), not while the application
+    holds control (a page stop callback, a consumer slow between pulls): the next scheduling point ends the operation.
+    ``max_retry_elapsed_per_request`` is each request's retry window: it opens when the first send is granted its
+    permit and bounds every send, retry wait and later permit wait after it. Each phase of a send (connecting, TLS,
+    the pool, writing, each read) is also bounded by its transport's own attempt timeout (``Settings.http_timeout``
+    for the client's HTTPX transport), so a send that hangs leaves the rest of the window to its retries.
+    ``max_direct_concurrency`` only narrows the client's own limit,
+    ``Settings.max_concurrent_requests``, which all the client's work shares: a direct dispatch runs at most the
+    smallest of the two, ``max_active_references`` and its ``DirectDispatch.concurrency``. It does not limit a
+    ``BatchDispatch``, whose physical batches in flight are bounded by its ``concurrency``,
+    ``max_active_references`` and the client's limit.
+    """
 
     max_requests: int = 10_000
     max_pages: int = 10_000
@@ -285,16 +302,6 @@ class ExecutionPolicy:
     binary_digest: bool = False
     page_trace_limit: int = 64
     debug_evidence: bool = False
-
-    @classmethod
-    def from_settings(cls, settings: Settings) -> ExecutionPolicy:
-        """Return the policy a client built from ``settings`` uses when a call passes none.
-
-        It is ``ExecutionPolicy()`` with ``max_retry_elapsed_per_request`` set to
-        ``settings.http_timeout``. A ``policy=`` argument, on the client or on one call, replaces the
-        default wholesale; derive it from this value with ``dataclasses.replace`` to keep the timeout.
-        """
-        return cls(max_retry_elapsed_per_request=float(settings.http_timeout))
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
@@ -330,7 +337,12 @@ class ExecutionPolicy:
 
 @dataclass(frozen=True, slots=True)
 class BudgetCounters:
-    """Immutable counters implementing pre-scheduling budget semantics."""
+    """Immutable, validated snapshot of an operation's budget counters.
+
+    The execution context keeps the live counters in a mutable ledger and builds this value only
+    when a snapshot or report asks for one. ``pages_per_reference`` holds the committed logical
+    pages of every reference binding that is still open; a closed binding's count is dropped.
+    """
 
     physical_requests: int = 0
     logical_pages: int = 0
@@ -353,64 +365,3 @@ class BudgetCounters:
             raise ValueError("budget counters cannot be negative")
         if self.buffered_rows > self.buffered_rows_high_water:
             raise ValueError("current buffer cannot exceed its high-water mark")
-
-    def reserve_attempt(
-        self,
-        policy: ExecutionPolicy,
-        *,
-        attempts_for_request: int,
-        retry_elapsed: float,
-        total_elapsed: float,
-    ) -> BudgetCounters:
-        """Reserve the attempt budget."""
-        if self.physical_requests >= policy.max_requests:
-            _raise_budget("physical request budget exhausted")
-        if attempts_for_request >= policy.max_attempts_per_request:
-            _raise_budget("per-request attempt budget exhausted")
-        if retry_elapsed >= policy.max_retry_elapsed_per_request:
-            _raise_budget("per-request retry time budget exhausted")
-        if total_elapsed >= policy.max_elapsed:
-            _raise_budget("operation elapsed budget exhausted")
-        return BudgetCounters(
-            physical_requests=self.physical_requests + 1,
-            logical_pages=self.logical_pages,
-            pages_per_reference=self.pages_per_reference,
-            buffered_rows=self.buffered_rows,
-            buffered_rows_high_water=self.buffered_rows_high_water,
-        )
-
-    def reserve_page(self, policy: ExecutionPolicy, *, reference: str | None = None) -> BudgetCounters:
-        """Reserve the page budget."""
-        if self.logical_pages >= policy.max_pages:
-            _raise_budget("logical page budget exhausted")
-        per_reference = dict(self.pages_per_reference)
-        if reference is not None:
-            current = per_reference.get(reference, 0)
-            if current >= policy.max_pages_per_reference:
-                _raise_budget("per-reference page budget exhausted")
-            per_reference[reference] = current + 1
-        return BudgetCounters(
-            physical_requests=self.physical_requests,
-            logical_pages=self.logical_pages + 1,
-            pages_per_reference=tuple(sorted(per_reference.items())),
-            buffered_rows=self.buffered_rows,
-            buffered_rows_high_water=self.buffered_rows_high_water,
-        )
-
-    def with_buffered_rows(self, policy: ExecutionPolicy, rows: int) -> BudgetCounters:
-        """Return counters with buffered rows."""
-        if rows < 0:
-            raise ValueError("buffered row count cannot be negative")
-        if rows > policy.max_buffered_rows:
-            _raise_budget("buffered row budget exhausted")
-        return BudgetCounters(
-            physical_requests=self.physical_requests,
-            logical_pages=self.logical_pages,
-            pages_per_reference=self.pages_per_reference,
-            buffered_rows=rows,
-            buffered_rows_high_water=max(rows, self.buffered_rows_high_water),
-        )
-
-
-def _raise_budget(message: str) -> None:
-    raise BudgetExceededError(message)

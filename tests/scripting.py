@@ -12,16 +12,22 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import parse_qsl, urlsplit
 
 from b24api import Bitrix24, ExecutionPolicy, Settings
 from b24api.encoding import encode_php_query
+from b24api.references import dispatch as dispatch_module
 from b24api.transport import WireResponse
+from b24api.traversal import keyset_plan
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Mapping
+    from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable, Mapping
+
+    import pytest
 
     from b24api import Request, Transport
     from b24api.contracts import UnknownRequestAudit
@@ -129,6 +135,204 @@ class Blocker:
             raise
 
 
+async def _price_on_loop[R](call: Callable[[], R]) -> R:
+    """Run a keyset plan's pricing on the event loop, where it takes no loop turn."""
+    return call()
+
+
+class VirtualClock:
+    """Coalescing clock in loop turns: a wait ends by an event within ``turns`` turns, else its timer fires.
+
+    Installed over the batch dispatcher's clock and timed wait, it makes coalescing structural: no
+    wall time is read, and ``timer_firings`` counts every wait that ended by its deadline. Auto keyset
+    plans are priced on the event loop, as sources are fed with ``on_loop``: a worker thread could
+    outlast a virtual wait and fire its timer.
+    """
+
+    def __init__(self, turns: int = 64) -> None:
+        """Start at time zero with no timer fired."""
+        self.now = 0.0
+        self.turns = turns
+        self.timer_firings = 0
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> VirtualClock:
+        """Replace the dispatcher's clock and timed wait for the rest of the test."""
+        monkeypatch.setattr(dispatch_module, "_loop_time", self.time)
+        monkeypatch.setattr(dispatch_module, "_wait_first", self.wait)
+        monkeypatch.setattr(keyset_plan, "finish_in_thread", _price_on_loop)
+        return self
+
+    def time(self) -> float:
+        """Return the virtual time."""
+        return self.now
+
+    async def wait(self, futures: tuple[asyncio.Future[object], ...], seconds: float) -> None:
+        """End when a future is done within the turn bound, else advance the clock past the deadline."""
+        for _turn in range(self.turns):
+            if any(future.done() for future in futures):
+                return
+            await asyncio.sleep(0)
+        self.now += seconds
+        self.timer_firings += 1
+
+
+# Timing: a test's verdict must follow from the order of events it scripts, never from how fast a busy
+# host runs its threads, its event loop or the dispatcher's coalescing timer.
+
+# ``BatchDispatch`` caps ``coalesce_wait`` at one second. A test asserting exact waves that is not about
+# the timer sets this, so a wave closes by its size or because no more input can join it, never by a
+# 20 ms timer that one descheduling of the loop outruns. A test about the timer drives a VirtualClock.
+UNREACHABLE_COALESCE_WAIT = 1.0
+
+# The operation budget of a test whose subject is that deadline firing while a source pull, a source
+# close or a send stays blocked until the test releases it. Wide enough that a worker-thread hop or a
+# stalled loop cannot spend it before the test reaches the blocked step; since that step never ends on
+# its own, a short budget proves nothing this one does not.
+DEADLINE_BUDGET = 0.2
+
+# How late past ``DEADLINE_BUDGET`` the deadline may end the blocked step: room for a loaded host to run
+# the timer, yet well below any fixed cleanup timeout a regression might use in place of the budget.
+DEADLINE_SLACK = 0.3
+
+# How long past the deadline cleanup may wait for what still blocks: the documented grace of 0.1 s, pinned
+# here rather than read from ``CLEANUP_GRACE_SECONDS``, so a longer grace fails the tests that bound it.
+CLEANUP_GRACE = 0.1
+
+# Only turns a hang into a failure: how long a test waits for something it caused, an event its fake sets,
+# a deadline it set, or a short stream it drains. Generous, since it costs time only when a test already
+# fails: a stalled or loaded host never reaches it, and it never races a budget. Whether a deadline fired
+# near its budget is checked against ``DEADLINE_SLACK`` instead.
+HANG_BOUND = 30.0
+
+
+def deadline_started() -> float:
+    """Return the loop time a test takes just before it starts an operation on ``DEADLINE_BUDGET``."""
+    return asyncio.get_running_loop().time()
+
+
+def assert_fired_near_deadline(started: float) -> None:
+    """Assert the operation deadline, not some fixed timeout, ended the blocked step begun at ``started``."""
+    elapsed = asyncio.get_running_loop().time() - started
+    if elapsed >= DEADLINE_BUDGET + CLEANUP_GRACE + DEADLINE_SLACK:
+        raise AssertionError(f"the deadline fired {elapsed:.3f} s after the start, not near {DEADLINE_BUDGET} s")
+
+
+async def reached(event: asyncio.Event, bound: float = HANG_BOUND) -> None:
+    """Wait for a test-owned ``event``; fail the test, rather than hang it, if it is not set in ``bound``."""
+    try:
+        async with asyncio.timeout(bound):
+            await event.wait()
+    except TimeoutError:
+        raise AssertionError(f"the test's event was not set within {bound} s") from None
+
+
+def raised_driving_the_loop(
+    main: Callable[[], Coroutine[Any, Any, None]], after: Callable[[], Coroutine[Any, Any, None]]
+) -> BaseException:
+    """Drive ``main`` on a loop of the test's own until the loop raises; then run ``after`` there, raising nothing.
+
+    Return what the loop raised. Running the loop again shows the interrupt was handed to it once; a second raise,
+    or ``after`` not ending within ``HANG_BOUND``, fails the test instead of ending or hanging the test session.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        work = loop.create_task(main())
+        try:
+            loop.run_until_complete(work)
+        except BaseException as error:  # noqa: BLE001 - the test inspects what the loop raised
+            raised = error
+        else:
+            raise AssertionError("the loop raised nothing")
+        try:
+            loop.run_until_complete(asyncio.wait_for(after(), HANG_BOUND))
+            work.cancel()
+            loop.run_until_complete(asyncio.gather(work, return_exceptions=True))
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except TimeoutError:
+            raise AssertionError(f"what runs after the loop raised did not end within {HANG_BOUND} s") from None
+        except BaseException as error:  # noqa: BLE001 - raised again, it fails the test instead of ending the session
+            raise AssertionError(f"the loop raised again: {error!r}") from None
+    finally:
+        loop.close()
+    return raised
+
+
+def raised_by_asyncio_run(main: Callable[[], Coroutine[Any, Any, object]], bound: float = HANG_BOUND) -> BaseException:
+    """Return what ``asyncio.run(main())`` raised in a thread of its own; fail if it returns or hangs past ``bound``.
+
+    A hang is the failure: the thread is a daemon one, left behind rather than waited for.
+    """
+    raised: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            asyncio.run(main())
+        except BaseException as error:  # noqa: BLE001 - handed to the test thread
+            raised.append(error)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(bound)
+    if worker.is_alive():
+        raise AssertionError(f"asyncio.run did not return within {bound} s")
+    if not raised:
+        raise AssertionError("asyncio.run returned without raising")
+    return raised[0]
+
+
+class WorkerStarts(ThreadPoolExecutor):
+    """Worker threads for a loop's default executor that set an event as each submitted call starts.
+
+    A synchronous source is pulled and closed in worker threads; installed with
+    ``loop.set_default_executor``, this lets a test wait until a given call is running instead of
+    guessing how long a thread takes to start.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Start with no call submitted."""
+        super().__init__(max_workers=4)
+        self._loop = loop
+        self._submitted = 0
+        self._started: dict[int, asyncio.Event] = {}
+
+    def started(self, call: int) -> asyncio.Event:
+        """Return the event set once the ``call``-th submitted call (from zero) starts running."""
+        return self._started.setdefault(call, asyncio.Event())
+
+    def submit[R](self, fn: Callable[..., R], /, *args: object, **kwargs: object) -> Future[R]:
+        """Submit ``fn`` and set its event once its worker thread starts running it."""
+        started = self.started(self._submitted)
+        self._submitted += 1
+
+        def run() -> R:
+            self._loop.call_soon_threadsafe(started.set)
+            return fn(*args, **kwargs)
+
+        return super().submit(run)
+
+
+async def on_loop[T](items: Iterable[T]) -> AsyncIterator[T]:
+    """Yield ``items`` on the event loop.
+
+    A public family pulls a synchronous source in a worker thread, so when each item reaches the
+    scheduler depends on OS thread scheduling, which no virtual clock sets. A test that asserts exact
+    waves, wave timings or an event order shared by two runs feeds its input through this instead.
+    """
+    for item in items:
+        yield item
+
+
+async def drain_to_failure[T, E: BaseException](stream: AsyncIterator[T], failure: type[E]) -> tuple[list[T], E]:
+    """Drain ``stream`` until it raises ``failure``; return the items it delivered before, and that failure."""
+    items: list[T] = []
+    try:
+        async for item in stream:
+            items.append(item)  # noqa: PERF401 - keep the items delivered before the failure
+    except failure as error:
+        return items, error
+    raise AssertionError(f"the stream ended without {failure.__name__}")
+
+
 def attached_report(error: BaseException) -> object:
     """Return the report an operation attached to its exception, or ``None``."""
     return getattr(error, "report", None)
@@ -150,13 +354,18 @@ def flat_query(parameters: Mapping[str, object]) -> Query:
 
 @dataclass
 class BatchPortal:
-    """Serve envelopes from ``answer`` and record each physical request's command count."""
+    """Serve envelopes from ``answer`` and record each physical request's command count.
+
+    ``wire_turns`` is a deterministic wire latency: each physical request yields that many event-loop
+    turns before it is answered, so the consumer and the producers run while it is on the wire.
+    """
 
     answer: Answer
     host: str = HOST
     waves: list[int] = field(default_factory=list)
     methods: list[tuple[str, ...]] = field(default_factory=list)
     queries: list[Query] = field(default_factory=list)
+    wire_turns: int = 0
 
     async def _envelope(self, method: str, query: Query) -> Envelope:
         self.queries.append(query)
@@ -168,6 +377,8 @@ class BatchPortal:
     async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
         """Answer one direct request or one classic physical batch."""
         del attempt_timeout, max_response_bytes
+        for _turn in range(self.wire_turns):
+            await asyncio.sleep(0)
         parameters = request.copy_parameters()
         if request.method != "batch":
             self.waves.append(1)

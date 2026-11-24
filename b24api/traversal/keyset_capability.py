@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from b24api.contracts.keyset_execution import (
+    KeysetPageCompletion,
     KeysetPhase,
 )
 from b24api.errors import PaginationError
@@ -96,6 +97,24 @@ class AnchorResult:
     empty_probes: int
     raw_rows: int
     discarded_rows: int
+    empty_below: tuple[tuple[int, int], ...]
+    # Per fence, what a probe page showed above it: ``(fence, rows, ids)``, ``rows`` rows over ``ids`` values.
+    above: tuple[tuple[int, int, int], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeSample:
+    """What one anchor probe's page showed above the row it found: ``rows`` more rows over ``ids`` values.
+
+    A page spans the values up to its last row. A page short of the cap spans every value below the
+    probe's upper fence only when the completion says a short page exhausts what it reads
+    (``SHORT_PAGE_EXHAUSTS``): under ``EMPTY_CONFIRMATION`` a server may cap its pages below the
+    requested size, and a short page proves nothing beyond its last row.
+    """
+
+    fence: int
+    rows: int
+    ids: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +163,14 @@ def analyze_boundary(
     return BoundaryAnalysis(facts, total_hint, boundary_density(facts))
 
 
+_ONE_DIGIT = 9
+
+
+def _crosses_width(left: int, right: int) -> bool:
+    """Return whether two identities have different decimal widths."""
+    return len(str(abs(left))) != len(str(abs(right)))
+
+
 def canary_commands(
     ascending: tuple[int, ...],
     descending: tuple[int, ...],
@@ -152,19 +179,22 @@ def canary_commands(
     """Derive the five fixed bounded-capability checks from boundary prefixes."""
     prefixes = (ascending, tuple(reversed(descending)))
     pairs = tuple((values[index], values[index + 1]) for values in prefixes for index in range(len(values) - 1))
-    pair = next(
-        ((left, right) for left, right in pairs if len(str(abs(left))) != len(str(abs(right)))),
-        pairs[0] if pairs else None,
-    )
+    pair = next(((left, right) for left, right in pairs if _crosses_width(left, right)), pairs[0] if pairs else None)
     if pair is None or page_cap < 2:
         raise PaginationError("boundary facts cannot construct five capability canaries")
     p, q = pair
+    # The two-row checks must compare identities of different decimal widths, which a portal comparing
+    # them as text orders wrongly. When no observed pair has them and ``p`` is the selection's smallest
+    # identity, their lower bound drops to the widest value one digit shorter: nothing lies between.
+    low = p - 1
+    if not _crosses_width(p, q) and p == ascending[0] and p > _ONE_DIGIT:
+        low = 10 ** (len(str(p)) - 1) - 1
     definitions = (
         (p, p + 1, ()),
         (p - 1, p, ()),
         (p - 1, p + 1, (p,)),
-        (p - 1, q + 1, (p, q)),
-        (p - 1, q + 1, (q, p)),
+        (low, q + 1, (p, q)),
+        (low, q + 1, (q, p)),
     )
     return tuple(
         CapabilityCommand(
@@ -184,18 +214,14 @@ def anchor_commands(
     upper_exclusive: int,
     target_lanes: int,
     page_cap: int,
-    writable_limit: bool,
 ) -> tuple[CapabilityCommand, ...]:
-    """Describe occupied-anchor probes independently of scheduler state."""
-    reserve = 1 if writable_limit else page_cap
+    """Describe occupied-anchor probes independently of scheduler state.
+
+    Each probe reads a page from its guess: its first row is the anchor, and the rest measure the
+    density of the lane the anchor opens (``ProbeSample``) before they are discarded.
+    """
     return tuple(
-        CapabilityCommand(
-            ordinal,
-            LaneBounds(guess, upper_exclusive),
-            descending=False,
-            reserve=reserve,
-            expects_single_row=writable_limit,
-        )
+        CapabilityCommand(ordinal, LaneBounds(guess, upper_exclusive), descending=False, reserve=page_cap)
         for ordinal, guess in enumerate(
             anchor_guesses(lo=lo, upper_exclusive=upper_exclusive, target_lanes=target_lanes),
         )
@@ -204,16 +230,26 @@ def anchor_commands(
 
 def normalize_anchor_receipts(
     receipts: tuple[LaneReceipt, ...],
+    samples: tuple[ProbeSample, ...],
     *,
     lo: int,
     upper_exclusive: int,
+    guesses: dict[str, int],
 ) -> AnchorResult:
-    """Normalize probe receipts into retained anchor values and provenance."""
+    """Normalize probe receipts into retained anchor values, provenance and the gaps they reveal.
+
+    A probe returns the first identity above its guess, or nothing below ``upper_exclusive``: no
+    identity lies between the guess and that fence, which ``empty_below`` keeps per fence. ``above``
+    keeps, per fence, the widest sample a probe page took above it.
+    """
     anchors: list[int] = []
     rows: dict[int, FrozenJson] = {}
     commands: dict[int, str] = {}
+    empty_below: dict[int, int] = {}
     empty = discarded = 0
     for receipt in receipts:
+        fence = receipt.identities[0] if receipt.rows else upper_exclusive
+        empty_below[fence] = min(empty_below.get(fence, fence), guesses[receipt.command_id])
         if not receipt.rows:
             empty += 1
             continue
@@ -222,6 +258,11 @@ def normalize_anchor_receipts(
         rows.setdefault(anchor, receipt.rows[0])
         commands.setdefault(anchor, receipt.command_id)
         discarded += max(0, len(receipt.rows) - 1)
+    above: dict[int, ProbeSample] = {}
+    for sample in samples:
+        kept = above.get(sample.fence)
+        if kept is None or sample.ids > kept.ids:
+            above[sample.fence] = sample
     normalized = normalize_anchors(lo=lo, upper_exclusive=upper_exclusive, anchors=tuple(anchors))
     return AnchorResult(
         normalized,
@@ -230,13 +271,26 @@ def normalize_anchor_receipts(
         empty,
         sum(len(receipt.rows) for receipt in receipts),
         discarded + len(anchors) - len(normalized),
+        tuple(sorted(empty_below.items())),
+        tuple((fence, sample.rows, sample.ids) for fence, sample in sorted(above.items())),
     )
+
+
+def _sample(receipt: LaneReceipt, *, exhausted: bool, upper_exclusive: int) -> ProbeSample:
+    first, last = receipt.identities[0], receipt.identities[-1]
+    reach = upper_exclusive - 1 if exhausted else last
+    return ProbeSample(first, len(receipt.rows) - 1, max(0, reach - first))
 
 
 def compact_anchor_receipts(
     receipts: tuple[LaneReceipt, ...],
-) -> tuple[tuple[LaneReceipt, ...], int, int]:
-    """Keep only each probe's usable first row and report discarded raw rows."""
+    *,
+    page_cap: int,
+    completion: KeysetPageCompletion,
+    upper_exclusive: int,
+) -> tuple[tuple[LaneReceipt, ...], tuple[ProbeSample, ...], int, int]:
+    """Keep only each probe's usable first row, sample the rest, and report discarded raw rows."""
+    short_exhausts = completion is KeysetPageCompletion.SHORT_PAGE_EXHAUSTS
     compact = tuple(
         replace(
             receipt,
@@ -245,8 +299,13 @@ def compact_anchor_receipts(
         )
         for receipt in receipts
     )
+    samples = tuple(
+        _sample(receipt, exhausted=short_exhausts and len(receipt.rows) < page_cap, upper_exclusive=upper_exclusive)
+        for receipt in receipts
+        if receipt.identities
+    )
     retained = sum(bool(receipt.rows) for receipt in receipts)
-    return compact, sum(len(receipt.rows) for receipt in receipts) - retained, retained
+    return compact, samples, sum(len(receipt.rows) for receipt in receipts) - retained, retained
 
 
 def anchor_capable_batch_capacity(*, current: int, available_rows: int, page_cap: int, target_lanes: int) -> int:

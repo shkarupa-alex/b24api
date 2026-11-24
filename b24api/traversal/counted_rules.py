@@ -10,12 +10,12 @@ accepting variable-width pages it legitimately accepts today.
 from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Literal
 
+from b24api.contracts.report import PageRejectionCode
 from b24api.contracts.traversal import OffsetContinuation
-from b24api.errors import CapabilityError
+from b24api.errors import CapabilityError, PaginationError
 
-type CountedHeadDecision = Literal["EMPTY", "DENSE", "SEQUENTIAL", "REJECT"]
+ENDED_BEFORE_TOTAL = "traversal terminated before its exact total"
 
 
 def expected_counted_next(offset: int, stride: int, total: int) -> int | None:
@@ -88,10 +88,10 @@ class EmptyHeadFacts:
 def empty_source_head_eligible(facts: EmptyHeadFacts) -> bool:
     """Return whether an unvalidated head may witness an empty source.
 
-    Only the first counted page at offset zero qualifies, with empty source and adapted rows, no
-    usable total, no continuation, no fixed step, no earlier exact total and no caller-declared
-    qualified-total confirmation. ``-1`` is the unknown-total sentinel and never counts as zero, and
-    ``next=0`` is a continuation, not its absence.
+    Only the first page at offset zero of an exact-total traversal (counted or sequential) qualifies,
+    with empty source and adapted rows, no usable total, no continuation, no fixed step, no earlier
+    exact total and no caller-declared qualified-total confirmation. ``-1`` is the unknown-total
+    sentinel and never counts as zero, and ``next=0`` is a continuation, not its absence.
     """
     return (
         not facts.fixed_step
@@ -108,16 +108,6 @@ def empty_source_head_eligible(facts: EmptyHeadFacts) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
-class CountedHeadFacts:
-    """The immutable decision a counted head transaction hands to its continuation."""
-
-    decision: CountedHeadDecision
-    total: int | None
-    stride: int | None
-    head_rows: int
-
-
-@dataclass(frozen=True, slots=True)
 class CountedHeadPlan:
     """The plan fields the counted head range rules read."""
 
@@ -125,7 +115,29 @@ class CountedHeadPlan:
     fixed_stride: int | None
 
 
-def counted_head_range(  # noqa: C901 - one closed set of head range contradictions
+def _head_stride(
+    plan: CountedHeadPlan,
+    *,
+    total: int,
+    next_offset: int | None,
+    head_rows: int,
+    page_size: int,
+) -> int | None:
+    """Return the tail width a head names: declared, the whole range, its continuation or its row count."""
+    if plan.fixed_stride is not None:
+        return plan.fixed_stride
+    if total == head_rows:
+        # The head holds the whole range: no tail is planned, so no continuation has to name its width.
+        return max(page_size, head_rows)
+    if plan.continuation is OffsetContinuation.SERVER_NEXT:
+        if next_offset is None:
+            # A server-next page without next ends the source, here short of its exact total.
+            raise PaginationError(ENDED_BEFORE_TOTAL, rejection_code=PageRejectionCode.TOTAL_DRIFT)
+        return next_offset
+    return head_rows
+
+
+def counted_head_range(
     plan: CountedHeadPlan,
     *,
     total: int | None,
@@ -137,34 +149,34 @@ def counted_head_range(  # noqa: C901 - one closed set of head range contradicti
     if total is None or total < 0:
         raise CapabilityError("parallel counted traversal requires a non-negative total")
     if total < head_rows:
-        raise CapabilityError("parallel counted traversal observed total below the head page")
-    stride: int | None
-    if total == 0 and not head_rows:
-        stride = page_size
-    elif plan.fixed_stride is not None:
-        stride = plan.fixed_stride
-    elif plan.continuation is OffsetContinuation.SERVER_NEXT:
-        stride = next_offset
-    elif plan.continuation is OffsetContinuation.OBSERVED_COUNT:
-        stride = head_rows
-    else:
-        stride = next_offset if next_offset is not None and next_offset > 0 else head_rows
+        raise PaginationError(
+            "parallel counted traversal observed total below the head page",
+            rejection_code=PageRejectionCode.TOTAL_DRIFT,
+        )
+    stride = _head_stride(plan, total=total, next_offset=next_offset, head_rows=head_rows, page_size=page_size)
     if not isinstance(stride, int) or isinstance(stride, bool) or stride < 1:
         raise CapabilityError("parallel counted traversal requires a positive in-band stride")
     if head_rows != min(stride, total):
-        raise CapabilityError("parallel counted head length contradicts the planned exact range")
-    if total > head_rows and next_offset is None and plan.continuation is OffsetContinuation.SERVER_NEXT:
-        raise CapabilityError("parallel counted traversal has no in-band tail stride")
+        raise PaginationError(
+            "parallel counted head length contradicts the planned exact range",
+            rejection_code=PageRejectionCode.RANGE_CONTRADICTION,
+        )
     if (
-        plan.continuation in {OffsetContinuation.SERVER_NEXT, OffsetContinuation.SERVER_NEXT_OR_OBSERVED_COUNT}
+        plan.continuation is OffsetContinuation.SERVER_NEXT
         and next_offset is not None
         and next_offset > 0
         and next_offset != stride
     ):
-        raise CapabilityError("parallel counted head continuation contradicts its row count")
+        raise PaginationError(
+            "parallel counted head continuation contradicts its row count",
+            rejection_code=PageRejectionCode.RANGE_CONTRADICTION,
+        )
     verdict = judge_counted_page(CountedPageFacts(0, head_rows, 0, total, next_offset, plan.continuation))
     if verdict.contradiction is CountedContradiction.CONTINUATION_AFTER_TOTAL:
-        raise CapabilityError("parallel counted traversal completed while continuation remained")
+        raise PaginationError(
+            "parallel counted traversal completed while continuation remained",
+            rejection_code=PageRejectionCode.RANGE_CONTRADICTION,
+        )
     return total, stride
 
 
@@ -189,24 +201,25 @@ def check_tail_page(  # noqa: PLR0913 - the planned range of one tail page
 ) -> None:
     """Reject a tail page whose rows, total or continuation contradict the planned exact range."""
     if rows != min(stride, total - start):
-        raise CapabilityError("parallel counted page length contradicts the planned exact range")
+        raise PaginationError(
+            "parallel counted page length contradicts the planned exact range",
+            rejection_code=PageRejectionCode.RANGE_CONTRADICTION,
+        )
     if total_reported not in {None, -1} and total_reported != total:
-        raise CapabilityError("parallel counted page total contradicts the head total")
+        raise PaginationError(
+            "parallel counted page total contradicts the head total", rejection_code=PageRejectionCode.TOTAL_DRIFT
+        )
     expected_next = expected_counted_next(start, stride, total)
     if continuation is OffsetContinuation.SERVER_NEXT and next_reported != expected_next:
-        raise CapabilityError("parallel counted continuation contradicts the planned exact range")
-    if (
-        continuation is OffsetContinuation.SERVER_NEXT_OR_OBSERVED_COUNT
-        and next_reported is not None
-        and next_reported != expected_next
-    ):
-        raise CapabilityError("parallel counted continuation contradicts the planned exact range")
+        raise PaginationError(
+            "parallel counted continuation contradicts the planned exact range",
+            rejection_code=PageRejectionCode.RANGE_CONTRADICTION,
+        )
 
 
 __all__ = [
+    "ENDED_BEFORE_TOTAL",
     "CountedContradiction",
-    "CountedHeadDecision",
-    "CountedHeadFacts",
     "CountedHeadPlan",
     "CountedPageFacts",
     "CountedVerdict",

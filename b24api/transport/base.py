@@ -9,7 +9,7 @@ from b24api.contracts.json import FrozenMapping, JsonValue, thaw_json
 from b24api.contracts.request import ReplaySafety, Request, ResultErrorSpec
 from b24api.contracts.request_summary import RequestSummary, RouteKind
 from b24api.contracts.response import _safe_media_type
-from b24api.contracts.wire import BodyEncoding, RequestHeaders
+from b24api.contracts.wire import BodyEncoding, RawContent, RequestHeaders
 from b24api.contracts.wire_body import V3_BATCH_METHOD, V3BatchBody
 from b24api.errors import CapabilityError
 
@@ -63,6 +63,8 @@ class WireResponse:
 class TransportCapabilities:
     """Advanced request features explicitly honored by a transport."""
 
+    # A transport that declares ``QUERY_STRING`` sends such a request's parameters in the URL's query, as a GET,
+    # or as a POST of its raw ``content`` byte for byte, with the declared content type, when it has one.
     encodings: frozenset[BodyEncoding] = frozenset({BodyEncoding.JSON})
     scoped_headers: bool = False
     positional_json: bool = False
@@ -72,6 +74,10 @@ class TransportCapabilities:
     # A top-level JSON array body (the native REST v3 batch envelope) is sent only to a transport that
     # declares it: ``send_wire`` must serialize ``WireRequest.array_body`` instead of named parameters.
     json_array_body: bool = field(default=False, kw_only=True)
+    # A transport that ends each attempt by its ``attempt_timeout`` itself, and classifies that timeout by how far
+    # the attempt got (proven not sent before dispatch), declares it: the executor then sets no deadline of its own
+    # around the attempt, whose expiry could not tell a request never sent from one that may have run.
+    bounds_attempts: bool = field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
         """Validate and freeze advertised capabilities."""
@@ -89,6 +95,8 @@ class TransportCapabilities:
             raise TypeError("positional_json must be a bool")
         if not isinstance(self.json_array_body, bool):
             raise TypeError("json_array_body must be a bool")
+        if not isinstance(self.bounds_attempts, bool):
+            raise TypeError("bounds_attempts must be a bool")
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -101,6 +109,7 @@ class WireRequest:
     encoding: BodyEncoding
     headers: RequestHeaders
     result_error: ResultErrorSpec | None
+    content: RawContent | None
     _parameters: FrozenMapping = field(repr=False)
     _positional: PositionalArguments | None = field(repr=False)
     _array_body: V3BatchBody | None = field(repr=False)
@@ -114,6 +123,7 @@ class WireRequest:
         object.__setattr__(self, "replay_safety", request.replay_safety)
         object.__setattr__(self, "encoding", request.encoding)
         object.__setattr__(self, "headers", request.headers)
+        object.__setattr__(self, "content", request.content)
         object.__setattr__(self, "result_error", request.result_error)
         object.__setattr__(self, "_parameters", request._parameters)  # noqa: SLF001 - canonical immutable handoff
         object.__setattr__(self, "_positional", request.positional)
@@ -137,6 +147,7 @@ class WireRequest:
         object.__setattr__(wire, "replay_safety", replay_safety)
         object.__setattr__(wire, "encoding", BodyEncoding.JSON)
         object.__setattr__(wire, "headers", RequestHeaders())
+        object.__setattr__(wire, "content", None)
         object.__setattr__(wire, "result_error", None)
         object.__setattr__(wire, "_parameters", FrozenMapping({}))
         object.__setattr__(wire, "_positional", None)
@@ -192,7 +203,11 @@ class Transport(Protocol):
     operation deadline is only a hard public bound when the injected transport
     cooperates with cancellation or returns within ``attempt_timeout``. A send-only
     transport cannot declare routes, so the executor gives it only ``RouteKind.BARE``
-    requests; a ``WireTransport`` declares the routes it builds in its capabilities.
+    requests; a ``WireTransport`` declares the routes it builds in its capabilities. A send refused because
+    the transport is closed raises ``ClientClosedError``: it never left the process, so the executor counts no
+    physical request for it and ends it as a stop before the send. Any other failure before dispatch (a
+    credential unavailable, a connection pool timeout, a refused connection) is a ``TransportError`` of its
+    phase, and its send counts, as ``HttpxTransport`` does.
     """
 
     @property
@@ -250,7 +265,7 @@ def preflight_transport(transport: WireTransport | None, request: Request) -> No
     if request.route not in capabilities.routes:
         raise CapabilityError(f"transport does not build the {request.route.value} route")
     if request.encoding not in capabilities.encodings:
-        raise CapabilityError(f"transport does not support {request.encoding.value} request bodies")
+        raise CapabilityError(f"transport does not support {request.encoding.value} requests")
     if request.headers.items and not capabilities.scoped_headers:
         raise CapabilityError("transport does not support scoped request headers")
 

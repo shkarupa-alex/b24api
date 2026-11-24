@@ -79,6 +79,7 @@ class KeysetTransactionHost(Protocol):
     page_adapter: PageAdapter
     completion_recorder: FastPageLedger
     completion: KeysetPageCompletion
+    command_capacity: int
     batch_capacity: int
     admission: OrderedAdmissionState
     violations: list[Violation]

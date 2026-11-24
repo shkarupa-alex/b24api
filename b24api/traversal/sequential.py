@@ -4,6 +4,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from b24api.completion.closure import QUALIFIED_TOTAL_REACHED, SINGLE_RESPONSE_COMPLETE
+from b24api.contracts.completion import EMPTY_SOURCE_WITNESS
+from b24api.contracts.policy import TotalSemantics
 from b24api.contracts.report import PageDispatch, PageRejectionCode
 from b24api.contracts.response import result_snapshot
 from b24api.contracts.traversal import OffsetContinuation
@@ -12,7 +14,6 @@ from b24api.traversal import offset_rules
 from b24api.traversal.counted_rules import CountedContradiction, CountedPageFacts, judge_counted_page
 from b24api.traversal.identity import (
     _Page,
-    _PageRejectionError,
     _request_with_controls,
 )
 from b24api.traversal.plans import OffsetSequentialPlan, OffsetTerminalRule
@@ -102,6 +103,8 @@ class OffsetStrategy:
         self._terminal: str | None = None
         self._expected_raw_total: int | None = None
         self._pending_short_window = False
+        self._from_first_page = True
+        self._reported_total: int | None = None
 
     def first_request(self, ctx: StrategyContext) -> Request:
         """Start at the request's own offset; a sparse raw traversal must cover the range from zero."""
@@ -109,6 +112,7 @@ class OffsetStrategy:
         offset = offset_rules.initial_offset(ctx.request, plan.offset_path, default=plan.initial_control)
         if plan.sparse_raw_bound is not None and offset != 0:
             raise CapabilityError("sparse raw traversal requires the complete range from offset zero")
+        self._from_first_page = offset == plan.initial_control
         ctx.cursor_state = offset
         return self._request(ctx, offset)
 
@@ -139,14 +143,23 @@ class OffsetStrategy:
                 ),
             )
             return PageVerdict(terminal is not None)
+        empty_source = False
         if sparse is None:
+            accepted = ctx.validated_rows + len(items)
             terminal = offset_rules.offset_terminal(
                 plan,
                 response,
                 page_size=len(items),
-                accepted=ctx.validated_rows + len(items),
+                accepted=accepted,
                 confirmation=ctx.confirmation_policy,
             )
+            empty_source = terminal is not None and ctx.empty_source_head_eligible(
+                response, ctx.source_page.current(items), items
+            )
+            if empty_source:
+                terminal = EMPTY_SOURCE_WITNESS.terminal_reason
+            elif terminal is not None:
+                self._check_reported_total(ctx, response, accepted)
         else:
             terminal, self._expected_raw_total = sparse_page_terminal(
                 sparse,
@@ -168,8 +181,32 @@ class OffsetStrategy:
         )
         if next_offset is not None and next_offset <= offset:
             raise PaginationError("offset did not advance")
+        if response.total is not None and response.total >= 0:
+            self._reported_total = response.total
         self._terminal, self._next_offset = terminal, next_offset
-        return PageVerdict(terminal is not None)
+        return PageVerdict(terminal is not None, empty_source=empty_source)
+
+    def _check_reported_total(self, ctx: StrategyContext, response: Response, accepted: int) -> None:
+        """Refuse a server-next end whose row count contradicts the reported total, when nothing else checks it.
+
+        A server-next traversal reads the ordinary Bitrix list envelope, whose ``total`` counts the
+        filter's rows: read from its first page, it must end with that many. The page's own total is
+        used, or the latest one an earlier page reported when the end carries none. Under ``IGNORE``
+        total semantics no total closes or qualifies the traversal, so this end check is its only use;
+        an exact total is checked by the driver on every page, and an advisory one only warns. An
+        observed-count or fixed-step endpoint has no such envelope, and its total is never read
+        unless the caller qualifies it.
+        """
+        if (
+            not self._from_first_page
+            or OffsetTerminalRule.NO_CONTINUATION not in self._plan.terminal
+            or ctx.total_semantics is not TotalSemantics.IGNORE
+        ):
+            return
+        total = response.total if response.total is not None and response.total >= 0 else self._reported_total
+        contradiction = offset_rules.reported_total_contradiction(total=total, delivered=accepted)
+        if contradiction is not None:
+            raise contradiction
 
     def advance(self, ctx: StrategyContext, identities: list[IdentityValue]) -> Request | PageStop:
         """Stop on a terminal page, refuse an unprovable short window, else request the next offset."""
@@ -194,6 +231,7 @@ class CountedStrategy:
         self._visited: set[int] = set()
         self._offset = 0
         self._next_offset: int | None = None
+        self._terminal = QUALIFIED_TOTAL_REACHED
 
     def first_request(self, ctx: StrategyContext) -> Request:
         """Start at offset zero."""
@@ -222,29 +260,30 @@ class CountedStrategy:
         verdict = judge_counted_page(
             CountedPageFacts(offset, len(items), ctx.validated_rows, effective_total, response.next, plan.continuation),
         )
-        terminal = verdict.terminal
-        if not terminal and not items:
-            raise _PageRejectionError(
-                "counted traversal ended before its exact total",
-                PageRejectionCode.RANGE_CONTRADICTION,
-            )
         if verdict.contradiction is CountedContradiction.CONTINUATION_AFTER_TOTAL:
-            raise CapabilityError("counted traversal completed while continuation remained")
+            raise PaginationError(
+                "counted traversal completed while continuation remained",
+                rejection_code=PageRejectionCode.RANGE_CONTRADICTION,
+            )
+        # An empty page, or a server-next page without next, ends the source; the driver then refuses an
+        # end short of the exact total, as it does for every traversal closed by one.
+        ended = not items or (plan.continuation is OffsetContinuation.SERVER_NEXT and response.next is None)
+        terminal = verdict.terminal or ended
+        empty_source = terminal and ctx.empty_source_head_eligible(response, ctx.source_page.current(items), items)
         next_offset = (
             None if terminal else offset_rules.next_offset(plan, response, current=offset, observed=len(items))
         )
         if next_offset is not None and next_offset <= offset:
             raise PaginationError("counted offset did not advance")
         self._next_offset = next_offset
-        return PageVerdict(terminal)
+        self._terminal = EMPTY_SOURCE_WITNESS.terminal_reason if empty_source else QUALIFIED_TOTAL_REACHED
+        return PageVerdict(terminal, empty_source=empty_source)
 
     def advance(self, ctx: StrategyContext, identities: list[IdentityValue]) -> Request | PageStop:
-        """Stop once the committed rows reach the exact total, else request the next offset."""
+        """Stop at a terminal page, else request the next offset."""
         del identities
-        if ctx.expected_total is not None and ctx.validated_rows == ctx.expected_total:
-            return PageStop(QUALIFIED_TOTAL_REACHED)
         if self._next_offset is None:
-            raise RuntimeError("non-terminal counted page lacks its validated next offset")
+            return PageStop(self._terminal)
         ctx.cursor_state = self._next_offset
         return self._request(ctx, self._next_offset)
 

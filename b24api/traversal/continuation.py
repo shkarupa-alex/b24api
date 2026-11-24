@@ -18,8 +18,7 @@ from b24api.contracts.page import PageView
 from b24api.contracts.reference import ParameterUpdate
 from b24api.contracts.response import result_snapshot
 from b24api.errors import CapabilityError, ContinuationError
-from b24api.traversal.identity import _request_with_controls
-from b24api.traversal.keyset_eligibility import _path_lookup
+from b24api.traversal.identity import _path_lookup, _request_with_controls
 from b24api.traversal.strategy_context import PageStop, PageVerdict
 
 if TYPE_CHECKING:
@@ -47,11 +46,28 @@ def _normalized(path: ParameterPath) -> tuple[str | int, ...]:
     return tuple(part.casefold() if isinstance(part, str) else part for part in path.path)
 
 
+def _wire_text(value: JsonValue) -> JsonValue:
+    """Return a control value as the server reads it: every scalar as the text the query encoding sends.
+
+    ``1``, ``"1"`` and ``True`` reach a PHP endpoint as the same ``1``, so a rule that alternates between
+    them repeats its control vector.
+    """
+    if isinstance(value, dict):
+        return {key: _wire_text(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_wire_text(item) for item in value]
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, int | float):
+        return str(value)
+    return value
+
+
 def _canonical(vector: list[tuple[tuple[str | int, ...], bool, JsonValue]]) -> bytes:
-    """Encode a control vector independently of mapping key order and update order."""
+    """Encode a control vector independently of mapping key order, update order and scalar spelling."""
     ordered = sorted(vector, key=lambda entry: json.dumps(entry[0]))
     return json.dumps(
-        [[list(path), present, value] for path, present, value in ordered],
+        [[list(path), present, _wire_text(value)] for path, present, value in ordered],
         ensure_ascii=False,
         allow_nan=False,
         separators=(",", ":"),

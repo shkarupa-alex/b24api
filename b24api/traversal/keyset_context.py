@@ -8,10 +8,13 @@ never imports references: both sides meet in these protocols.
 """
 
 from __future__ import annotations
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from b24api.batch.outcome import BatchOutcome
+    from b24api.contracts.completion import CommandSettlement
     from b24api.contracts.policy import ExecutionPolicy
     from b24api.contracts.report import PageDispatch
     from b24api.contracts.request import Request
@@ -29,6 +32,10 @@ class KeysetContext(Protocol):
     @property
     def execution_context(self) -> ExecutionContext:
         """Return the operation context the engine and the executor charge requests to."""
+        ...
+
+    def planning_rows(self) -> int:
+        """Return the buffered rows a plan may use, as it is chosen; ``policy`` names them from then on."""
         ...
 
     async def start(self) -> None:
@@ -60,6 +67,13 @@ class KeysetContext(Protocol):
         ...
 
 
+class FailedWavePage(NamedTuple):
+    """One page of a wave whose engine call raised: how its command settled, and its index in its physical batch."""
+
+    settlement: CommandSettlement
+    batch_index: int | None
+
+
 class WaveEngine(Protocol):
     """Execute the atomic correlated waves and the sequential finish pages of one fast keyset runtime."""
 
@@ -73,26 +87,38 @@ class WaveEngine(Protocol):
         """Return how ``execute_page`` sends a finish page: direct, or as a command of a shared batch."""
         ...
 
-    async def execute_page(self, request: Request, *, context: ExecutionContext) -> BatchOutcome:
-        """Execute one sequential finish page and return its correlated outcome.
+    async def execute_page(self, request: Request, *, command_id: str, context: ExecutionContext) -> BatchOutcome:
+        """Execute one sequential finish page, the scheduled page ``command_id``, and return its outcome.
 
         A command failure of a shared batch, refused or lost, is returned as a ``BatchFailure``, as a
         wave command's is; a direct page raises its failure, as a direct request does, and so does a
-        failure of the whole shared batch envelope.
+        failure of the whole shared batch envelope. A page whose call raises is settled by the engine first.
         """
         ...
 
     async def execute_requests(
         self,
-        requests: tuple[Request, ...],
+        pages: Mapping[str, Request],
         *,
         context: ExecutionContext,
         advisory_totals: bool = False,
         strict_envelope: bool = False,
-        strict_json_members: bool = False,
     ) -> tuple[BatchOutcome, ...]:
-        """Return one correlated outcome per request, in request order."""
+        """Return one correlated outcome per scheduled page of ``pages``, keyed by command id, in its order.
+
+        When the call raises, the engine settles every page first, by its command id, from what its own command
+        is known to have done: the page ledger can then reject the successful ones, and it settles a page never
+        handed to an engine as not executed (``FastPageLedger.close``).
+        """
+        ...
+
+    def failed_pages(self, error: BaseException) -> tuple[FailedWavePage, ...] | None:
+        """Return each page of the latest call that raised ``error``, as the engine settled it, in the call's order.
+
+        ``None`` when ``error`` is not what the latest call raised: it ended the operation outside the engine. A call
+        that raised, a cancelled one included, keeps every page, each settled from what its command did.
+        """
         ...
 
 
-__all__ = ["KeysetContext", "WaveEngine"]
+__all__ = ["FailedWavePage", "KeysetContext", "WaveEngine"]

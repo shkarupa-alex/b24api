@@ -6,23 +6,23 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
-from b24api.batch.outcome import BatchFailure, BatchSuccess
+from b24api.batch.outcome import BatchFailure, BatchSuccess, settlement_of
+from b24api.completion.page_failure import failed_page
 from b24api.contracts.keyset_execution import ClosureWitness, KeysetPageCompletion, KeysetPhase
 from b24api.contracts.page import IdentityPageAdapter, PageAdapter
 from b24api.contracts.policy import ReplayDisposition
 from b24api.contracts.report import PageOutcome, PageRejectionCode, Violation, ViolationSeverity
 from b24api.contracts.request import ResultSelector
 from b24api.errors import (
-    AmbiguousExecutionError,
     B24ApiError,
     CapabilityError,
+    IdentityContractError,
     PageAdaptationError,
     PaginationError,
-    ProtocolError,
 )
 from b24api.traversal.keyset_geometry import closure_witness
-from b24api.traversal.page_adaptation import adapt_page
-from b24api.traversal.values import _coerce_identity, _extract_path, _response_items, _validate_order
+from b24api.traversal.page_adaptation import PageTokens, adapt_page
+from b24api.traversal.values import _response_items, _row_identity, _validate_order
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -106,19 +106,20 @@ def select_rows(*, outcome: BatchSuccess, selector: ResultSelector) -> tuple[Fro
     return tuple(_response_items(outcome.response, selector))
 
 
-def classify_rejection(outcome: BatchOutcome) -> tuple[PageOutcome, PageRejectionCode]:
-    """Classify one correlated failure without inspecting unsafe values."""
+def classify_rejection(
+    outcome: BatchOutcome, receipt: ReceiptRejection
+) -> tuple[PageOutcome, PageRejectionCode] | None:
+    """Classify one rejected receipt without inspecting unsafe values: its own contract failure first.
+
+    A failed command is traced by ``failed_page``'s one rule: ``None`` for a command that never executed.
+    """
+    if isinstance(receipt.error, PageAdaptationError):
+        return PageOutcome.REJECTED, PageRejectionCode.PAGE_ADAPTATION
+    if isinstance(receipt.error, IdentityContractError):
+        return PageOutcome.REJECTED, PageRejectionCode.IDENTITY_CONTRACT
     if not isinstance(outcome, BatchFailure):
         return PageOutcome.REJECTED, PageRejectionCode.RANGE_CONTRADICTION
-    error = outcome.error
-    if isinstance(error, AmbiguousExecutionError):
-        return PageOutcome.UNKNOWN, PageRejectionCode.AMBIGUOUS_EXECUTION
-    if isinstance(error, ProtocolError):
-        summary = error.request_summary
-        if summary is not None and summary.method == "batch":
-            return PageOutcome.REJECTED, PageRejectionCode.BATCH_ENVELOPE
-        return PageOutcome.REJECTED, PageRejectionCode.COMMAND_FAILURE
-    return PageOutcome.REJECTED, PageRejectionCode.COMMAND_FAILURE
+    return failed_page(outcome.error, settlement_of(outcome))
 
 
 def validate_lane_receipt(  # noqa: PLR0913
@@ -148,20 +149,29 @@ def validate_lane_receipt(  # noqa: PLR0913
     rows: tuple[FrozenJson, ...] = ()
     try:
         rows = _response_items(outcome.response, selector or ResultSelector.root())
-        if plan.phase is not KeysetPhase.ANCHOR_PROBE:
-            rows = adapt_page(
-                outcome.response,
-                rows,
-                adapter=page_adapter,
-                identities=((identity.item_path, identity.coercion),),
-                request_summary=plan.request.summary,
-                page_offset=lane.rounds,
-            )
+        # Every phase, the anchor probe too: a partition lane publishes its retained anchor row as a fence.
+        rows = adapt_page(
+            outcome.response,
+            rows,
+            adapter=page_adapter,
+            tokens=PageTokens((identity,)),
+            row_offset=lane.received_rows,
+            request_summary=plan.request.summary,
+            page_offset=lane.rounds,
+        )
         if len(rows) > effective_page_cap or len(rows) > plan.reserved_rows:
             raise PaginationError("response exceeded the declared keyset page cap")
         if plan.expects_single_row and len(rows) > 1:
             raise PaginationError("anchor probe returned more than one row")
-        coerced = tuple(_coerce_identity(_extract_path(row, identity.item_path), identity.coercion) for row in rows)
+        coerced = tuple(
+            _row_identity(
+                row,
+                identity,
+                row_offset=lane.received_rows + index,
+                request_summary=plan.request.summary,
+            )
+            for index, row in enumerate(rows)
+        )
         if any(not isinstance(value, int) for value in coerced):
             raise PaginationError("fast keyset identity must coerce to an integer")
         identities = tuple(value for value in coerced if isinstance(value, int))
@@ -199,6 +209,8 @@ def validate_lane_receipt(  # noqa: PLR0913
         )
     except PageAdaptationError as error:
         return _rejection(plan, str(error), code="page_adaptation", selected_rows=len(rows), error=error)
+    except IdentityContractError as error:
+        return _rejection(plan, str(error), code="identity_contract", selected_rows=len(rows), error=error)
     except (CapabilityError, PaginationError) as error:
         return _rejection(plan, str(error), code="range_contradiction", selected_rows=len(rows), error=error)
 
@@ -208,7 +220,11 @@ def validate_boundary_direction(
     ascending: LaneReceipt,
     descending: LaneReceipt,
 ) -> ReceiptRejection | None:
-    """Reject an ignored descending direction before boundary admission."""
+    """Reject boundary pages whose directions contradict each other before boundary admission.
+
+    Each direction's first page starts at its end of one selection: the ascending page at its least identity, the
+    descending page at its greatest. Neither may then hold an identity beyond the other's end.
+    """
     if bool(ascending.identities) != bool(descending.identities):
         return ReceiptRejection(
             descending.lane_ordinal,
@@ -235,6 +251,13 @@ def validate_boundary_direction(
             descending.command_id,
             Violation(ViolationSeverity.BLOCKING, "direction_contradiction", "descending boundary precedes head"),
             "descending boundary precedes head",
+        )
+    if ascending.identities and descending.identities and min(descending.identities) < min(ascending.identities):
+        return ReceiptRejection(
+            descending.lane_ordinal,
+            descending.command_id,
+            Violation(ViolationSeverity.BLOCKING, "direction_contradiction", "descending boundary passes head"),
+            "descending boundary passes head",
         )
     return None
 

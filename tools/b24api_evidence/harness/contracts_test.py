@@ -540,25 +540,42 @@ def test_fingerprint_requires_exact_random_key_shape_and_hides_principal() -> No
         parse_fingerprint_key("A")
     with pytest.raises(ContractError, match="diversity safety"):
         parse_fingerprint_key("A" * 43)
-    with pytest.raises(ContractError, match="HTTPS"):
+    with pytest.raises(ContractError, match="user name or password"):
         portal_identity(
             "https://user:password@portal.invalid/rest/13/not-a-real-token/",
             role="employee_full",
             fingerprint_key=key,
         )
-    with pytest.raises(ContractError, match="invalid port"):
+    with pytest.raises(ContractError, match="not a valid http or https URL"):
         portal_identity(
             "https://[" + "::1/rest/1/" + "abcdef",
             role="employee_full",
             fingerprint_key=key,
         )
     for invalid_host in (".bad.example", "bad_host", "-bad.example", "bad-.example", "[::1]"):
-        with pytest.raises(ContractError, match="host"):
+        with pytest.raises(ContractError, match=r"host|not a valid http or https URL"):
             portal_identity(
                 f"https://{invalid_host}" + "/rest/13/abcdef",
                 role="employee_full",
                 fingerprint_key=key,
             )
+    # The identity names the host requests go to: IDNA 2008, as HTTPX encodes it, not IDNA 2003.
+    assert (
+        portal_identity(
+            "https://faß.de" + "/rest/13/" + "not-a-real-token/", role="employee_full", fingerprint_key=key
+        ).host
+        == "xn--fa-hia.de"
+    )
+    # The default port written out, under any scheme case, is the default port.
+    assert (
+        portal_identity(
+            "HTTPS://Portal.invalid:443" + "/rest/13/" + "not-a-real-token/", role="r", fingerprint_key=key
+        ).host
+        == "portal.invalid"
+    )
+    for origin in ("http://portal.invalid", "https://portal.invalid:8443"):
+        with pytest.raises(ContractError, match="default port"):
+            portal_identity(origin + "/rest/13/" + "not-a-real-token/", role="employee_full", fingerprint_key=key)
 
 
 def test_reviewed_profile_set_is_anchored_by_id_and_immutable_hash(tmp_path: Path) -> None:

@@ -45,7 +45,7 @@ from b24api.contracts import (
 from b24api.encoding import encode_php_query
 from b24api.errors import CapabilityError
 from b24api.references.binding import _bind_request, _BindingLocalValidationError, binding_update_conflict
-from tests.scripting import ResponderTransport, client_for
+from tests.scripting import UNREACHABLE_COALESCE_WAIT, ResponderTransport, client_for, on_loop
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -134,7 +134,15 @@ async def _drain[T](stream: OperationStream[T]) -> list[T]:
 # A17.1: every owner keeps its own constants and its own cursor over both dispatch routes.
 
 
-@pytest.mark.parametrize("dispatch", [DirectDispatch(concurrency=2), BatchDispatch(batch_size=2, concurrency=1)])
+# The batch case asserts the owners share a wave: their input comes on the event loop and the wave closes
+# by size or by the end of input, so neither a worker-thread pull nor the coalescing timer decides it.
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        DirectDispatch(concurrency=2),
+        BatchDispatch(batch_size=2, concurrency=1, coalesce_wait=UNREACHABLE_COALESCE_WAIT),
+    ],
+)
 @pytest.mark.asyncio
 async def test_each_owner_binding_keeps_its_constants_and_its_own_cursor(
     dispatch: DirectDispatch | BatchDispatch,
@@ -142,7 +150,7 @@ async def test_each_owner_binding_keeps_its_constants_and_its_own_cursor(
     portal = _ProductRows()
     async with _client(portal) as client:
         stream = client.iter_references(
-            _request(), [_owner("D"), _owner("L")], traversal=_traversal(), dispatch=dispatch
+            _request(), on_loop([_owner("D"), _owner("L")]), traversal=_traversal(), dispatch=dispatch
         )
         outcomes = await _drain(stream)
 
@@ -363,6 +371,22 @@ async def test_base_cursor_collision_and_non_mapping_filter_fail_before_bindings
         with pytest.raises(CapabilityError):
             client.iter_reference_outcomes(
                 _request(parameters),
+                _refused_bindings(),
+                traversal=_traversal(),
+                dispatch=DirectDispatch(concurrency=1),
+            )
+
+    assert portal.physical == 0
+
+
+@pytest.mark.asyncio
+async def test_a_base_order_beside_the_identity_fails_before_bindings() -> None:
+    """Every binding would order by the caller's field first and skip rows, so the base is refused."""
+    portal = _ProductRows()
+    async with _client(portal) as client:
+        with pytest.raises(CapabilityError, match="caller order conflicts"):
+            client.iter_reference_outcomes(
+                _request({"order": {"PRICE": "DESC"}}),
                 _refused_bindings(),
                 traversal=_traversal(),
                 dispatch=DirectDispatch(concurrency=1),

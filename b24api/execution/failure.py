@@ -15,6 +15,7 @@ from b24api.errors import (
     BatchCommandError,
     BudgetExceededError,
     CapabilityError,
+    CleanupOverrunError,
     EnvelopeContractError,
     HTTPGatewayError,
     IdentityContractError,
@@ -26,8 +27,10 @@ from b24api.errors import (
     ResultShapeError,
     TransportError,
 )
+from b24api.execution.facts import carry_facts
 
 if TYPE_CHECKING:
+    from b24api.contracts.report import OperationReport
     from b24api.execution.snapshot import KernelReport
 
 R = TypeVar("R")
@@ -62,7 +65,8 @@ def classify_failure(error: BaseException) -> FailureClass:  # noqa: C901, PLR09
         return FailureClass("capability_rejected")
     if isinstance(error, AmbiguousExecutionError):
         return FailureClass("ambiguous_execution")
-    if isinstance(error, BudgetExceededError):
+    if isinstance(error, BudgetExceededError) and not isinstance(error, CleanupOverrunError):
+        # A cleanup overrun refused no work: it is classified as any other failed close, not as the budget's end.
         return FailureClass("budget_exhausted", incomplete=True)
     if isinstance(error, ResponseTooLargeError):
         return FailureClass("response_too_large")
@@ -84,6 +88,8 @@ def classify_failure(error: BaseException) -> FailureClass:  # noqa: C901, PLR09
 
 
 EARLY_CLOSE_REASON = "stream closed before exhaustion"
+# The terminal reason of every stream its reader's cancellation ended, in every family.
+CANCELLED_REASON = "iteration cancelled"
 
 
 def report_reason(error: BaseException) -> str:
@@ -98,23 +104,28 @@ def report_reason(error: BaseException) -> str:
     return str(getattr(cause, "report_name", type(cause).__name__))
 
 
-def cleanup_failure_violation(error: BaseException, *, secondary: bool, subject: str = "batch") -> Violation:
-    """Record a cleanup failure; ``secondary`` marks one that follows an earlier primary failure."""
-    outcome = "also failed" if secondary else "failed"
-    message = f"{subject} cleanup {outcome} ({type(error).__name__})"
-    return Violation(ViolationSeverity.BLOCKING, "cleanup_failure", message)
+def public_cause(error: BaseException) -> BaseException:
+    """Return the public failure a private carrier carries (``report_cause``); any other error is its own."""
+    cause = getattr(error, "report_cause", None)
+    return cause if isinstance(cause, BaseException) else error
 
 
 CLEANUP_FAILED_REASON = "stream cleanup failed"
 
 
-def with_cleanup_failure(
-    report: KernelReport,
-    error: BaseException,
-    *,
-    terminal: bool,
-    subject: str = "batch",
-) -> KernelReport:
+def cleanup_failure_violation(error: BaseException, *, secondary: bool) -> Violation:
+    """Record a failed close or cleanup, in one shape for every stream.
+
+    ``secondary`` marks one behind an earlier failure ("stream cleanup also failed (X)"); without one the close is
+    what failed ("stream cleanup failed (X)", the report's terminal reason ``CLEANUP_FAILED_REASON``).
+    """
+    outcome = "also failed" if secondary else "failed"
+    return Violation(
+        ViolationSeverity.BLOCKING, "cleanup_failure", f"stream cleanup {outcome} ({report_reason(error)})"
+    )
+
+
+def with_cleanup_failure(report: KernelReport, error: BaseException, *, terminal: bool) -> KernelReport:
     """Return the kernel report with one cleanup-failure violation.
 
     A terminal cleanup failure (no earlier primary failure) also turns the report FAILED with
@@ -122,10 +133,57 @@ def with_cleanup_failure(
     """
     violations = report.violations
     if not (terminal and any(item.code == "cleanup_failure" for item in violations)):
-        violations = (*violations, cleanup_failure_violation(error, secondary=not terminal, subject=subject))
+        violations = (*violations, cleanup_failure_violation(error, secondary=not terminal))
     if not terminal:
         return replace(report, violations=violations)
     return replace(report, state=KernelState.FAILED, terminal_reason=CLEANUP_FAILED_REASON, violations=violations)
+
+
+def with_cleanup_failure_behind(report: KernelReport, error: BaseException) -> KernelReport:
+    """Return the report with one cleanup-failure violation for ``error``, behind what ended the stream first.
+
+    A source its stream closed early records the failed close as what failed it; when the stream ended by something
+    that came first (its reader's cancellation), that close is recorded once, as "stream cleanup also failed (X)".
+    """
+    violations = tuple(item for item in report.violations if item.code != "cleanup_failure")
+    return replace(report, violations=(*violations, cleanup_failure_violation(error, secondary=True)))
+
+
+INTERRUPTED_REASON = "operation interrupted"
+
+
+def with_interrupt(report: OperationReport, interrupt: BaseException) -> OperationReport:
+    """Return the report of an operation an interrupt (``is_interrupt``) ended, in one shape however it ended.
+
+    The interrupt is what leaves, whatever came before it: the report is failed with ``INTERRUPTED_REASON``, keeps
+    every violation recorded before it (an earlier failure's first) and adds one ``interrupted`` violation last,
+    "operation interrupted (X)".
+    """
+    message = f"{INTERRUPTED_REASON} ({report_reason(interrupt)})"
+    violation = Violation(ViolationSeverity.BLOCKING, "interrupted", message)
+    return replace(
+        report,
+        state=TerminalState.FAILED,
+        terminal_reason=INTERRUPTED_REASON,
+        violations=(*report.violations, violation),
+        exhausted=False,
+    )
+
+
+def outcome_error(error: Exception, message: str) -> B24ApiError:
+    """Return the error a failure outcome carries, by one rule for every family that yields outcomes.
+
+    The library's own error is carried as it is; any other ``Exception`` (caller code's: a page stop, a hook) as a
+    ``CapabilityError(message)`` whose ``__cause__`` it is, and which carries what was recorded about whether its
+    command ran (``carry_facts``): the outcome follows those facts, never the carrier's type. Only an
+    ``Exception`` is a failure: anything else ends the operation as it is, so it never reaches an outcome.
+    """
+    if isinstance(error, B24ApiError):
+        return error
+    carried = CapabilityError(message)
+    carried.__cause__ = error
+    carry_facts(error, carried)
+    return carried
 
 
 def attach_report(error: BaseException, report: object) -> None:
@@ -141,7 +199,10 @@ def finalize_failure[R](
     operation: str,
     terminal_reason: str,
 ) -> tuple[R, BaseException]:
-    """Append one stable blocking violation and attach the frozen report."""
+    """Record one stable blocking violation for the failure and attach the frozen report.
+
+    The failure is primary: its violation precedes the cleanup failures behind it ("stream cleanup also failed").
+    """
     if isinstance(error, asyncio.CancelledError):
         attach_report(error, report)
         return report, error
@@ -159,15 +220,17 @@ def finalize_failure[R](
     reason = terminal_reason if terminal_reason and terminal_reason != error_name else f"{operation} failed"
     violations = tuple(getattr(report, "violations", ()))
     if not any(item.code == failure.code for item in violations):
+        primary = Violation(
+            failure.severity,
+            failure.code,
+            f"{reason} ({error_name})",
+            error=report_error if isinstance(report_error, B24ApiError) else None,
+            replay_disposition=replay_disposition,
+        )
         violations = (
-            *violations,
-            Violation(
-                failure.severity,
-                failure.code,
-                f"{reason} ({error_name})",
-                error=report_error if isinstance(report_error, B24ApiError) else None,
-                replay_disposition=replay_disposition,
-            ),
+            *(item for item in violations if item.code != "cleanup_failure"),
+            primary,
+            *(item for item in violations if item.code == "cleanup_failure"),
         )
     state: object = TerminalState.INCOMPLETE if failure.incomplete else TerminalState.FAILED
     if isinstance(getattr(report, "state", None), KernelState):
@@ -198,10 +261,13 @@ def finalize_failure[R](
 __all__ = [
     "CLEANUP_FAILED_REASON",
     "EARLY_CLOSE_REASON",
+    "INTERRUPTED_REASON",
     "FailureClass",
     "classify_failure",
     "cleanup_failure_violation",
     "finalize_failure",
     "report_reason",
     "with_cleanup_failure",
+    "with_cleanup_failure_behind",
+    "with_interrupt",
 ]

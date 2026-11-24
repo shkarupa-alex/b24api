@@ -23,7 +23,7 @@ from b24api.contracts.policy import (
     TotalSemantics,
 )
 from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode
-from b24api.contracts.request import IdentitySpec, ParameterPath, Request, ResultSelector, RouteKind
+from b24api.contracts.request import IdentitySpec, ParameterPath, ReplaySafety, Request, ResultSelector, RouteKind
 from b24api.contracts.traversal import KeysetSpec
 from b24api.errors import (
     ApiResponseError,
@@ -47,7 +47,6 @@ from b24api.traversal.plans import (
     CursorTerminalRule,
     ItemCursorPlan,
     KeysetPlan,
-    KeysetTerminalRule,
     ListPlan,
     OffsetContinuation,
     OffsetSequentialPlan,
@@ -55,7 +54,7 @@ from b24api.traversal.plans import (
     SingleResponsePlan,
 )
 from tests.ledger_hold import LedgerHold
-from tests.scripting import Blocker, ResponderTransport, attached_report
+from tests.scripting import Blocker, ResponderTransport, attached_report, replies
 
 if TYPE_CHECKING:
     from b24api.contracts.json import JsonValue
@@ -568,7 +567,7 @@ async def test_conflicting_policy_and_plan_semantics_refuse_before_io() -> None:
 @pytest.mark.parametrize(
     ("responses", "message"),
     [
-        (({"result": [], "total": -1},), "before its exact total"),
+        (({"result": [], "total": 3},), "before its exact total"),
         (
             (
                 {"result": [{"ID": 1}], "total": 2, "next": 1},
@@ -596,8 +595,8 @@ async def test_counted_offset_rejects_unproven_totals(
     await _assert_incomplete_pagination(stream, message)
 
     assert stream.report.state is KernelState.INCOMPLETE
-    expected_code = PageRejectionCode.TOTAL_DRIFT if message == "drifted" else PageRejectionCode.RANGE_CONTRADICTION
-    assert stream.report.page_trace[-1].rejection_code is expected_code
+    # An end short of the exact total is the same contradiction as a drifted total.
+    assert stream.report.page_trace[-1].rejection_code is PageRejectionCode.TOTAL_DRIFT
 
 
 @pytest.mark.asyncio
@@ -605,16 +604,12 @@ async def test_page_trace_limit_bounds_live_driver_evidence() -> None:
     responses = [
         {"result": [{"ID": 1}], "next": 1},
         {"result": [{"ID": 2}], "next": 2},
-        {"result": [{"ID": 3}], "next": 3},
-        {"result": []},
+        {"result": [{"ID": 3}]},
     ]
     stream = iter_list(
         Executor(ResponderTransport(lambda _request: responses.pop(0))),
         Request("crm.item.list", route=RouteKind.BARE),
-        plan=OffsetSequentialPlan(
-            continuation=OffsetContinuation.SERVER_NEXT,
-            terminal=frozenset({OffsetTerminalRule.EMPTY_PAGE}),
-        ),
+        plan=OffsetSequentialPlan(),
         identity=_identity(),
         policy=ExecutionPolicy(page_trace_limit=1),
     )
@@ -627,7 +622,7 @@ async def test_page_trace_limit_bounds_live_driver_evidence() -> None:
 
 
 @pytest.mark.asyncio
-async def test_direct_fetch_failure_records_unknown_scheduled_page() -> None:
+async def test_a_refused_direct_fetch_records_a_rejected_scheduled_page() -> None:
     stream = iter_list(
         Executor(
             ResponderTransport(
@@ -645,7 +640,7 @@ async def test_direct_fetch_failure_records_unknown_scheduled_page() -> None:
     assert attached_report(captured.value) is stream.report
     assert len(stream.report.page_trace) == 1
     record = stream.report.page_trace[0]
-    assert record.outcome is PageOutcome.UNKNOWN
+    assert record.outcome is PageOutcome.REJECTED
     assert record.dispatch is PageDispatch.DIRECT
     assert record.rejection_code is PageRejectionCode.COMMAND_FAILURE
 
@@ -673,48 +668,9 @@ async def test_cancellation_while_waiting_for_dispatch_records_no_unknown_page()
 
 
 @pytest.mark.asyncio
-async def test_boundary_keyset_strategy_refuses_before_io() -> None:
-    transport = ResponderTransport(lambda _request: {"result": []})
-    boundary = KeysetPlan(
-        identity_requirement=IdentityRequirement.REQUIRED,
-        order_semantics=OrderSemantics.ASCENDING,
-        terminal=KeysetTerminalRule.BOUNDARY_ID_SEEN,
-    )
-
-    stream = iter_list(
-        Executor(transport),
-        Request("crm.item.list", route=RouteKind.BARE),
-        plan=boundary,
-        identity=_identity(),
-    )
-    with pytest.raises(CapabilityError):
-        await _collect(stream)
-
-    assert transport.requests == []
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("plan", "policy", "message"),
     [
-        (
-            SingleResponsePlan(),
-            ExecutionPolicy(
-                consistency=ConsistencyPolicy(
-                    confirmation_policy=ConfirmationPolicy.INDEPENDENT_ORACLE,
-                ),
-            ),
-            "independent oracle",
-        ),
-        (
-            SingleResponsePlan(),
-            ExecutionPolicy(
-                consistency=ConsistencyPolicy(
-                    confirmation_policy=ConfirmationPolicy.BOUNDARY_ID_SEEN,
-                ),
-            ),
-            "boundary identity",
-        ),
         (
             SingleResponsePlan(order_semantics=OrderSemantics.INPUT),
             ExecutionPolicy(),
@@ -977,6 +933,36 @@ async def test_latent_keyset_filter_collision_refuses_before_io() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_caller_order_beside_the_identity_refuses_a_keyset_before_io() -> None:
+    """Ordering by another field first would let the cursor skip rows behind an exact-coverage report."""
+    transport = ResponderTransport(lambda _request: {"result": [{"ID": 1}]})
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list", {"order": {"PRIO": "DESC"}}, route=RouteKind.BARE),
+        plan=_keyset_plan(),
+        identity=_identity(),
+    )
+
+    with pytest.raises(CapabilityError, match="caller order conflicts"):
+        await anext(stream)
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_a_caller_order_by_the_identity_alone_keeps_a_keyset_running() -> None:
+    transport = ResponderTransport(replies({"result": [{"ID": 1}]}, {"result": []}))
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list", {"order": {"id": "ASC"}}, route=RouteKind.BARE),
+        plan=_keyset_plan(),
+        identity=_identity(),
+    )
+
+    assert await _collect(stream) == [{"ID": 1}]
+    assert [request.copy_parameters()["order"] for request in transport.requests] == [{"id": "ASC"}] * 2
+
+
+@pytest.mark.asyncio
 async def test_latent_item_cursor_collision_refuses_before_io() -> None:
     transport = ResponderTransport(lambda _request: {"result": [{"ID": 1}]})
     plan = ItemCursorPlan(
@@ -1177,7 +1163,11 @@ async def test_cancellation_during_failed_finalization_preserves_failure_report(
             return WireResponse(200, (("content-type", "application/json"),), b"{")
 
     transport = MalformedAfterHoldTransport()
-    stream = iter_list(Executor(transport), Request("crm.item.list", route=RouteKind.BARE), plan=SingleResponsePlan())
+    stream = iter_list(
+        Executor(transport),
+        Request("crm.item.list", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE),
+        plan=SingleResponsePlan(),
+    )
     hold = transport.hold = LedgerHold(stream._context)  # noqa: SLF001 - deterministic finalize-race regression
     primary: list[ProtocolError] = []
     post_failure_executed = False

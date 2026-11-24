@@ -9,14 +9,23 @@ from types import MappingProxyType
 from typing import TypedDict, cast
 
 from b24api._diagnostics import DiagnosticContext
-from b24api.contracts.json import FrozenMapping, JsonValue, _freeze_json, thaw_json
+from b24api.contracts.json import (
+    FrozenMapping,
+    JsonValue,
+    _freeze_json,
+    _has_empty_container,
+    _string_free_tuple,
+    thaw_json,
+)
 from b24api.contracts.policy import IdentityCoercion
 from b24api.contracts.positional import PositionalArguments
 from b24api.contracts.request_summary import RequestSummary, RouteKind
-from b24api.contracts.wire import BodyEncoding, RequestHeaders
+from b24api.contracts.wire import BodyEncoding, RawContent, RequestHeaders
+from b24api.encoding import BracketObstacle, bracket_obstacle
 from b24api.redaction import DEFAULT_REDACTOR, Redactor
 
-_METHOD_RE = re.compile(r"^[A-Za-z0-9_.]+$")
+# Dot-separated names: an empty segment (``..``, a leading or trailing dot) would be a URL dot segment.
+_METHOD_RE = re.compile(r"[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*")
 _NO_HEADERS = RequestHeaders()
 type PathPart = str | int
 _COMPONENT_LABEL_MAXIMUM = 80
@@ -60,6 +69,7 @@ class _OptionalRequestSpec(TypedDict, total=False):
     replay_safety: ReplaySafety
     encoding: BodyEncoding
     headers: RequestHeaders
+    content: RawContent
     result_error: ResultErrorSpec
 
 
@@ -78,7 +88,7 @@ class ParameterPath:
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
-        object.__setattr__(self, "path", tuple(self.path))
+        object.__setattr__(self, "path", _string_free_tuple(self.path, label="path"))
         _validate_path(self.path, allow_empty=False)
 
 
@@ -90,7 +100,7 @@ class ResultSelector:
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
-        object.__setattr__(self, "path", tuple(self.path))
+        object.__setattr__(self, "path", _string_free_tuple(self.path, label="path"))
         _validate_path(self.path, allow_empty=True)
 
     @classmethod
@@ -118,7 +128,7 @@ class IdentitySpec:
 
     def __post_init__(self) -> None:
         """Validate and normalize instance state."""
-        object.__setattr__(self, "item_path", tuple(self.item_path))
+        object.__setattr__(self, "item_path", _string_free_tuple(self.item_path, label="item_path"))
         _validate_path(self.item_path, allow_empty=False)
         if not self.filter_key or not self.order_key:
             raise ValueError("identity filter_key and order_key must be non-empty")
@@ -144,10 +154,12 @@ class ResultErrorSpec:
 
     def __post_init__(self) -> None:
         """Validate and freeze paths."""
-        object.__setattr__(self, "code_path", tuple(self.code_path))
+        object.__setattr__(self, "code_path", _string_free_tuple(self.code_path, label="code_path"))
         _validate_path(self.code_path, allow_empty=False)
         if self.description_path is not None:
-            object.__setattr__(self, "description_path", tuple(self.description_path))
+            object.__setattr__(
+                self, "description_path", _string_free_tuple(self.description_path, label="description_path")
+            )
             _validate_path(self.description_path, allow_empty=False)
         if not isinstance(self.selector, ResultSelector) or not isinstance(self.shape, ResultErrorShape):
             raise TypeError("result error fields must use their declared contract types")
@@ -163,7 +175,7 @@ class IdentityComponent:
 
     def __post_init__(self) -> None:
         """Validate and freeze the component."""
-        object.__setattr__(self, "item_path", tuple(self.item_path))
+        object.__setattr__(self, "item_path", _string_free_tuple(self.item_path, label="item_path"))
         _validate_path(self.item_path, allow_empty=False)
         if not isinstance(self.coercion, IdentityCoercion):
             raise TypeError("coercion must be an IdentityCoercion")
@@ -181,7 +193,7 @@ class CompositeIdentitySpec:
 
     def __post_init__(self) -> None:
         """Validate component cardinality and uniqueness."""
-        object.__setattr__(self, "components", tuple(self.components))
+        object.__setattr__(self, "components", _string_free_tuple(self.components, label="components"))
         if not _COMPOSITE_COMPONENT_MINIMUM <= len(self.components) <= _COMPOSITE_COMPONENT_MAXIMUM:
             raise ValueError("composite identity must contain 2..8 components")
         if any(not isinstance(component, IdentityComponent) for component in self.components):
@@ -217,8 +229,13 @@ class Request:
     encoding: BodyEncoding
     headers: RequestHeaders
     result_error: ResultErrorSpec | None
+    # Last of the public fields: the ones before it keep their places in a positional pattern.
+    content: RawContent | None
     _parameters: FrozenMapping = field(repr=False)
     _positional: PositionalArguments | None = field(repr=False)
+    _empty_container: bool | None = field(repr=False, compare=False)
+    _batch_obstacle: BracketObstacle | None = field(repr=False, compare=False)
+    _summary: RequestSummary | None = field(repr=False, compare=False)
 
     def __init__(  # noqa: C901, PLR0913 - canonical request boundary validates each declared contract
         self,
@@ -228,12 +245,17 @@ class Request:
         *,
         encoding: BodyEncoding = BodyEncoding.JSON,
         headers: RequestHeaders = _NO_HEADERS,
+        content: RawContent | None = None,
         result_error: ResultErrorSpec | None = None,
         route: RouteKind,
     ) -> None:
-        """Initialize instance state."""
+        """Initialize instance state.
+
+        ``content`` is a raw body for a ``QUERY_STRING`` request, whose parameters then travel in the query of
+        a POST; such a request without it is a GET.
+        """
         if not _METHOD_RE.fullmatch(method):
-            raise ValueError("method must contain only letters, digits, dots, and underscores")
+            raise ValueError("method must be dot-separated names of letters, digits, and underscores")
         if method.endswith(".json"):
             raise ValueError("request methods are logical names and cannot include a .json route suffix")
         if not isinstance(route, RouteKind):
@@ -246,12 +268,13 @@ class Request:
             raise TypeError("encoding and headers must use their declared contract types")
         if result_error is not None and not isinstance(result_error, ResultErrorSpec):
             raise TypeError("result_error must be a ResultErrorSpec")
+        _check_content(content, encoding)
         positional = parameters if isinstance(parameters, PositionalArguments) else None
         if positional is not None and encoding is not BodyEncoding.JSON:
             raise ValueError("positional arguments require JSON body encoding")
         if positional is not None and route is RouteKind.API_V3:
             raise ValueError("PHP positional arguments cannot use the API_V3 route")
-        frozen = _freeze_json({} if positional is not None else parameters or {})
+        frozen = _freeze_json({} if positional is not None else parameters or {}, wire=True)
         if not isinstance(frozen, FrozenMapping):
             raise TypeError("request parameters must be a mapping")
         object.__setattr__(self, "method", method)
@@ -259,9 +282,26 @@ class Request:
         object.__setattr__(self, "replay_safety", replay_safety)
         object.__setattr__(self, "encoding", encoding)
         object.__setattr__(self, "headers", headers)
+        object.__setattr__(self, "content", content)
         object.__setattr__(self, "result_error", result_error)
         object.__setattr__(self, "_parameters", frozen)
         object.__setattr__(self, "_positional", positional)
+        object.__setattr__(self, "_empty_container", None)
+        object.__setattr__(self, "_summary", None)
+        # Computed here, not on first read: a lazy marker object would not survive copy or pickle.
+        object.__setattr__(
+            self, "_batch_obstacle", None if positional is not None else bracket_obstacle(frozen, batch=True)
+        )
+        if encoding is not BodyEncoding.JSON:
+            obstacle = bracket_obstacle(frozen, batch=False)
+            if obstacle is not None:
+                # A GET-only action has no JSON form to advise.
+                place, advice = (
+                    ("form-encoded", "; use JSON encoding")
+                    if encoding is BodyEncoding.FORM_URLENCODED
+                    else ("query-string", "")
+                )
+                raise ValueError(f"{place} parameters cannot carry {obstacle}{advice}")
 
     @classmethod
     def bare(  # noqa: PLR0913 - mirrors the canonical constructor's arguments except route
@@ -272,6 +312,7 @@ class Request:
         *,
         encoding: BodyEncoding = BodyEncoding.JSON,
         headers: RequestHeaders = _NO_HEADERS,
+        content: RawContent | None = None,
         result_error: ResultErrorSpec | None = None,
     ) -> Request:
         """Build a classic REST request: the constructor with ``route=RouteKind.BARE`` fixed."""
@@ -281,6 +322,7 @@ class Request:
             replay_safety,
             encoding=encoding,
             headers=headers,
+            content=content,
             result_error=result_error,
             route=RouteKind.BARE,
         )
@@ -304,6 +346,29 @@ class Request:
     def positional(self) -> PositionalArguments | None:
         """Return immutable positional arguments, if this request uses them."""
         return self._positional
+
+    @property
+    def has_empty_container(self) -> bool:
+        """Return whether a nested empty array or object would vanish from PHP bracket encoding.
+
+        Bracket syntax, used by form bodies, query strings and classic batch commands, names leaves only, so
+        ``{"fields": {"UF_MULTI": []}}`` encodes exactly as ``{}``. Positional requests have no
+        named parameters and answer ``False``.
+        """
+        if self._empty_container is None:
+            object.__setattr__(self, "_empty_container", _has_empty_container(self._parameters))
+        return cast("bool", self._empty_container)
+
+    @property
+    def classic_batch_obstacle(self) -> BracketObstacle | None:
+        """Return why a classic batch command would not carry these parameters as a direct JSON call does.
+
+        The one rule every classic batch path applies before any request: a ``None``, an empty array or
+        object, a key bracket syntax would rename, or a value holding a ``$result[`` reference the batch
+        handler substitutes. ``None`` when the command means what the direct call means. Positional
+        requests have no named parameters and answer ``None``; they have no classic command form at all.
+        """
+        return self._batch_obstacle
 
     @property
     def parameters(self) -> Mapping[str, JsonValue]:
@@ -330,24 +395,39 @@ class Request:
             self.replay_safety,
             encoding=self.encoding,
             headers=self.headers,
+            content=self.content,
             result_error=self.result_error,
             route=self.route,
         )
 
     @property
     def summary(self) -> RequestSummary:
-        """Return the summary."""
-        return summarize_request(
-            self.method,
-            {f"@{self._positional.layout_id}": None} if self._positional else self._parameters,
-            encoding=self.encoding,
-            header_names=self.headers.names,
-            route=self.route,
-        )
+        """Return the value-free summary every error about this request carries, built on first read."""
+        if self._summary is None:
+            summary = summarize_request(
+                self.method,
+                {f"@{self._positional.layout_id}": None} if self._positional else self._parameters,
+                encoding=self.encoding,
+                header_names=self.headers.names,
+                route=self.route,
+            )
+            object.__setattr__(self, "_summary", summary)
+            return summary
+        return self._summary
 
     def __repr__(self) -> str:
         """Return a safe representation."""
         return f"Request(summary={self.summary!r}, replay_safety={self.replay_safety!r})"
+
+
+def _check_content(content: object, encoding: BodyEncoding) -> None:
+    """Refuse raw content of another type, or for parameters that do not travel in the query."""
+    if content is None:
+        return
+    if not isinstance(content, RawContent):
+        raise TypeError("content must be a RawContent")
+    if encoding is not BodyEncoding.QUERY_STRING:
+        raise ValueError("raw content requires QUERY_STRING encoding, which sends the parameters in the query")
 
 
 def diagnostic_context(request: Request) -> DiagnosticContext:
@@ -370,7 +450,16 @@ def canonical_request(raw: RequestLike) -> Request:
         return raw
     if not isinstance(raw, Mapping):
         raise TypeError("request must be a Request or closed request mapping")
-    unknown = set(raw) - {"method", "parameters", "replay_safety", "encoding", "headers", "result_error", "route"}
+    unknown = set(raw) - {
+        "method",
+        "parameters",
+        "replay_safety",
+        "encoding",
+        "headers",
+        "content",
+        "result_error",
+        "route",
+    }
     if unknown:
         raise ValueError(f"unknown request fields: {sorted(unknown)}")
     method = raw.get("method")
@@ -378,6 +467,7 @@ def canonical_request(raw: RequestLike) -> Request:
     safety = raw.get("replay_safety", ReplaySafety.UNKNOWN)
     encoding = raw.get("encoding", BodyEncoding.JSON)
     headers = raw.get("headers", RequestHeaders())
+    content = raw.get("content")
     result_error = raw.get("result_error")
     route = raw.get("route")
     if not isinstance(method, str):
@@ -398,6 +488,7 @@ def canonical_request(raw: RequestLike) -> Request:
         replay_safety=safety,
         encoding=encoding,
         headers=headers,
+        content=content,
         result_error=result_error,
         route=route,
     )

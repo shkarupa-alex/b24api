@@ -3,12 +3,12 @@
 # ruff: noqa: SLF001 - class-owned alternate construction
 
 from __future__ import annotations
-import asyncio
+import functools
 import warnings
-import weakref
 from typing import TYPE_CHECKING, Self, cast
 
 from b24api._client_traversal import _TraversalFacade
+from b24api._webhook import Webhook, WebhookRefusal, parse_webhook
 from b24api.batch.facade import batch_outcome_stream, batch_stream
 from b24api.batch.logical import command_source as logical_command_source
 from b24api.contracts.dispatch import BatchDispatch, DirectDispatch, DispatchSpec
@@ -23,9 +23,25 @@ from b24api.contracts.request import (
 )
 from b24api.contracts.response import ResultCollectionShape
 from b24api.contracts.traversal import KeysetSpec
-from b24api.execution import Executor, HttpxTransport, Transport, await_cleanup_resistant, rearm_cancellation
-from b24api.execution.cleanup import CloseableResource, close_owned_resources
-from b24api.redaction import Redactor, webhook_secrets
+from b24api.errors import ClientClosedError
+from b24api.execution import (
+    Executor,
+    HttpxTransport,
+    RateCoordinator,
+    Transport,
+    await_cleanup_resistant,
+    rearm_cancellation,
+)
+from b24api.execution.cleanup import OwnedStream, StreamRegistry, close_owned_resources
+from b24api.execution.context import (
+    CANCEL_GRACE_SECONDS,
+    Settled,
+    outside_operation_work,
+    own_cancellation,
+    spawn_settled,
+)
+from b24api.execution.lifecycle import close_on_exit
+from b24api.redaction import Redactor, secret_values
 from b24api.references.facade import reference_stream
 from b24api.references.fanout import CommandSource as FanOutCommandSource
 from b24api.references.fanout import command_source as fanout_command_source
@@ -36,6 +52,7 @@ from b24api.transport.protocol import ProtocolCodec
 from b24api.traversal.keyset_verifier import verify_keyset_capability as _verify_keyset_capability
 
 if TYPE_CHECKING:
+    import asyncio
     from collections.abc import AsyncIterable, Iterable
     from types import TracebackType
 
@@ -48,7 +65,6 @@ if TYPE_CHECKING:
     from b24api.contracts.response import BinaryResponse, Response
     from b24api.contracts.stream import OperationStream
     from b24api.contracts.traversal import CursorSpec, TraversalSpec
-    from b24api.execution.rate import RateCoordinator
     from b24api.references.binding import BindingSource
     from b24api.references.sources import ReferenceSources
 
@@ -59,7 +75,8 @@ _DEFAULT_KEYSET = KeysetSpec()
 
 
 def _normalized_host(host: str) -> str:
-    return host.strip().rstrip(".").casefold()
+    """Compare hosts as named: a custom transport may report an IPv6 address in brackets, as in a URL."""
+    return host.strip().removeprefix("[").removesuffix("]").rstrip(".").casefold()
 
 
 class Bitrix24(_TraversalFacade):
@@ -76,17 +93,25 @@ class Bitrix24(_TraversalFacade):
         transport: Transport | None = None,
         unknown_request_audit: UnknownRequestAudit | None = None,
     ) -> None:
-        """Compose settings, transport ownership and default policy."""
+        """Compose settings, transport ownership, the request concurrency limit and the default policy."""
         resolved = settings if settings is not None else api_settings()
         if not isinstance(resolved, Settings):
             raise TypeError("settings must be a Settings value")
         if policy is not None and not isinstance(policy, ExecutionPolicy):
             raise TypeError("policy must be an ExecutionPolicy")
-        host = resolved.webhook_url.host
-        if host is None:
-            raise ValueError("webhook URL must contain a host")
+        # The parse Settings validated with; it refuses only a Settings built without validation.
+        match parse_webhook(str(resolved.webhook_url)):
+            case WebhookRefusal() as refusal:
+                raise ValueError(refusal.value)
+            case Webhook() as webhook:
+                host = webhook.host
+        # Every refusal of the configuration comes before the transport, so a refused client opens nothing.
+        default_policy = policy or ExecutionPolicy()
+        coordinator = RateCoordinator(max_concurrency=resolved.max_concurrent_requests)
+        # The configured webhook credential is an exact secret for every error this client renders.
+        codec = ProtocolCodec(redactor=Redactor(known_secrets=secret_values((webhook.token,))))
         if transport is None:
-            selected_transport: Transport = HttpxTransport(str(resolved.webhook_url))
+            selected_transport: Transport = HttpxTransport(webhook.url, timeout=resolved.http_timeout)
             owned_transport: HttpxTransport | None = cast("HttpxTransport", selected_transport)
         else:
             if _normalized_host(transport.host) != _normalized_host(host):
@@ -95,16 +120,14 @@ class Bitrix24(_TraversalFacade):
             owned_transport = None
         self._transport = selected_transport
         self._owned_transport = owned_transport
-        # The configured webhook credential is an exact secret for every error this client renders.
-        codec = ProtocolCodec(redactor=Redactor(known_secrets=webhook_secrets(str(resolved.webhook_url))))
-        self._executor = Executor(selected_transport, codec=codec)
-        self._owned_coordinator = self._executor.coordinator
-        self._default_policy = policy or ExecutionPolicy.from_settings(resolved)
+        self._executor = Executor(selected_transport, codec=codec, coordinator=coordinator)
+        self._owned_coordinator = coordinator
+        self._default_policy = default_policy
         self._host = host
         self._closed = False
         self._unknown_request_audit = unknown_request_audit
-        self._close_task: asyncio.Task[None] | None = None
-        self._streams: weakref.WeakSet[CloseableResource] = weakref.WeakSet()
+        self._close_task: asyncio.Task[Settled[None]] | None = None
+        self._streams = StreamRegistry()
 
     @classmethod
     def from_webhook(
@@ -112,18 +135,23 @@ class Bitrix24(_TraversalFacade):
         url: str,
         *,
         http_timeout: float | None = None,
+        max_concurrent_requests: int | None = None,
         policy: ExecutionPolicy | None = None,
     ) -> Bitrix24:
         """Build a client that owns its HTTPX transport and rate coordinator for one webhook URL.
 
-        The URL is validated by ``Settings``; ``http_timeout=None`` keeps the ``Settings`` default.
+        The URL and the limits are validated by ``Settings``; a limit left ``None`` keeps its ``Settings``
+        default.
         """
-        if not isinstance(url, str):
-            raise TypeError("webhook url must be a string")
-        settings = (
-            Settings(webhook_url=url) if http_timeout is None else Settings(webhook_url=url, http_timeout=http_timeout)
-        )
-        return cls(settings, policy=policy)
+        try:
+            if not isinstance(url, str):
+                raise TypeError("webhook url must be a string")
+            limits = {"http_timeout": http_timeout, "max_concurrent_requests": max_concurrent_requests}
+            settings = Settings(webhook_url=url, **{name: value for name, value in limits.items() if value is not None})
+            return cls(settings, policy=policy)
+        finally:
+            # A construction error's traceback keeps this frame's locals; none of them may be the webhook.
+            url = ""
 
     @classmethod
     def _from_executor(
@@ -144,7 +172,7 @@ class Bitrix24(_TraversalFacade):
         instance._closed = False
         instance._unknown_request_audit = unknown_request_audit
         instance._close_task = None
-        instance._streams = weakref.WeakSet()
+        instance._streams = StreamRegistry()
         return instance
 
     @property
@@ -163,28 +191,53 @@ class Bitrix24(_TraversalFacade):
         primary: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Close owned work without replacing a primary body exception."""
-        try:
-            await self.aclose()
-        except BaseException as cleanup_error:
-            if primary is not None:
-                raise primary.with_traceback(traceback) from cleanup_error
-            raise
+        """Close owned work as a stream's ``async with`` does (``close_on_exit``): the body's exception stays primary.
+
+        A cancellation the close absorbed lands on the next await; a failed close is noted on the body's exception.
+        Anything else the close raises, an escape (``is_escape``: an interrupt, or any other ``BaseException`` that is
+        no failure), replaces it, as from a ``finally``, with the body's exception as its context.
+        """
+        del traceback
+        # A body its task's cancellation ended (Ctrl-C under ``asyncio.run``) exits through a cancelled close.
+        cancelled = own_cancellation(primary)
+        await close_on_exit(
+            functools.partial(self._close, cancelled=cancelled),
+            primary,
+            note=lambda failure: f"client close also failed ({type(failure).__name__})",
+        )
 
     async def aclose(self) -> None:
-        """Close active streams, the owned rate coordinator and the owned transport idempotently."""
+        """Close active streams, the owned rate coordinator and the owned transport idempotently.
+
+        A close from an event loop other than the one the client's work started on raises ``RuntimeError`` and leaves
+        the client open: its streams and connections belong to that loop. A close requested from inside the work of
+        one of this client's streams is refused, leaving the client open,
+        because closing that stream would wait for the code that requested it. That is decided once, before anything
+        changes: the close then runs outside the caller's work, so no stream it closes judges it again later. A
+        cancelled close raises its cancellation once the close ends or the cancellation grace does, whichever comes
+        first; a close still running then goes on in the background, and a later ``aclose()`` waits for it.
+        """
+        await self._close(cancelled=None)
+
+    async def _close(self, *, cancelled: asyncio.CancelledError | None) -> None:
+        """Close as ``aclose`` does; ``cancelled``: the cancellation its caller holds already, whose grace runs now."""
         if self._close_task is not None and self._close_task.done():
             return
+        self._executor.coordinator.check_loop()
+        if any(stream.inside_own_work for stream in self._streams.snapshot()):
+            raise RuntimeError("client cannot be closed from inside the pull or cleanup of one of its streams")
         if self._close_task is None:
             self._closed = True
-            self._close_task = asyncio.create_task(
-                close_owned_resources(tuple(self._streams), self._owned_transport, self._owned_coordinator),
+            self._close_task = spawn_settled(
+                close_owned_resources(self._streams.snapshot(), self._owned_transport, self._owned_coordinator),
+                context=outside_operation_work(),
             )
-        cleanup = await await_cleanup_resistant(self._close_task)
-        if cleanup.error is not None:
+        cleanup = await await_cleanup_resistant(self._close_task, grace=CANCEL_GRACE_SECONDS, cancelled=cancelled)
+        if cleanup.error is not None and cleanup.unfinished is None:
             rearm_cancellation(cleanup.cancellation)
             raise cleanup.error
         if cleanup.cancellation is not None:
+            # A close the grace stopped waiting for overran it because of this cancellation, which leaves instead.
             raise cleanup.cancellation
 
     async def call(self, request: RequestLike, *, policy: ExecutionPolicy | None = None) -> JsonValue:
@@ -437,15 +490,15 @@ class Bitrix24(_TraversalFacade):
         )
 
     def _register_stream[T](self, stream: OperationStream[T]) -> OperationStream[T]:
-        self._streams.add(cast("CloseableResource", stream))
+        self._streams.add(cast("OwnedStream", stream))
         return stream
 
     def _discard_stream(self, stream: object) -> None:
-        self._streams.discard(cast("CloseableResource", stream))
+        self._streams.discard(cast("OwnedStream", stream))
 
     def _require_open(self) -> None:
         if self._closed:
-            raise RuntimeError("client is closed")
+            raise ClientClosedError
 
     def _audit_unknown(self, request: Request) -> Violation | None:
         if request.replay_safety is not ReplaySafety.UNKNOWN or self._unknown_request_audit is None:

@@ -1,11 +1,18 @@
 """Installed CLI boundary and exact JSON-to-contract routing."""
 
 from __future__ import annotations
+import contextlib
+import errno
 import io
 import json
+import os
+import stat
+import subprocess
+import sys
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NoReturn, Self
+from pathlib import Path
+from typing import TYPE_CHECKING, NoReturn, Self, cast
 
 import pytest
 
@@ -25,6 +32,7 @@ from b24api import (
     ResultSelector,
     RouteKind,
     TerminalState,
+    TotalTermination,
     TraversalAssurance,
     cli,
 )
@@ -49,7 +57,7 @@ from b24api.contracts import (
 from b24api.errors import CapabilityError, IncompleteTraversalError, ProtocolError
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from typing import TextIO
 
 _USAGE = 2
 _UNAVAILABLE = 3
@@ -77,7 +85,7 @@ def test_keyset_execution_json_is_closed_and_routes_all_fast_modes() -> None:
     )
     partitioned = parse_keyset_execution({"kind": "partitioned", "target_lanes": 3})
     automatic = parse_keyset_execution(
-        {"kind": "auto", "range_window_width": 9, "max_range_waves": 4, "total_hint": "request_advisory"},
+        {"kind": "auto", "range_window_width": 9, "total_hint": "request_advisory"},
     )
 
     assert isinstance(range_execution, RangeKeysetExecution)
@@ -85,6 +93,8 @@ def test_keyset_execution_json_is_closed_and_routes_all_fast_modes() -> None:
     assert isinstance(automatic, AutoKeysetExecution)
     with pytest.raises(CliUsageError):
         parse_keyset_execution({"kind": "range", "window_width": 1})
+    with pytest.raises(CliUsageError):  # removed: range windows are priced by the wave model, not capped
+        parse_keyset_execution({"kind": "auto", "max_range_waves": 4})
     with pytest.raises(CliUsageError):
         parse_keyset_execution({"kind": "auto", "unknown": 1})
     with pytest.raises(CliUsageError, match="must be a string"):
@@ -193,7 +203,7 @@ class _IncompleteStream(_Stream):
 
 
 def _run(monkeypatch: pytest.MonkeyPatch, client: _Client, args: list[str], *, stdin: str = "") -> tuple[int, str, str]:
-    monkeypatch.setattr(cli, "Bitrix24", lambda: client)
+    monkeypatch.setattr(cli, "_open_client", lambda: client)
     stdout = io.StringIO()
     stderr = io.StringIO()
     if args[0] in {"call", "list", "verify-keyset"} and "--route" not in args:
@@ -508,7 +518,8 @@ def test_sequential_default_is_mechanics_only_and_reports_once(monkeypatch: pyte
                 "offset": {"parameter_path": ["start"]},
             },
             "iter_list_counted",
-            OffsetSpec(),
+            # A counted traversal requires the exact total; the CLI asks for it, as iter_list_counted's default does.
+            OffsetSpec(total_termination=TotalTermination.EXACT_QUALIFIED),
         ),
         (
             "keyset",
@@ -550,7 +561,7 @@ def test_sequential_default_is_mechanics_only_and_reports_once(monkeypatch: pyte
                     "item_path": ["ID"],
                     "coercion": "exact_string",
                     "direction": "ascending",
-                    "take": "first",
+                    "take": "last",
                     "limit_path": ["LIMIT"],
                     "allow_create_controls": False,
                 },
@@ -561,7 +572,7 @@ def test_sequential_default_is_mechanics_only_and_reports_once(monkeypatch: pyte
                 ("ID",),
                 IdentityCoercion.EXACT_STRING,
                 "ascending",
-                "first",
+                "last",
                 ParameterPath(("LIMIT",)),
                 allow_create_controls=False,
             ),
@@ -627,7 +638,7 @@ def test_invalid_contract_is_rejected_before_client_construction(
         constructed = True
         return _Client()
 
-    monkeypatch.setattr(cli, "Bitrix24", unused_client)
+    monkeypatch.setattr(cli, "_open_client", unused_client)
     stderr = io.StringIO()
     code = cli.main(
         ["list", "test.list", "--route", "bare", "--contract", _contract(tmp_path, {"version": 1, "unknown": True})],
@@ -700,7 +711,7 @@ def test_configuration_failure_maps_to_unavailable(monkeypatch: pytest.MonkeyPat
     def fail() -> NoReturn:
         raise configuration_error("contains a credential")
 
-    monkeypatch.setattr(cli, "Bitrix24", fail)
+    monkeypatch.setattr(cli, "_open_client", fail)
     stderr = io.StringIO()
     code = cli.main(["call", "test.get", "--route", "bare"], stdin=io.StringIO(), stdout=io.StringIO(), stderr=stderr)
     assert code == _UNAVAILABLE
@@ -709,7 +720,7 @@ def test_configuration_failure_maps_to_unavailable(monkeypatch: pytest.MonkeyPat
 
 def test_broken_pipe_closes_stream_and_uses_exit_five(monkeypatch: pytest.MonkeyPatch) -> None:
     client = _Client(rows=[{"ID": 1}])
-    monkeypatch.setattr(cli, "Bitrix24", lambda: client)
+    monkeypatch.setattr(cli, "_open_client", lambda: client)
     stderr = io.StringIO()
 
     code = cli.main(
@@ -726,11 +737,255 @@ def test_broken_pipe_closes_stream_and_uses_exit_five(monkeypatch: pytest.Monkey
     assert json.loads(diagnostics.splitlines()[-1])["state"] == "early_closed"
 
 
-def test_keyboard_interrupt_maps_to_130(monkeypatch: pytest.MonkeyPatch) -> None:
-    class InterruptedClient(_Client):
-        async def __aenter__(self) -> Self:
-            raise KeyboardInterrupt
+_ROOT = Path(__file__).resolve().parents[1]
+# The installed console script runs `sys.exit(main())`; this child does the same over an offline client
+# serving two one-row pages. Before answering the second page it waits for one line on stdin, so a
+# parent can close its reader exactly between the rows; an empty stdin releases it at once.
+_CLI_CHILD = """
+import sys
+from b24api import cli
+from tests.scripting import ResponderTransport, client_for
 
-    code, stdout, stderr = _run(monkeypatch, InterruptedClient(), ["call", "test.get"])
+pages = [{"result": [{"ID": 1}], "next": 1, "total": 2}, {"result": [{"ID": 2}], "total": 2}]
+
+def respond(_request):
+    if len(pages) == 1:
+        sys.stdin.readline()
+    return pages.pop(0)
+
+cli._open_client = lambda: client_for(ResponderTransport(respond))
+sys.exit(cli.main())
+"""
+_LIST = ("list", "test.list", "--route", "bare")
+
+
+@pytest.fixture(params=[False, True], ids=["buffered", "unbuffered"])
+def child_env(request: pytest.FixtureRequest) -> dict[str, str]:
+    """Give the child an explicit environment: buffered standard streams, or ``PYTHONUNBUFFERED=1``."""
+    return {"PYTHONUNBUFFERED": "1"} if request.param else {}
+
+
+def _spawn_cli(
+    args: tuple[str, ...],
+    env: dict[str, str],
+    *,
+    stdin: int,
+    stdout: int,
+    stderr: int,
+) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(  # noqa: S603 - fixed interpreter and in-repository child script
+        [sys.executable, "-c", _CLI_CHILD, *args],
+        cwd=_ROOT,
+        env=env,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
+@pytest.mark.parametrize(
+    ("args", "closed"),
+    [
+        (("call", "test.get", "--route", "bare"), "stdout"),
+        (_LIST, "stdout"),
+        (("--help",), "stdout"),
+        (("list", "--help"), "stdout"),
+        (_LIST, "both"),
+        (("call", "test.get", "--route", "bare", "--params", "[]"), "stderr"),
+        (("bogus",), "stderr"),
+    ],
+    ids=["call-result", "list-rows", "help", "subcommand-help", "list-report", "usage-diagnostic", "parser-error"],
+)
+def test_reader_closed_before_the_first_write_exits_five(
+    args: tuple[str, ...],
+    closed: str,
+    child_env: dict[str, str],
+) -> None:
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    stdout = write_end if closed in {"stdout", "both"} else subprocess.PIPE
+    stderr = write_end if closed in {"stderr", "both"} else subprocess.PIPE
+    try:
+        with _spawn_cli(args, child_env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr) as child:
+            _, diagnostics = child.communicate(timeout=30)
+    finally:
+        os.close(write_end)
+
+    assert child.returncode == _OUTPUT_CLOSED, diagnostics
+    assert b"Exception ignored" not in (diagnostics or b"")
+    assert b"Traceback" not in (diagnostics or b"")
+
+
+def test_reader_closed_mid_stream_exits_five_after_reporting(child_env: dict[str, str]) -> None:
+    pipe = subprocess.PIPE
+    with _spawn_cli(_LIST, child_env, stdin=pipe, stdout=pipe, stderr=pipe) as child:
+        assert child.stdout is not None
+        first = json.loads(child.stdout.readline())
+        child.stdout.close()
+        _, stderr = child.communicate(b"reader closed\n", timeout=30)
+
+    assert first == {"ID": 1}
+    assert child.returncode == _OUTPUT_CLOSED, stderr
+    assert b"Exception ignored" not in stderr
+    assert json.loads(stderr.splitlines()[-1])["state"] == "early_closed"
+
+
+class _NoDescriptorOutput:
+    """A duck-typed sink without ``fileno`` whose reader has gone."""
+
+    def write(self, _value: str) -> int:
+        raise BrokenPipeError
+
+    def flush(self) -> None:
+        raise BrokenPipeError
+
+
+def test_closed_injected_output_is_left_to_its_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "_open_client", _Client)
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    try:
+        # The caller's own close cannot flush the row left behind either; that is the caller's to handle.
+        with contextlib.suppress(BrokenPipeError), open(write_end, "w", encoding="utf-8", closefd=False) as stdout:
+            code = cli.main(["call", "test.get", "--route", "bare"], stdin=io.StringIO(), stdout=stdout)
+        mode = os.fstat(write_end).st_mode
+    finally:
+        os.close(write_end)
+
+    assert code == _OUTPUT_CLOSED
+    assert stat.S_ISFIFO(mode), "the caller's descriptor must not be redirected"
+
+    duck = cast("TextIO", _NoDescriptorOutput())
+    assert cli.main(["call", "test.get", "--route", "bare"], stdin=io.StringIO(), stdout=duck) == _OUTPUT_CLOSED
+
+
+class _FullOutput(io.StringIO):
+    """A sink on a full disk: every write and flush fails with ENOSPC, which is not a gone reader."""
+
+    def write(self, _value: str) -> int:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    def flush(self) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+
+class _ProtocolFailureClient(_Client):
+    async def call(self, _request: Request) -> object:
+        raise ProtocolError("protocol failure")
+
+
+class _InterruptedClient(_Client):
+    async def __aenter__(self) -> Self:
+        raise KeyboardInterrupt
+
+
+@pytest.mark.parametrize(
+    ("client", "args"),
+    [
+        (_ProtocolFailureClient(), ["call", "test.get"]),
+        (_Client(), ["call", "test.get", "--params", "[]"]),
+        (_Client(rows=[{"ID": 1}]), ["list", "test.list"]),
+    ],
+    ids=["failure-diagnostic", "usage-diagnostic", "list-report"],
+)
+def test_failing_stderr_sink_maps_to_the_generic_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    client: _Client,
+    args: list[str],
+) -> None:
+    monkeypatch.setattr(cli, "_open_client", lambda: client)
+    code = cli.main([*args, "--route", "bare"], stdin=io.StringIO(), stdout=io.StringIO(), stderr=_FullOutput())
+    assert code == _CORRECTNESS
+
+
+def test_failing_parser_stderr_maps_to_the_generic_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "stderr", _FullOutput())
+    assert cli.main(["bogus"], stdin=io.StringIO(), stdout=io.StringIO()) == _CORRECTNESS
+
+
+def test_parser_flushes_help_so_a_failing_sink_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    class BufferedFullOutput(io.StringIO):
+        def flush(self) -> None:
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(sys, "stdout", BufferedFullOutput())
+    stderr = io.StringIO()
+
+    assert cli.main(["--help"], stdin=io.StringIO(), stderr=stderr) == _CORRECTNESS
+    assert json.loads(stderr.getvalue())["type"] == "OSError"
+
+
+def test_closed_stdout_outranks_a_failing_stderr(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _Client(rows=[{"ID": 1}])
+    monkeypatch.setattr(cli, "_open_client", lambda: client)
+    code = cli.main(
+        ["list", "test.list", "--route", "bare"],
+        stdin=io.StringIO(),
+        stdout=_BrokenOutput(),
+        stderr=_FullOutput(),
+    )
+    assert code == _OUTPUT_CLOSED
+
+
+def test_final_flush_folds_an_undeliverable_stream_into_the_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    gone = cast("TextIO", _NoDescriptorOutput())
+    monkeypatch.setattr(cli, "_open_client", _InterruptedClient)
+    assert cli.main(["call", "test.get", "--route", "bare"], stdin=io.StringIO(), stdout=gone) == _OUTPUT_CLOSED
+    monkeypatch.setattr(cli, "_open_client", _Client)
+    args = ["call", "test.get", "--route", "bare"]
+    assert cli.main(args, stdin=io.StringIO(), stdout=io.StringIO(), stderr=_FullOutput()) == _CORRECTNESS
+
+
+@pytest.mark.skipif(not Path("/dev/full").exists(), reason="needs /dev/full")
+@pytest.mark.parametrize(
+    ("args", "full", "closed"),
+    [
+        (("bogus",), "stderr", ""),
+        (("--help",), "both", ""),
+        (("call", "test.get", "--route", "bare", "--params", "[]"), "stderr", ""),
+        (_LIST, "stderr", ""),
+        (_LIST, "stderr", "stdout"),
+    ],
+    ids=["parser-error", "help", "usage-diagnostic", "list-report", "closed-stdout-outranks"],
+)
+def test_full_device_maps_to_the_generic_failure(
+    args: tuple[str, ...],
+    full: str,
+    closed: str,
+    child_env: dict[str, str],
+) -> None:
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    device = os.open("/dev/full", os.O_WRONLY)
+    stdout = write_end if closed == "stdout" else device if full == "both" else subprocess.DEVNULL
+    try:
+        with _spawn_cli(args, child_env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=device) as child:
+            child.communicate(timeout=30)
+    finally:
+        os.close(device)
+        os.close(write_end)
+
+    assert child.returncode == (_OUTPUT_CLOSED if closed else _CORRECTNESS)
+
+
+def test_keyboard_interrupt_maps_to_130(monkeypatch: pytest.MonkeyPatch) -> None:
+    code, stdout, stderr = _run(monkeypatch, _InterruptedClient(), ["call", "test.get"])
     assert code == _INTERRUPTED
     assert stdout == stderr == ""
+
+
+@pytest.mark.parametrize("closed_stream", ["stdout", "stderr"])
+def test_an_injected_stream_its_owner_already_closed_fails_without_raising(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    closed_stream: str,
+) -> None:
+    monkeypatch.setattr(cli, "_open_client", _Client)
+    with (tmp_path / "closed.txt").open("w", encoding="utf-8") as closed:
+        pass
+    healthy = io.StringIO()
+    streams: dict[str, TextIO] = {"stdout": healthy, "stderr": healthy, closed_stream: closed}
+    # A closed stdout fails the result write; a closed stderr fails the usage diagnostic.
+    args = ["call", "x", "--route", "bare"] + ([] if closed_stream == "stdout" else ["--params", "[]"])
+
+    assert cli.main(args, stdin=io.StringIO(), **streams) == _CORRECTNESS

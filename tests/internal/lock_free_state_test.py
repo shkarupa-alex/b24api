@@ -9,7 +9,6 @@ property the removal relies on: each mutator finishes in one step, and concurren
 from __future__ import annotations
 import asyncio
 import random
-import time
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -41,7 +40,7 @@ async def test_every_ledger_mutator_completes_without_suspending() -> None:
     context = ExecutionContext(ExecutionPolicy(max_pages=4), RateCoordinator())
 
     _one_step(context.start())
-    _one_step(context.reserve_attempt(attempts_for_request=1, retry_started=time.monotonic()))
+    _one_step(context.reserve_attempt(attempts_for_request=1))
     _one_step(context.record_retry())
     _one_step(context.record_cooldown(_COOLDOWN))
     single = _one_step(context.reserve_page(reference="a"))
@@ -64,7 +63,8 @@ async def test_every_coordinator_mutator_completes_without_suspending() -> None:
     coordinator = RateCoordinator(max_concurrency=1)
 
     permit = _one_step(coordinator.acquire(WorkClass.BATCH, methods=frozenset({"batch"})))
-    _one_step(coordinator.observe_operation_time_limit("crm.item.list", delay=60.0))
+    coordinator.hold_method("crm.item.list", 60.0)
+    coordinator.observe_reset("crm.item.list", 60.0)
     _one_step(coordinator.observe_throttle(30.0, reason="retry-after"))
     busy = _one_step(coordinator.snapshot())
     permit.release_now()

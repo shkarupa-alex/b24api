@@ -56,7 +56,7 @@ def _request(offset: int) -> Request:
 
 
 def _fixture() -> ScriptedTransport:
-    pages = ((0, (10, 20), 2), (2, (20, 30), 4), (4, (40,), None), (5, (), None))
+    pages = ((0, (10, 20), 2), (2, (20, 30), 4), (4, (40,), None))
     return ScriptedTransport(
         tuple(
             ScriptedExchange.json(
@@ -90,7 +90,7 @@ async def run() -> RecipeEvidence:
         if ids != EMITTED_IDS:
             raise AssertionError("scenario 3 emitted rows differ from frozen source")
         if stream.report is None or not stream.report.exhausted:
-            raise AssertionError("scenario 3 lacked empty-page closure")
+            raise AssertionError("scenario 3 did not end at the page without next")
         if stream.report.emitted != len(EMITTED_IDS) or stream.report.unique_rows != len(EXPECTED_IDS):
             raise AssertionError("scenario 3 report lost duplicate accounting")
         if not any(violation.code == "duplicate_identity" for violation in stream.report.violations):
@@ -100,7 +100,7 @@ async def run() -> RecipeEvidence:
         if tuple(sorted({_chat_id(row) for row in rows})) != EXPECTED_IDS:
             raise AssertionError("scenario 3 keyed chat set differs from independent oracle")
     transport.assert_exhausted()
-    if tuple(request.copy_parameters()["OFFSET"] for request in transport.calls) != (0, 2, 4, 5):
+    if tuple(request.copy_parameters()["OFFSET"] for request in transport.calls) != (0, 2, 4):
         raise AssertionError("scenario 3 did not follow envelope continuation")
     report = stream.report
     if report is None:

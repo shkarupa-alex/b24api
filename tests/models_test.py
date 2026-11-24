@@ -1,5 +1,6 @@
 """Tests for deep immutability, controls, policies, budgets, and reports."""
 
+import asyncio
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
 
@@ -21,6 +22,7 @@ from b24api.contracts.request import IdentitySpec, ParameterPath, ReplaySafety, 
 from b24api.contracts.response import Response, inject_controls
 from b24api.contracts.violation import MAX_RETAINED_VIOLATIONS, retain_violations
 from b24api.errors import BudgetExceededError
+from b24api.execution import ExecutionContext, RateCoordinator
 from b24api.execution.snapshot import KernelReport
 from b24api.references.outcome import KernelReferenceFailure, KernelReferenceItem, ReferenceRequest
 
@@ -168,7 +170,8 @@ def test_default_row_buffer_holds_one_complete_portal_batch() -> None:
     assert ExecutionPolicy().max_buffered_rows == 50 * 50
 
 
-def test_budget_counters_count_attempts_pages_references_and_buffers_before_scheduling() -> None:
+@pytest.mark.asyncio
+async def test_budget_ledger_counts_attempts_pages_references_and_buffers_before_scheduling() -> None:
     policy = ExecutionPolicy(
         max_requests=TEST_LIMIT,
         max_pages=TEST_LIMIT,
@@ -178,30 +181,88 @@ def test_budget_counters_count_attempts_pages_references_and_buffers_before_sche
         max_retry_elapsed_per_request=5,
         max_buffered_rows=TEST_LIMIT,
     )
-    counters = BudgetCounters().reserve_attempt(
-        policy,
-        attempts_for_request=0,
-        retry_elapsed=0,
-        total_elapsed=0,
-    )
-    counters = counters.reserve_attempt(policy, attempts_for_request=1, retry_elapsed=1, total_elapsed=1)
-    assert counters.physical_requests == TEST_LIMIT
-    with pytest.raises(BudgetExceededError):
-        counters.reserve_attempt(policy, attempts_for_request=0, retry_elapsed=0, total_elapsed=0)
+    now = [0.0]
+    context = ExecutionContext(policy, RateCoordinator(), clock=lambda: now[0])
+    await context.start()
+    await context.reserve_attempt(attempts_for_request=0)
+    now[0] = 1
+    await context.reserve_attempt(attempts_for_request=1)
+    assert (await context.snapshot()).counters.physical_requests == TEST_LIMIT
+    with pytest.raises(BudgetExceededError, match="physical request budget"):
+        await context.reserve_attempt(attempts_for_request=0)
 
-    pages = BudgetCounters().reserve_page(policy, reference="A")
-    with pytest.raises(BudgetExceededError):
-        pages.reserve_page(policy, reference="A")
-    pages = pages.reserve_page(policy, reference="B")
-    assert pages.logical_pages == TEST_LIMIT
-    with pytest.raises(BudgetExceededError):
-        pages.reserve_page(policy, reference="C")
+    context.commit_page(await context.reserve_page(reference="A"))
+    with pytest.raises(BudgetExceededError, match="per-reference page budget"):
+        await context.reserve_page(reference="A")
+    context.commit_page(await context.reserve_page(reference="B"))
+    counters = (await context.snapshot()).counters
+    assert counters.logical_pages == TEST_LIMIT
+    assert counters.pages_per_reference == (("A", 1), ("B", 1))
+    with pytest.raises(BudgetExceededError, match="logical page budget"):
+        await context.reserve_page(reference="C")
 
-    buffered = BudgetCounters().with_buffered_rows(policy, TEST_LIMIT).with_buffered_rows(policy, 1)
-    assert buffered.buffered_rows == 1
-    assert buffered.buffered_rows_high_water == TEST_LIMIT
-    with pytest.raises(BudgetExceededError):
-        buffered.with_buffered_rows(policy, 3)
+    await context.set_buffered_rows(TEST_LIMIT)
+    await context.adjust_buffered_rows(-1)
+    counters = (await context.snapshot()).counters
+    assert counters.buffered_rows == 1
+    assert counters.buffered_rows_high_water == TEST_LIMIT
+    with pytest.raises(BudgetExceededError, match="buffered row budget"):
+        await context.set_buffered_rows(3)
+
+
+HELD = 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settles", ["released", "committed"])
+@pytest.mark.parametrize("wave", [1, 2])
+async def test_a_page_wave_waits_for_pages_in_flight_and_is_refused_once_they_are_committed(
+    wave: int, settles: str
+) -> None:
+    # A wave (one page, or several reserved at once) that fits the page budget only once pages in flight come back
+    # waits for them. A released page lets it reserve; committed pages never come back, so once they leave it no
+    # room the budget refuses it.
+    context = ExecutionContext(ExecutionPolicy(max_pages=HELD + wave - 1), RateCoordinator())
+    await context.start()
+    held = await context.reserve_pages(HELD)
+    waiting = asyncio.ensure_future(context.reserve_page() if wave == 1 else context.reserve_pages(wave))
+    await asyncio.sleep(0)
+    assert not waiting.done()
+    async with asyncio.timeout(5):
+        if settles == "released":
+            context.release_page(held[0])
+            await waiting
+            assert (await context.snapshot()).counters.logical_pages == 0
+            return
+        context.commit_page(held[0])
+        await asyncio.sleep(0)
+        assert not waiting.done()
+        context.commit_page(held[1])
+        with pytest.raises(BudgetExceededError, match="logical page budget"):
+            await waiting
+
+
+@pytest.mark.asyncio
+async def test_releasing_an_attempt_gives_back_only_one_reserved() -> None:
+    # A send its closed transport refused gives back its reserved attempt; with none reserved, a release is a
+    # misuse, refused loudly instead of driving the count below zero.
+    context = ExecutionContext(ExecutionPolicy(), RateCoordinator())
+    await context.reserve_attempt(attempts_for_request=0)
+    context.release_attempt()
+    assert (await context.snapshot()).counters.physical_requests == 0
+
+    with pytest.raises(RuntimeError, match="no reserved attempt to release"):
+        context.release_attempt()
+    assert (await context.snapshot()).counters.physical_requests == 0
+
+
+def test_budget_counters_snapshot_is_validated_and_sorted() -> None:
+    counters = BudgetCounters(logical_pages=2, pages_per_reference=(("B", 1), ("A", 1)))
+    assert counters.pages_per_reference == (("A", 1), ("B", 1))
+    with pytest.raises(ValueError, match="cannot be negative"):
+        BudgetCounters(pages_per_reference=(("A", -1),))
+    with pytest.raises(ValueError, match="high-water mark"):
+        BudgetCounters(buffered_rows=1)
 
 
 def test_report_is_frozen_and_completion_rejects_blocking_violation() -> None:
@@ -249,7 +310,7 @@ def test_failure_repr_excludes_request_error_and_payload_values() -> None:
         command_index=0,
         stable_key="_0",
         request=request,
-        error={"auth": EXAMPLE_CREDENTIAL},
+        error=RuntimeError(EXAMPLE_CREDENTIAL),
         correlation={"secret": EXAMPLE_CREDENTIAL},
     )
 

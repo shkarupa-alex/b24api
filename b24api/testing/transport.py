@@ -1,4 +1,4 @@
-"""Dependency-free conformance runner for public transport contracts."""
+"""Conformance runner for public transport contracts, needing nothing beyond b24api's own dependencies."""
 
 from __future__ import annotations
 import asyncio
@@ -10,10 +10,13 @@ from dataclasses import dataclass
 from enum import StrEnum
 from functools import partial
 from types import MappingProxyType
+from urllib.parse import parse_qsl, urlsplit
+
+import h11
 
 from b24api.contracts.request import Request
 from b24api.contracts.request_summary import RouteKind
-from b24api.contracts.wire import BodyEncoding, RequestHeaders
+from b24api.contracts.wire import BodyEncoding, RawContent, RequestHeaders
 from b24api.errors import ResponseTooLargeError
 from b24api.testing._isolation import (
     IsolationAbortError,
@@ -27,6 +30,7 @@ type TransportFactory = Callable[[str], Transport | Awaitable[Transport]]
 _HTTP_OK = 200
 _CASE_TIMEOUT_SECONDS = 6.0
 _CLOSE_TIMEOUT_SECONDS = 1.0
+_READ_BYTES = 65536
 
 
 class ConformanceCase(StrEnum):
@@ -46,6 +50,8 @@ class ConformanceCase(StrEnum):
     CANCELLATION_PROPAGATES = "cancellation_propagates"
     ROUTE_JSON_SUFFIX = "route_json_suffix"
     ROUTE_API_V3_REBASE = "route_api_v3_rebase"
+    QUERY_STRING_GET = "query_string_get"
+    QUERY_STRING_RAW_CONTENT = "query_string_raw_content"
 
 
 # A declared route must reach its own endpoint on the conformance webhook ``/rest/1/token/``.
@@ -61,6 +67,15 @@ _ROUTE_PATHS = MappingProxyType(
         RouteKind.API_V3: "/rest/api/1/token/conformance.test",
     }
 )
+_QUERY_CASES = frozenset({ConformanceCase.QUERY_STRING_GET, ConformanceCase.QUERY_STRING_RAW_CONTENT})
+_QUERY_PARAMETERS = MappingProxyType({"plain": "a b", "outer": {"items": ["x"]}})
+_QUERY_PATH = "/rest/1/token/conformance.test"
+# Decoded as PHP decodes a query: ``+`` and ``%20`` alike are a space, a blank value or a bare key is a parameter
+# still, and the order of distinct keys is no matter. The pairs must be exactly the ones the client encodes.
+_QUERY_PAIRS = sorted([("plain", "a b"), ("outer[items][0]", "x")])
+# Not octet-stream, the type a transport might send by default, and with a case-sensitive parameter value: the case
+# checks the declared type goes out whole and as written.
+_RAW_CONTENT = RawContent(b"\x00chunk\xff", 'image/svg+xml; charset=utf-8; name="Chunk  A.svg"')
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,11 +105,45 @@ class ConformanceReport:
         return not self.failures
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class _Capture:
-    request_line: str
+    """One request as the responder read it: header names lower-cased, the body decoded from its framing."""
+
+    method: str
+    target: str
     headers: dict[str, str]
     body: bytes
+
+
+# Wakes the case waiting for a request HTTP/1.1 cannot parse, so the case ends at once instead of at its deadline;
+# the case environment fails it with this detail, whatever the case makes of the capture.
+_UNPARSED = _Capture("", "", {}, b"")
+_UNPARSEABLE_DETAIL = "UnparseableRequest"
+
+
+async def _next_event(connection: h11.Connection, reader: asyncio.StreamReader) -> object:
+    while (event := connection.next_event()) is h11.NEED_DATA:
+        connection.receive_data(await reader.read(_READ_BYTES))
+    return event
+
+
+async def _read_capture(connection: h11.Connection, reader: asyncio.StreamReader) -> _Capture | None:
+    """Read one request as HTTP/1.1 frames it, by ``Content-Length`` or chunked; ``None`` if none was sent.
+
+    Raises ``h11.RemoteProtocolError`` for a request HTTP/1.1 cannot parse.
+    """
+    request = await _next_event(connection, reader)
+    if not isinstance(request, h11.Request):
+        return None
+    body = bytearray()
+    while isinstance(event := await _next_event(connection, reader), h11.Data):
+        body += event.data
+    return _Capture(
+        request.method.decode("latin-1"),
+        request.target.decode("latin-1"),
+        {name.decode("latin-1"): value.decode("latin-1") for name, value in request.headers},
+        bytes(body),
+    )
 
 
 async def run_transport_conformance(
@@ -131,23 +180,20 @@ async def _run_case_environment(
 ) -> ConformanceOutcome:
     """Own one case's event loop, responder, captures, and transport."""
     captures: asyncio.Queue[_Capture] = asyncio.Queue()
+    unparseable = asyncio.Event()
 
     async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            with contextlib.suppress(asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
-                head = await reader.readuntil(b"\r\n\r\n")
-                lines = head.decode("latin-1").split("\r\n")
-                request_line = lines[0]
-                headers = {
-                    name.strip().casefold(): value.strip()
-                    for line in lines[1:]
-                    if ":" in line
-                    for name, value in (line.split(":", 1),)
-                }
-                length = int(headers.get("content-length", "0"))
-                body = await reader.readexactly(length) if length else b""
-                await captures.put(_Capture(request_line, headers, body))
-                if "cancel.test" in request_line:
+            with contextlib.suppress(ConnectionResetError, BrokenPipeError):
+                try:
+                    capture = await _read_capture(h11.Connection(h11.SERVER), reader)
+                except h11.RemoteProtocolError:
+                    unparseable.set()
+                    capture = _UNPARSED
+                if capture is None:
+                    return
+                await captures.put(capture)
+                if "cancel.test" in capture.target:
                     await reader.read()
                     return
                 response_body = b'{"result":true}'
@@ -165,11 +211,24 @@ async def _run_case_environment(
 
     server = await asyncio.start_server(handler, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
+    # A case that sent a request HTTP/1.1 cannot parse fails with that detail if the responder has read it, whether
+    # the transport then returned, raised or was cancelled (the responder answers and closes at once, so a transport
+    # still writing or reading may well fail). The verdict waits for the server to close, and so for every connection
+    # the loop has attached to it. If the transport ends before the responder has read its request, the responder
+    # may still read it before closing, or closing may drop it unread; the case then keeps its own outcome or error.
     try:
-        return await _run_owned_case(case, factory, f"http://127.0.0.1:{port}/rest/1/token/", captures, controller)
-    finally:
-        server.close()
-        await server.wait_closed()
+        try:
+            outcome = await _run_owned_case(
+                case, factory, f"http://127.0.0.1:{port}/rest/1/token/", captures, controller
+            )
+        finally:
+            server.close()
+            await server.wait_closed()
+    except (Exception, asyncio.CancelledError):
+        if not unparseable.is_set():
+            raise
+        return ConformanceOutcome(case, passed=False, detail=_UNPARSEABLE_DETAIL)
+    return ConformanceOutcome(case, passed=False, detail=_UNPARSEABLE_DETAIL) if unparseable.is_set() else outcome
 
 
 async def _run_owned_case(  # noqa: C901, PLR0912 - preserve the first lifecycle failure
@@ -195,7 +254,7 @@ async def _run_owned_case(  # noqa: C901, PLR0912 - preserve the first lifecycle
     failure: BaseException | None = None
     try:
         outcome = await _await_bounded(
-            _run_case(case, transport, captures),
+            (_run_query_case if case in _QUERY_CASES else _run_case)(case, transport, captures),
             seconds=max(0.0, deadline - asyncio.get_running_loop().time()),
             detail="CaseDeadlineExceeded",
         )
@@ -363,11 +422,11 @@ async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915
     elif case is ConformanceCase.FORM_NESTED_BRACKETS:
         request = Request(
             "conformance.test",
-            parameters={"outer": {"items": ["x", None]}},
+            parameters={"outer": {"items": ["x", "y"]}},
             encoding=BodyEncoding.FORM_URLENCODED,
             route=RouteKind.BARE,
         )
-        expected_body = b"outer%5Bitems%5D%5B0%5D=x"
+        expected_body = b"outer%5Bitems%5D%5B0%5D=x&outer%5Bitems%5D%5B1%5D=y"
     elif case is ConformanceCase.SCOPED_HEADERS_FORWARDED:
         request = Request(
             "conformance.test",
@@ -394,8 +453,47 @@ async def _run_case(  # noqa: C901, PLR0911, PLR0912, PLR0915
     elif expected_header is not None:
         passed = passed and capture.headers.get(expected_header[0]) == expected_header[1]
     elif case in _CASE_ROUTES:
-        passed = passed and capture.request_line.split(" ")[1] == _ROUTE_PATHS[route]
+        passed = passed and capture.target == _ROUTE_PATHS[route]
     return ConformanceOutcome(case, passed=passed)
+
+
+async def _run_query_case(
+    case: ConformanceCase,
+    transport: Transport,
+    captures: asyncio.Queue[_Capture],
+) -> ConformanceOutcome:
+    """Check that a query-string request is a GET, or a POST of its raw content, with its parameters in the query."""
+    if not isinstance(transport, WireTransport) or BodyEncoding.QUERY_STRING not in transport.capabilities.encodings:
+        return ConformanceOutcome(case, passed=True, skipped=True)
+    content = _RAW_CONTENT if case is ConformanceCase.QUERY_STRING_RAW_CONTENT else None
+    request = Request(
+        "conformance.test",
+        parameters=_QUERY_PARAMETERS,
+        encoding=BodyEncoding.QUERY_STRING,
+        content=content,
+        route=RouteKind.BARE,
+    )
+    response = await transport.send_wire(WireRequest(request), attempt_timeout=5, max_response_bytes=1024)
+    capture = await captures.get()
+    if content is None:
+        sent = _sent_query(capture, "GET") and capture.body == b"" and "content-type" not in capture.headers
+    else:
+        sent = (
+            _sent_query(capture, "POST")
+            and capture.body == content.data
+            and capture.headers.get("content-type") == content.content_type
+        )
+    return ConformanceOutcome(case, passed=response.status_code == _HTTP_OK and sent)
+
+
+def _sent_query(capture: _Capture, method: str) -> bool:
+    """Return whether ``capture`` is a ``method`` request for the case's path, its parameters in the query."""
+    parts = urlsplit(capture.target)
+    return (
+        capture.method == method
+        and parts.path == _QUERY_PATH
+        and sorted(parse_qsl(parts.query, keep_blank_values=True)) == _QUERY_PAIRS
+    )
 
 
 def _discard_capture(captures: asyncio.Queue[_Capture]) -> None:

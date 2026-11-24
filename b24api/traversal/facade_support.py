@@ -5,10 +5,10 @@ from typing import TYPE_CHECKING, Literal
 
 from b24api.contracts.identity_store import IdentityStore
 from b24api.contracts.policy import DuplicatePolicy, IdentityRequirement, OrderSemantics
-from b24api.contracts.request import _MappingValuesResultSelector, _TolerantMappingValuesResultSelector
+from b24api.contracts.request import IdentitySpec, _MappingValuesResultSelector, _TolerantMappingValuesResultSelector
 from b24api.contracts.response import ResultCollectionShape
 from b24api.contracts.traversal import ContinuationTraversal, InclusiveWindowTraversal
-from b24api.traversal.plans import ContinuationPlan, InclusiveWindowPlan
+from b24api.traversal.plans import ContinuationPlan, CursorTerminalRule, InclusiveWindowPlan, ItemCursorPlan
 
 if TYPE_CHECKING:
     from b24api.contracts.request import ResultSelector, TraversalIdentity
@@ -79,6 +79,48 @@ def declared_traversal_plan(
         duplicate_policy=DuplicatePolicy.ERROR,
     )
     return window, selector, traversal.identity, traversal.max_decoded_rows
+
+
+def cursor_traversal_plan(
+    cursor: CursorSpec,
+    identity: IdentitySpec | None,
+    *,
+    page_size: int,
+) -> tuple[ItemCursorPlan, IdentitySpec]:
+    """Lower a cursor traversal for flat and reference streams alike.
+
+    The cursor owns progression and its order; the cursor strategy checks it on every page. The row
+    identity owns uniqueness. Only an identity that reads the cursor itself (same path, same
+    coercion) inherits the cursor's order; any other identity field carries no order of its own, so
+    the plan does not demand one. Without an identity the cursor value is the identity.
+    """
+    cursor_identity = identity or IdentitySpec(
+        item_path=cursor.item_path,
+        filter_key="cursor",
+        order_key="cursor",
+        coercion=cursor.coercion,
+    )
+    page_order, order_semantics = _cursor_page_contract(cursor)
+    if (cursor_identity.item_path, cursor_identity.coercion) != (cursor.item_path, cursor.coercion):
+        order_semantics = OrderSemantics.UNORDERED
+    plan = ItemCursorPlan(
+        cursor_request_path=cursor.parameter_path,
+        cursor_item_path=cursor.item_path,
+        cursor_coercion=cursor.coercion,
+        direction=_direction(cursor.direction),
+        cursor_take=cursor.take,
+        limit_path=cursor.limit_path,
+        requested_page_size=page_size if cursor.limit_path is not None else None,
+        terminal=CursorTerminalRule.EMPTY_CONFIRMATION,
+        allow_create_controls=cursor.allow_create_controls,
+        domain=cursor.domain,
+        identity_requirement=IdentityRequirement.REQUIRED,
+        order_semantics=order_semantics,
+        duplicate_policy=DuplicatePolicy.ERROR,
+        page_order=page_order,
+        response_terminal=cursor.continuation,
+    )
+    return plan, cursor_identity
 
 
 def _cursor_page_contract(cursor: CursorSpec) -> tuple[Literal["asc", "desc"] | None, OrderSemantics]:

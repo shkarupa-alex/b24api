@@ -4,14 +4,16 @@ HTTPX's own ``aiter_bytes`` inflates a whole received chunk before a caller can 
 32 KiB gzip body can allocate tens of megabytes and a ``gzip, gzip`` cascade over a gigabyte before a
 byte ceiling is checked. The decoder here reads raw transfer bytes instead and never asks zlib for more
 than one byte past the remaining budget. Only one ``identity``, ``gzip`` or ``deflate`` coding can be
-bounded this way; a stacked, unknown, ``br`` or ``zstd`` coding is refused before decompression.
+bounded this way; a stacked, unknown, ``br`` or ``zstd`` coding is refused before decompression. A compressed
+stream that ends before its end marker is refused too, where HTTPX would return the decoded prefix, and every
+member of a multi-member gzip body is decoded, as ``gzip.decompress`` decodes them, where HTTPX keeps the first.
 """
 
 from __future__ import annotations
 import asyncio
 import zlib
 from dataclasses import dataclass
-from typing import Self
+from typing import Self, cast
 
 import httpx
 
@@ -26,6 +28,10 @@ _ZLIB_HEADER_BYTES = 2
 _ZLIB_HEADER_CHECK = 31
 _ZLIB_DEFLATE_METHOD = 8
 _ZLIB_MAX_WINDOW_INFO = 7
+_GZIP_PADDING = b"\x00"
+#: The most raw input zlib is handed at once. What a call leaves unread past a gzip member's end is copied out
+#: (``unused_data``), so a bounded slice keeps that copy bounded and a body of many tiny members linear.
+_INFLATE_SLICE = 16 << 10
 
 
 class _DecodeRefusedError(Exception):
@@ -59,7 +65,7 @@ class _BoundedDecoder:
         self._prefix = b""
         # Raw deflate input kept while a zlib-framing guess has decoded nothing, so the guess can be undone.
         self._replay: bytearray | None = None
-        self._decompressor: zlib._Decompress | None = zlib.decompressobj(_GZIP_WBITS) if coding == "gzip" else None
+        self._decompressor: zlib._Decompress | None = None
 
     @classmethod
     def for_encoding(cls, content_encoding: str | None, *, limit: int) -> Self:
@@ -85,18 +91,25 @@ class _BoundedDecoder:
         if self._coding == _IDENTITY:
             return self._count(raw)
         if self._decompressor is None:
-            # Deflate is sent zlib-wrapped by most servers and raw by some; decide once, from a complete
-            # header, never from a first fragment that may be a single byte.
+            # The decompressor waits for two raw bytes, so a body without any stays empty. Deflate is sent
+            # zlib-wrapped by most servers and raw by some; decide once, from a complete header, never from a
+            # first fragment that may be a single byte.
             self._prefix += raw
             if len(self._prefix) < _ZLIB_HEADER_BYTES:
                 return b""
             raw, self._prefix = self._prefix, b""
-            wrapped = _zlib_wrapped(raw)
-            self._decompressor = zlib.decompressobj(zlib.MAX_WBITS if wrapped else _RAW_DEFLATE_WBITS)
-            self._replay = bytearray() if wrapped else None
+            self._decompressor = self._open(raw)
         if self._replay is not None:
             return self._inflate_framing_guess(raw, self._replay)
         return self._inflate(raw)
+
+    def _open(self, header: bytes) -> zlib._Decompress:
+        """Choose the decompressor from the first raw bytes: gzip, or deflate zlib-wrapped or raw."""
+        if self._coding == "gzip":
+            return zlib.decompressobj(_GZIP_WBITS)
+        wrapped = _zlib_wrapped(header)
+        self._replay = bytearray() if wrapped else None
+        return zlib.decompressobj(zlib.MAX_WBITS if wrapped else _RAW_DEFLATE_WBITS)
 
     def _inflate_framing_guess(self, raw: bytes, replay: bytearray) -> bytes:
         """Inflate under the zlib-framing guess while it has decoded nothing.
@@ -118,48 +131,64 @@ class _BoundedDecoder:
             self._replay = None
         return decoded
 
-    def finish(self) -> bytes:
-        """Return what remains after the last raw chunk.
+    def finish(self) -> None:
+        """Check, after the last raw chunk, that a compressed body reached the end of its stream.
+
+        ``feed`` has already returned every decoded byte: ``_inflate`` hands zlib all input with room for one
+        byte past the ceiling, so a stream that stopped within the ceiling has no output pending. An unbounded
+        ``flush()`` is never needed.
 
         Raises:
-            _DecodedBodyTooLargeError: The decoded body would exceed the ceiling.
-            zlib.error: The raw bytes are not a valid stream of the declared coding.
+            zlib.error: The raw bytes ended before the end of the compressed stream.
         """
-        if self._coding == _IDENTITY:
-            return b""
-        if self._decompressor is None:
-            # Fewer than two bytes cannot carry a zlib header, so the body is raw deflate.
-            self._decompressor = zlib.decompressobj(_RAW_DEFLATE_WBITS)
-            remainder = self._inflate(self._prefix)
-            self._prefix = b""
-            return remainder + self._flush()
-        return self._flush()
+        if self._coding == _IDENTITY or (self._decompressor is None and not self._prefix):
+            # No raw byte at all under a compression coding is an empty body, as HTTPX reads it.
+            return
+        if self._decompressor is None or not self._decompressor.eof:
+            # A truncated stream, or gzip member, is refused, as ``gzip.decompress`` and ``zlib.decompress``
+            # refuse it, where HTTPX returns the decoded prefix. One byte is truncated too: no framing fits in it.
+            raise zlib.error("compressed response body ended before the end of its stream")
 
     def _inflate(self, data: bytes) -> bytes:
         decompressor = self._decompressor
-        if decompressor is None:  # pragma: no cover - feed/finish always choose a decompressor first
+        if decompressor is None:  # pragma: no cover - feed always chooses a decompressor first
             raise RuntimeError("bounded decoder has no decompressor")
         pieces: list[bytes] = []
-        # Bytes after the end of the stream are dropped, as HTTPX drops them, and never handed back to zlib,
-        # whose ``unused_data`` would otherwise accumulate them without bound.
-        while data and not decompressor.eof:
-            pieces.append(self._count(decompressor.decompress(data, self._limit - self._produced + 1)))
-            data = decompressor.unconsumed_tail
+        view = memoryview(data)
+        position = 0
+        while position < len(view):
+            if decompressor.eof:
+                if self._coding != "gzip":
+                    # Bytes after a zlib or raw deflate stream are dropped, never handed back to zlib, whose
+                    # ``unused_data`` would otherwise accumulate them without bound.
+                    break
+                # After a gzip member, zero padding is skipped and anything else must start the next member,
+                # as ``gzip.decompress`` reads them; the ceiling spans every member.
+                position = _skip_padding(view, position)
+                if position == len(view):
+                    break
+                decompressor = self._decompressor = zlib.decompressobj(_GZIP_WBITS)
+            piece = view[position : position + _INFLATE_SLICE]
+            pieces.append(self._count(decompressor.decompress(piece, self._limit - self._produced + 1)))
+            # What zlib left of the slice is past the member's end; short of it, zlib stops only after the one byte
+            # past the ceiling, which ``_count`` has refused.
+            left = decompressor.unused_data if decompressor.eof else decompressor.unconsumed_tail
+            position += len(piece) - len(left)
         return b"".join(pieces)
-
-    def _flush(self) -> bytes:
-        decompressor = self._decompressor
-        if decompressor is None or decompressor.eof:
-            return b""
-        # ``_inflate`` drained every unconsumed tail, so no pending input remains for ``flush`` to inflate
-        # without a length bound; a truncated stream is tolerated here exactly as HTTPX tolerates it.
-        return self._count(decompressor.flush())
 
     def _count(self, decoded: bytes) -> bytes:
         self._produced += len(decoded)
         if self._produced > self._limit:
             raise _DecodedBodyTooLargeError("decoded response body exceeded the byte ceiling")
         return decoded
+
+
+def _skip_padding(view: memoryview, position: int) -> int:
+    """Return the position of the first byte at or after ``position`` that is no gzip zero padding."""
+    while position < len(view) and view[position] == 0:
+        window = view[position : position + _INFLATE_SLICE]
+        position += len(window) - len(bytes(window).lstrip(_GZIP_PADDING))
+    return position
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,20 +202,22 @@ class BodyReadOutcome:
 
 
 async def read_bounded_body(response: httpx.Response, maximum: int) -> BodyReadOutcome:
-    """Decode raw bytes under the ceiling without propagating credential-bearing HTTPX exceptions."""
+    """Decode raw bytes under the ceiling; HTTPX request errors and decoding failures become an outcome."""
     body = bytearray()
     try:
         # A refused coding fails here, before any body byte is read.
         decoder = _BoundedDecoder.for_encoding(response.headers.get("content-encoding"), limit=maximum)
         if response.is_stream_consumed:
-            # An in-memory response (a mock or custom transport) arrives already read and decoded; its
-            # allocation happened inside that transport, so only the ceiling remains to enforce.
+            # A body read inside the injected client, by its transport (``httpx.Response(content=...)`` in a
+            # ``MockTransport``), by a response hook (``await response.aread()``) or for an ``httpx.Auth`` with
+            # ``requires_response_body``, arrives decoded by HTTPX, which checks no end of stream and keeps only
+            # the first gzip member. Its raw bytes may still sit behind the client's stream wrapper, but the
+            # public API cannot tell an in-memory stream from a released network one, whose replay would read a
+            # connection back in the pool. Only the ceiling remains to enforce.
             body.extend(_BoundedDecoder(_IDENTITY, limit=maximum).feed(response.content))
         else:
-            # Raw transfer bytes only: ``aiter_bytes`` would inflate a whole chunk before its size is known.
-            async for chunk in response.aiter_raw():
-                body.extend(decoder.feed(chunk))
-            body.extend(decoder.finish())
+            await _read_raw(response, decoder, body)
+            decoder.finish()
     except _DecodedBodyTooLargeError:
         return BodyReadOutcome(too_large=True)
     except asyncio.CancelledError as error:
@@ -205,3 +236,16 @@ async def read_bounded_body(response: httpx.Response, maximum: int) -> BodyReadO
     except httpx.RequestError:
         return BodyReadOutcome(transport_failure="HTTP client failed while reading the response body")
     return BodyReadOutcome(body=bytes(body))
+
+
+async def _read_raw(response: httpx.Response, decoder: _BoundedDecoder, body: bytearray) -> None:
+    """Feed every raw transfer chunk to the decoder; ``aiter_bytes`` would inflate a chunk before its size is known.
+
+    The stream is read directly, not through ``aiter_raw()``, which also closes it after the last chunk:
+    the transport's own release is then the only close, and its failure cannot void a complete body.
+    """
+    if response.is_closed:
+        raise httpx.StreamClosed  # a hook closed the response unread; ``aiter_raw()`` refuses it alike
+    # ``AsyncClient`` wraps every response stream in an asynchronous one before any hook sees it.
+    async for chunk in cast("httpx.AsyncByteStream", response.stream):
+        body.extend(decoder.feed(chunk))

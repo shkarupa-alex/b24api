@@ -1,9 +1,10 @@
 # ruff: noqa: INP001 - a standalone workflow script, not an importable package module
-"""Release gate: refuse a noncanonical tag before building and unmatched distributions before upload.
+"""Release gate: refuse a noncanonical or unreviewed tag before CI and unmatched distributions before upload.
 
-``tag`` validates ``GITHUB_REF_NAME`` before the build backend runs. ``dists DIR`` checks that the
-directory holds exactly one wheel and one sdist whose filenames and embedded metadata carry the
-validated tag as their version, and that the wheel passes the ``wheel`` check. ``wheel FILE`` needs
+``tag`` validates ``GITHUB_REF_NAME`` and requires the checked-out commit to be on ``origin/master``, the
+reviewed branch, before CI and the build run. ``dists DIR`` checks that the directory holds exactly one
+wheel and one sdist whose filenames and embedded metadata carry the validated tag as their version and
+the Markdown README as their description, and that the wheel passes the ``wheel`` check. ``wheel FILE`` needs
 no tag: it checks that a built wheel carries the ``b24api/py.typed`` marker and ships nothing beside
 the package and its ``.dist-info`` (no ``docs/``, ``tests/``, ``tools/`` or ``examples/``). The
 package version itself stays owned by setuptools-git-versioning; this gate only compares what the
@@ -14,6 +15,8 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tarfile
 import zipfile
@@ -26,6 +29,7 @@ ACCEPTED_FORM = (
     "release tags must be canonical stable versions MAJOR.MINOR.PATCH, for example 2.2.1, "
     "without a prefix such as v or fix-, leading zeros, or a prerelease or build suffix"
 )
+RELEASE_BRANCH = "origin/master"
 _WHEEL_PARTS = (5, 6)
 TYPING_MARKER = f"{PROJECT}/py.typed"
 
@@ -50,6 +54,29 @@ def release_version(environ: dict[str, str] | os._Environ[str]) -> str:
             f"{ACCEPTED_FORM}; push a canonical release tag instead",
         )
     return tag
+
+
+def require_reviewed_commit(repository: Path) -> None:
+    """Refuse a tag whose commit is not on ``RELEASE_BRANCH``: only reviewed history is published."""
+    git = shutil.which("git")
+    if git is None:
+        raise ReleaseGateError("Release branch unavailable", "git is required to check the tagged commit")
+    result = subprocess.run(  # noqa: S603 - fixed git command on fixed refs
+        [git, "merge-base", "--is-ancestor", "HEAD", f"refs/remotes/{RELEASE_BRANCH}"],
+        cwd=repository,
+        check=False,
+        capture_output=True,
+    )
+    if result.returncode == 1:
+        raise ReleaseGateError(
+            "Tag not on master",
+            f"the tagged commit is not on {RELEASE_BRANCH}; tag a commit of master after it passes CI",
+        )
+    if result.returncode != 0:
+        raise ReleaseGateError(
+            "Release branch unavailable",
+            f"cannot compare the tagged commit with {RELEASE_BRANCH}; fetch master with full history first",
+        )
 
 
 def verify_distributions(dist: Path, version: str) -> tuple[Path, Path]:
@@ -126,13 +153,18 @@ def _check_metadata(text: str, version: str, artifact: str) -> None:
         raise ReleaseGateError("Invalid metadata", f"{artifact} metadata does not describe {PROJECT}")
     if headers.get("Version") != version:
         raise ReleaseGateError("Version mismatch", f"{artifact} metadata version is not {version}")
+    description = headers.get_payload()
+    if headers.get("Description-Content-Type", "").split(";")[0] != "text/markdown" or not (
+        isinstance(description, str) and description.strip()
+    ):
+        raise ReleaseGateError("Invalid metadata", f"{artifact} metadata lacks the Markdown README as its description")
 
 
 def main(argv: list[str] | None = None) -> int:
     """Run one gate and report a failure as a GitHub error annotation."""
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("tag", help="validate GITHUB_REF_NAME before building")
+    commands.add_parser("tag", help="validate GITHUB_REF_NAME and require HEAD on origin/master before CI")
     dists = commands.add_parser("dists", help="verify built distributions against GITHUB_REF_NAME")
     dists.add_argument("directory", type=Path)
     wheel_check = commands.add_parser("wheel", help="verify the contents of one built wheel; needs no tag")
@@ -148,7 +180,8 @@ def main(argv: list[str] | None = None) -> int:
             sdist, wheel = verify_distributions(arguments.directory, version)
             sys.stdout.write(f"verified {sdist.name} and {wheel.name} as version {version}\n")
         else:
-            sys.stdout.write(f"release tag {version} is canonical\n")
+            require_reviewed_commit(Path.cwd())
+            sys.stdout.write(f"release tag {version} is canonical and on {RELEASE_BRANCH}\n")
     except ReleaseGateError as error:
         # The rejected tag is never echoed into the annotation command itself.
         sys.stdout.write(f"::error title={error.title}::{error}\n")

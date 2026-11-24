@@ -3,18 +3,17 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING, NoReturn
 
-from b24api.batch.outcome import BatchSuccess
-from b24api.contracts.completion import CommandSettlement
+from b24api.batch.outcome import BatchSuccess, settlement_of
+from b24api.completion.page_failure import failed_page
 from b24api.contracts.keyset_execution import ClosureWitness, KeysetPageCompletion, KeysetPhase
 from b24api.contracts.report import PageDispatch, PageOutcome, PageRejectionCode
 from b24api.errors import (
-    AmbiguousExecutionError,
     B24ApiError,
     BudgetExceededError,
     IncompleteTraversalError,
-    PageAdaptationError,
     PaginationError,
 )
+from b24api.execution.facts import Execution, execution
 from b24api.traversal import keyset_step
 from b24api.traversal.keyset_capability import (
     anchor_commands,
@@ -27,7 +26,6 @@ from b24api.traversal.keyset_fast_plan import (
     LaneSpec,
     LaneState,
     LaneStatus,
-    fit_wave,
 )
 from b24api.traversal.keyset_geometry import descending_closure_witness
 from b24api.traversal.keyset_observation import stage_or_record_observation
@@ -43,6 +41,7 @@ from b24api.traversal.keyset_transaction_contract import (
     build_controlled_request,
     build_lane_plan,
 )
+from b24api.traversal.keyset_waves import wave_members, wave_room
 
 if TYPE_CHECKING:
     from b24api.batch.outcome import BatchOutcome
@@ -64,7 +63,6 @@ def build_anchor_plans(
         upper_exclusive=min(desc.identities),
         target_lanes=target,
         page_cap=host.effective_page_cap,
-        writable_limit=host.keyset.limit_path is not None,
     )
     return build_capability_plans(
         commands,
@@ -83,7 +81,7 @@ async def execute_wave(
 ) -> tuple[LaneReceipt, ...]:
     """Execute and validate one atomic correlated batch wave."""
     if not plans or len(plans) > host.engine.portal_command_cap:
-        raise ValueError("fast keyset wave must contain 1..50 commands")
+        raise ValueError("fast keyset wave must contain 1..portal_command_cap commands")
     reserved_rows = sum(plan.reserved_rows for plan in plans)
     charged_rows = 0
     if reserved_rows > host.context.policy.max_buffered_rows - host.transactions.buffer_balance:
@@ -98,25 +96,28 @@ async def execute_wave(
             all(plan.phase is KeysetPhase.BOUNDARY for plan in plans)
             and getattr(getattr(host.execution, "total_hint", None), "value", None) == "request_advisory"
         )
-        outcomes = await host.engine.execute_requests(
-            tuple(plan.request for plan in plans),
-            context=host.context.execution_context,
-            advisory_totals=advisory,
-            strict_envelope=True,
-            strict_json_members=True,
-        )
+        try:
+            outcomes = await host.engine.execute_requests(
+                {plan.command_id: plan.request for plan in plans},
+                context=host.context.execution_context,
+                advisory_totals=advisory,
+                strict_envelope=True,
+            )
+        except BaseException as error:
+            _trace_failed_call(host, plans, error, PageDispatch.BATCH)
+            raise
         _record_wave_dispatch(host, plans, outcomes)
-        receipts, rejections, selected_rows = _validate_wave(host, plans, outcomes, reservations)
+        receipts, rejections = _validate_wave(host, plans, outcomes, reservations)
         if rejections:
-            _abort_wave(host, plans, receipts, rejections, selected_rows)
+            _abort_wave(host, plans, outcomes, receipts, rejections)
         stage_semantics = any(plan.phase is KeysetPhase.BOUNDARY for plan in plans)
-        for index, (plan, receipt, outcome) in enumerate(zip(plans, receipts, outcomes, strict=True)):
+        for plan, receipt, outcome in zip(plans, receipts, outcomes, strict=True):
             stage_or_record_observation(
                 host.transactions.staged_observations,
                 host.record_page,
                 stage=stage_semantics,
                 plan=plan,
-                index=index,
+                index=outcome.command_index,
                 rows=len(receipt.rows),
                 response=outcome.response if isinstance(outcome, BatchSuccess) else None,
                 witness=receipt.witness,
@@ -135,7 +136,7 @@ def _record_wave_dispatch(
 ) -> None:
     """Settle every command and count the physical request before any receipt is validated."""
     for plan, outcome in zip(plans, outcomes, strict=True):
-        host.completion_recorder.settle(plan.command_id, _settlement(outcome))
+        host.completion_recorder.settle(plan.command_id, settlement_of(outcome))
     host.transactions.boundary_totals = boundary_totals(plans, outcomes)
     host.batch_requests += 1
     host.batch_commands += len(plans)
@@ -151,12 +152,11 @@ def _validate_wave(
     plans: tuple[LaneCommandPlan, ...],
     outcomes: tuple[BatchOutcome, ...],
     reservations: tuple[PageReservation, ...],
-) -> tuple[list[LaneReceipt], list[ReceiptRejection], int]:
+) -> tuple[list[LaneReceipt], list[ReceiptRejection]]:
     """Charge each page, validate its receipt, and record every rejected command's page."""
     receipts: list[LaneReceipt] = []
     rejections: list[ReceiptRejection] = []
-    selected_rows = 0
-    for index, (plan, outcome, reservation) in enumerate(zip(plans, outcomes, reservations, strict=True)):
+    for plan, outcome, reservation in zip(plans, outcomes, reservations, strict=True):
         commit = host.context.commit_page if isinstance(outcome, BatchSuccess) else host.context.release_page
         commit(reservation)
         lane = lane_for_command(
@@ -178,34 +178,34 @@ def _validate_wave(
             page_adapter=host.page_adapter,
         )
         if not isinstance(receipt, ReceiptRejection):
-            selected_rows += len(receipt.rows)
             host.completion_recorder.validated(plan.command_id)
             receipts.append(receipt)
             continue
-        selected_rows += receipt.selected_rows
         rejections.append(receipt)
-        host.violations.append(receipt.violation)
-        page_outcome, rejection_code = classify_rejection(outcome)
-        if isinstance(receipt.error, PageAdaptationError):
-            rejection_code = PageRejectionCode.PAGE_ADAPTATION
+        if not _budget_end(host, receipt.error):
+            host.violations.append(receipt.violation)
+        traced = classify_rejection(outcome, receipt)
+        if traced is None:
+            continue  # never sent: not traced
+        page_outcome, rejection_code = traced
         host.record_page(
             plan,
-            index=index,
+            index=outcome.command_index,
             selected=receipt.selected_rows,
             admitted=0,
             outcome=page_outcome,
             rejection=rejection_code,
             violation=receipt.violation,
         )
-    return receipts, rejections, selected_rows
+    return receipts, rejections
 
 
 def _abort_wave(
     host: KeysetTransactionHost,
     plans: tuple[LaneCommandPlan, ...],
+    outcomes: tuple[BatchOutcome, ...],
     receipts: list[LaneReceipt],
     rejections: list[ReceiptRejection],
-    selected_rows: int,
 ) -> NoReturn:
     """Reject the valid pages of a failed wave too, discard its rows, and raise its cause.
 
@@ -213,48 +213,104 @@ def _abort_wave(
     have executed, the binding's outcome is unknown, not failed.
     """
     successful = {receipt.command_id: receipt for receipt in receipts}
-    for index, plan in enumerate(plans):
+    for plan, outcome in zip(plans, outcomes, strict=True):
         if plan.command_id in successful:
             host.record_page(
                 plan,
-                index=index,
+                index=outcome.command_index,
                 selected=len(successful[plan.command_id].rows),
                 admitted=0,
                 outcome=PageOutcome.REJECTED,
                 rejection=PageRejectionCode.TRANSACTION_ABORTED,
             )
+    selected_rows = sum(len(receipt.rows) for receipt in receipts) + sum(r.selected_rows for r in rejections)
     host.admission.record_raw(selected_rows, discarded=True)
     causes = [receipt for receipt in rejections if receipt.error is not None]
     rejection = next(
-        (receipt for receipt in causes if isinstance(receipt.error, AmbiguousExecutionError)),
+        (receipt for receipt in causes if execution(receipt.error) is Execution.POSSIBLY_RUN),
         causes[0] if causes else None,
     )
     if rejection is None:
         raise PaginationError("fast keyset wave validation failed")
-    _raise_rejection(rejection)
+    _raise_rejection(host, rejection)
 
 
-def _settlement(outcome: BatchOutcome) -> CommandSettlement:
-    """Classify one correlated command: an ambiguous failure may have executed, so it is unknown."""
-    if isinstance(outcome, BatchSuccess):
-        return CommandSettlement.SUCCESS
-    if isinstance(outcome.error, AmbiguousExecutionError):
-        return CommandSettlement.UNKNOWN
-    return CommandSettlement.FAILURE
+async def _execute_finish_command(
+    host: KeysetTransactionHost, plan: LaneCommandPlan, request: Request, dispatch: PageDispatch
+) -> BatchOutcome:
+    """Send the finish page through the engine; a call that fails as a whole traces the page before it raises."""
+    try:
+        return await host.engine.execute_page(
+            request, command_id=plan.command_id, context=host.context.execution_context
+        )
+    except BaseException as error:
+        _trace_failed_call(host, (plan,), error, dispatch)
+        raise
 
 
-def _raise_rejection(rejection: ReceiptRejection) -> NoReturn:
+def _trace_failed_call(
+    host: KeysetTransactionHost,
+    plans: tuple[LaneCommandPlan, ...],
+    error: BaseException,
+    dispatch: PageDispatch,
+) -> None:
+    """Trace each page of an engine call that failed as a whole the way it settles (``failed_page``).
+
+    The call left no outcome per command to validate; the engine settled each page from what its command did
+    (``WaveEngine.failed_pages``), and the trace reads that same fact, with the command's index in its physical
+    batch: a page never sent is not traced, and whatever ended the call, a cancellation included, decides nothing.
+    """
+    pages = host.engine.failed_pages(error)
+    if pages is None:
+        return
+    for plan, page in zip(plans, pages, strict=True):
+        traced = failed_page(error, page.settlement)
+        if traced is None:
+            continue
+        page_outcome, rejection_code = traced
+        host.record_page(
+            plan,
+            index=page.batch_index,
+            selected=0,
+            admitted=0,
+            outcome=page_outcome,
+            rejection=rejection_code,
+            dispatch=dispatch,
+        )
+
+
+def _finish_index(outcome: BatchOutcome, dispatch: PageDispatch) -> int | None:
+    """Return a finish page's index in the physical batch it was sent with, as a wave page takes it.
+
+    A batch finish page's command outcome carries it, as every wave command's does; a direct finish page has none.
+    """
+    return outcome.command_index if dispatch is PageDispatch.BATCH else None
+
+
+def _budget_end(host: KeysetTransactionHost, error: BaseException | None) -> bool:
+    """Return whether the operation's budget refusal stopped a command: its end, not a failed page.
+
+    Only that refusal is (``ExecutionContext.ended_by``): another budget error, such as a request's own retry window
+    or a result the row budget dropped (``ResultTooLargeError``, an answered command), stays the command's failure.
+    """
+    return host.context.execution_context.ended_by(error)
+
+
+def _raise_rejection(host: KeysetTransactionHost, rejection: ReceiptRejection) -> NoReturn:
     """Raise a rejected command's cause; a failed command ends the traversal incomplete, with its replay.
 
     An ambiguous command is raised as is, as a direct page's is: whether it executed is unknown, so
-    the binding's outcome is unknown rather than failed.
+    the binding's outcome is unknown rather than failed. A command the operation's budget refused is
+    raised as is too: the refusal ends the operation, as it ends a direct page.
     """
     cause = rejection.error
     if cause is None:
         raise PaginationError(rejection.detail)
+    if _budget_end(host, cause):
+        raise cause
     if (
         isinstance(cause, B24ApiError)
-        and not isinstance(cause, AmbiguousExecutionError)
+        and execution(cause) is not Execution.POSSIBLY_RUN
         and rejection.violation.code == "command_failure"
     ):
         raise IncompleteTraversalError(
@@ -273,29 +329,25 @@ async def execute_body_wave(host: KeysetTransactionHost) -> None:
     if not open_lanes:
         host.drain_admission_frontier()
         return
-    frontier = open_lanes[0]
-    candidates_lanes = [
-        lane
-        for lane in open_lanes
-        if lane is frontier or not host.transactions.lane_rows[lane.spec.ordinal] or lane.rounds <= frontier.rounds
-    ][: host.batch_capacity]
-    plan_candidates = tuple(_body_plan(host, lane) for lane in candidates_lanes)
-    plans = fit_wave(
-        plan_candidates,
-        reserves=tuple(plan.reserved_rows for plan in plan_candidates),
-        commands=host.batch_capacity,
-        rows=host.context.policy.max_buffered_rows - host.transactions.buffer_balance,
+    members = wave_members(
+        open_lanes,
+        room=wave_room(
+            capacity=host.batch_capacity,
+            free_rows=host.context.policy.max_buffered_rows - host.transactions.buffer_balance,
+            reserve=host.effective_page_cap,
+        ),
     )
-    if not plans:
+    if not members:
         raise BudgetExceededError("fast keyset body wave has no available row capacity")
-    receipts = await host.execute_wave(plans)
+    receipts = await host.execute_wave(tuple(_body_plan(host, lane) for lane in members))
     retained = sum(len(receipt.rows) for receipt in receipts)
     await host.adjust_buffer(retained)
     host.admission.record_raw(retained)
     by_ordinal = {receipt.lane_ordinal: receipt for receipt in receipts}
-    for lane in candidates_lanes[: len(plans)]:
+    for lane in members:
         receipt = by_ordinal[lane.spec.ordinal]
         lane.rounds += 1
+        lane.received_rows += len(receipt.rows)
         host.transactions.lane_rows[lane.spec.ordinal].extend(receipt.rows)
         host.transactions.lane_identities[lane.spec.ordinal].extend(receipt.identities)
         host.transactions.lane_commands[lane.spec.ordinal].append((receipt.command_id, len(receipt.rows)))
@@ -334,6 +386,19 @@ def _body_plan(host: KeysetTransactionHost, lane: LaneState) -> LaneCommandPlan:
     return build_lane_plan(host, lane, phase=KeysetPhase.BODY, request=request)
 
 
+def close_empty_lanes(host: KeysetTransactionHost) -> None:
+    """Close, without a request, every open lane known to hold no identity.
+
+    Its fences leave no identity value between them, or an anchor probe found none there. Its whole
+    lattice (nothing) is already known; a partition lane still takes back its retained anchor.
+    """
+    for lane in host.transactions.lanes:
+        lower, upper = lane.spec.bounds.lower_exclusive, lane.spec.bounds.upper_exclusive
+        no_values = lower is not None and upper is not None and upper - lower <= 1
+        if lane.status is LaneStatus.OPEN and (lane.spec.known_empty or no_values):
+            _close_lane(host, lane, ClosureWitness.LATTICE_FULL)
+
+
 def _close_lane(host: KeysetTransactionHost, lane: LaneState, witness: ClosureWitness) -> None:
     """Close a lane on its witness; a partition lane first takes back its retained upper anchor row."""
     lane.status = LaneStatus.CLOSED
@@ -368,14 +433,19 @@ async def execute_finish_page(
     if host.transactions.finish_cursor is None:
         host.transactions.terminal = True
         return
-    finish_lane = host.transactions.finish_lane = _finish_lane(host.transactions.finish_cursor, finish_plan)
+    previous = host.transactions.finish_lane
+    finish_lane = host.transactions.finish_lane = _finish_lane(
+        host.transactions.finish_cursor,
+        finish_plan,
+        received_rows=0 if previous is None else previous.received_rows,
+    )
     plan = build_lane_plan(host, finish_lane, phase=KeysetPhase.FINISH, request=request)
     dispatch = host.engine.page_dispatch
     reservation = await host.context.reserve_page()
     try:
         await host.adjust_buffer(host.effective_page_cap)
         host.completion_recorder.schedule(plan.command_id)
-        outcome = await host.engine.execute_page(request, context=host.context.execution_context)
+        outcome = await _execute_finish_command(host, plan, request, dispatch)
         _record_finish_dispatch(host, plan, outcome, dispatch)
         commit = host.context.commit_page if isinstance(outcome, BatchSuccess) else host.context.release_page
         commit(reservation)
@@ -392,6 +462,7 @@ async def execute_finish_page(
         )
         if isinstance(receipt, ReceiptRejection):
             _reject_finish_receipt(host, plan, outcome, receipt, dispatch)
+        finish_lane.received_rows += len(receipt.rows)
         response = outcome.response if isinstance(outcome, BatchSuccess) else None
         host.completion_recorder.validated(plan.command_id)
         terminal = keyset_step.keyset_page_terminal(finish_plan, len(receipt.rows))
@@ -400,10 +471,10 @@ async def execute_finish_page(
         try:
             admitted = host.admission.validate_and_commit(receipt)
         except PaginationError:
-            host.admission.record_discarded(len(receipt.rows))
+            # The refused rows stay raw: the runtime's cleanup counts them discarded with every row it did not admit.
             host.record_page(
                 plan,
-                index=None,
+                index=_finish_index(outcome, dispatch),
                 selected=len(receipt.rows),
                 admitted=0,
                 outcome=PageOutcome.REJECTED,
@@ -415,7 +486,7 @@ async def execute_finish_page(
             raise
         host.record_page(
             plan,
-            index=None,
+            index=_finish_index(outcome, dispatch),
             selected=len(receipt.rows),
             admitted=len(admitted.rows),
             response=response,
@@ -451,7 +522,7 @@ def _record_finish_dispatch(
     dispatch: PageDispatch,
 ) -> None:
     """Settle the finish command before its receipt is validated; a batched page counts as a one-command wave."""
-    host.completion_recorder.settle(plan.command_id, _settlement(outcome))
+    host.completion_recorder.settle(plan.command_id, settlement_of(outcome))
     if dispatch is PageDispatch.BATCH:
         host.batch_requests += 1
         host.batch_commands += 1
@@ -462,11 +533,12 @@ def _require_closure_witness(receipt: LaneReceipt) -> None:
         raise RuntimeError("terminal fast finish page lacked a closure witness")
 
 
-def _finish_lane(cursor: int, finish_plan: KeysetPlan) -> LaneState:
-    """Open the single sequential finish lane that continues from the fast phase's cursor."""
+def _finish_lane(cursor: int, finish_plan: KeysetPlan, *, received_rows: int) -> LaneState:
+    """Open the finish lane's next page: it continues from the cursor, its row count from the last page."""
     descending = finish_plan.direction != "asc"
     bounds = LaneBounds(None if descending else cursor, cursor if descending else None)
-    return LaneState(LaneSpec(0, LaneKind.FINISH, bounds, descending, None), cursor, LaneStatus.OPEN, None, 0, 0)
+    spec = LaneSpec(0, LaneKind.FINISH, bounds, descending, None)
+    return LaneState(spec, cursor, LaneStatus.OPEN, None, 0, 0, received_rows)
 
 
 def _reject_finish_receipt(
@@ -477,26 +549,28 @@ def _reject_finish_receipt(
     dispatch: PageDispatch,
 ) -> NoReturn:
     """Record a rejected finish page as a rejected wave command is recorded, discard its rows, and raise."""
-    host.violations.append(receipt.violation)
+    if not _budget_end(host, receipt.error):
+        host.violations.append(receipt.violation)
     host.admission.record_raw(receipt.selected_rows, discarded=True)
-    page_outcome, rejection_code = classify_rejection(outcome)
-    if isinstance(receipt.error, PageAdaptationError):
-        rejection_code = PageRejectionCode.PAGE_ADAPTATION
-    host.record_page(
-        plan,
-        index=None,
-        selected=receipt.selected_rows,
-        admitted=0,
-        outcome=page_outcome,
-        rejection=rejection_code,
-        violation=receipt.violation,
-        dispatch=dispatch,
-    )
-    _raise_rejection(receipt)
+    traced = classify_rejection(outcome, receipt)
+    if traced is not None:  # a finish page never sent is not traced
+        page_outcome, rejection_code = traced
+        host.record_page(
+            plan,
+            index=_finish_index(outcome, dispatch),
+            selected=receipt.selected_rows,
+            admitted=0,
+            outcome=page_outcome,
+            rejection=rejection_code,
+            violation=receipt.violation,
+            dispatch=dispatch,
+        )
+    _raise_rejection(host, receipt)
 
 
 __all__ = [
     "build_anchor_plans",
+    "close_empty_lanes",
     "execute_body_wave",
     "execute_finish_page",
     "execute_wave",

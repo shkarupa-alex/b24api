@@ -3,7 +3,7 @@
 from __future__ import annotations
 import inspect
 from dataclasses import FrozenInstanceError, fields, replace
-from typing import is_typeddict
+from typing import TYPE_CHECKING, is_typeddict
 
 import pytest
 
@@ -46,6 +46,9 @@ from b24api.contracts import (
 from b24api.contracts.policy import IdentityCoercion
 from b24api.errors import ProtocolError
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 CORRELATION_VALUE = 7
 DIRECT_CONCURRENCY = 3
 BATCH_SIZE = 7
@@ -61,6 +64,8 @@ def test_public_error_module_export_snapshot_is_static_contract_evidence() -> No
         "BatchFailed",
         "BudgetExceededError",
         "CapabilityError",
+        "CleanupOverrunError",
+        "ClientClosedError",
         "ContinuationError",
         "ContinuationReason",
         "EnvelopeContractError",
@@ -78,6 +83,8 @@ def test_public_error_module_export_snapshot_is_static_contract_evidence() -> No
         "ReferenceFailed",
         "ResponseTooLargeError",
         "ResultShapeError",
+        "ResultTooLargeError",
+        "StreamClosedError",
         "TransportError",
         "ValidationIssue",
     )
@@ -191,7 +198,7 @@ def test_request_mapping_contract_is_a_closed_typed_dict() -> None:
     assert is_typeddict(RequestSpec)
     assert RequestSpec.__required_keys__ == frozenset({"method", "route"})
     assert RequestSpec.__optional_keys__ == frozenset(
-        {"parameters", "replay_safety", "encoding", "headers", "result_error"},
+        {"parameters", "replay_safety", "encoding", "content", "headers", "result_error"},
     )
 
 
@@ -353,6 +360,24 @@ def test_operation_report_terminal_properties_are_explicit() -> None:
     with_failures = OperationReport(TerminalState.COMPLETED_WITH_FAILURES, "batch", "some commands failed")
     assert not with_failures.exhausted
     assert with_failures.partial
+
+
+_NEGATIVE_COUNTERS: dict[str, Callable[[], OperationReport]] = {
+    "admitted": lambda: OperationReport(TerminalState.CANCELLED, "batch", "cancelled", admitted=-1),
+    "retries": lambda: OperationReport(TerminalState.CANCELLED, "batch", "cancelled", retries=-1),
+    "undelivered_possibly_run": lambda: OperationReport(
+        TerminalState.CANCELLED, "batch", "cancelled", undelivered_possibly_run=-1
+    ),
+    "undelivered_not_sent": lambda: OperationReport(
+        TerminalState.CANCELLED, "batch", "cancelled", undelivered_not_sent=-1
+    ),
+}
+
+
+@pytest.mark.parametrize("counter", sorted(_NEGATIVE_COUNTERS))
+def test_an_operation_report_refuses_a_negative_counter(counter: str) -> None:
+    with pytest.raises(ValueError, match="non-negative integers"):
+        _NEGATIVE_COUNTERS[counter]()
 
 
 def test_keyset_selection_summary_is_a_closed_optional_report_field() -> None:

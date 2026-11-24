@@ -22,11 +22,11 @@ from datetime import datetime
 from enum import IntEnum
 from pathlib import Path
 from typing import Any, Final, cast
-from urllib.parse import urlsplit
 
 from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import SchemaError
 
+from b24api._webhook import Webhook, WebhookRefusal, parse_webhook
 from tools.b24api_evidence import repository as repository_state
 
 SCHEMA_VERSION: Final = "2.0"
@@ -47,7 +47,6 @@ NORMATIVE_MAXIMUM_SMALL_P95_RATIO: Final = 1.05
 NORMATIVE_MAXIMUM_OPERATING_RATIO: Final = 1.10
 MAX_MUTATION_RETRIES: Final = 3
 FINGERPRINT_KEY_BYTES: Final = 32
-WEBHOOK_PATH_PARTS: Final = 3
 MINIMUM_WEBHOOK_TOKEN_LENGTH: Final = 6
 MINIMUM_COMPARED_PLANS: Final = 2
 MINIMUM_KEY_DISTINCT_BYTES: Final = 16
@@ -287,32 +286,23 @@ def parse_fingerprint_key(encoded: str) -> bytes:
 
 
 def portal_identity(webhook_url: str, *, role: str, fingerprint_key: str) -> PortalIdentity:
-    """Validate a webhook and derive a non-reversible host/role/principal fingerprint."""
+    """Validate a webhook URL and derive a non-reversible host/role/principal fingerprint."""
+    # The library's own parse, so the identity names the host and principal requests actually go to.
+    webhook = parse_webhook(webhook_url)
+    if isinstance(webhook, WebhookRefusal):
+        raise ContractError(f"live webhook is refused: {webhook.value}")
+    return webhook_identity(webhook, role=role, fingerprint_key=fingerprint_key)
+
+
+def webhook_identity(webhook: Webhook, *, role: str, fingerprint_key: str) -> PortalIdentity:
+    """Derive the fingerprint of an already parsed webhook, which the live harness must address."""
     key = parse_fingerprint_key(fingerprint_key)
-    try:
-        parts = urlsplit(webhook_url)
-        port = parts.port
-    except ValueError as error:
-        raise ContractError("live webhook has an invalid port") from error
-    path_parts = [part for part in parts.path.split("/") if part]
-    if (
-        parts.scheme != "https"
-        or parts.hostname is None
-        or parts.username is not None
-        or parts.password is not None
-        or port not in {None, 443}
-        or len(path_parts) != WEBHOOK_PATH_PARTS
-        or path_parts[0] != "rest"
-    ):
-        raise ContractError("live webhook must be an HTTPS /rest/<principal>/<token>/ URL")
-    principal_id = path_parts[1]
-    token = path_parts[2]
-    if not principal_id.isdigit() or len(token) < MINIMUM_WEBHOOK_TOKEN_LENGTH or parts.query or parts.fragment:
+    address = webhook.address
+    if address.scheme != "https" or address.port is not None:
+        raise ContractError("live webhook must be an HTTPS /rest/<principal>/<token>/ URL on the default port")
+    if len(webhook.token) < MINIMUM_WEBHOOK_TOKEN_LENGTH:
         raise ContractError("live webhook has an invalid principal or token shape")
-    try:
-        host = parts.hostname.encode("idna").decode("ascii").lower()
-    except UnicodeError as error:
-        raise ContractError("live webhook host is not valid IDNA") from error
+    host, principal_id = address.host, address.user
     if not _DNS_HOST_RE.fullmatch(host):
         raise ContractError("live webhook host is not a valid DNS name")
     message = canonical_json([host, role, principal_id])

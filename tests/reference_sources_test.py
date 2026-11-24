@@ -45,7 +45,18 @@ from b24api.contracts import (
 from b24api.contracts.request import RouteKind
 from b24api.errors import BudgetExceededError, CapabilityError, InputSourceError, ReferenceFailed
 from b24api.transport import TransportCapabilities, WireResponse
-from tests.scripting import BatchPortal, Envelope, Query
+from tests.scripting import (
+    DEADLINE_BUDGET,
+    HANG_BOUND,
+    UNREACHABLE_COALESCE_WAIT,
+    BatchPortal,
+    Envelope,
+    Query,
+    VirtualClock,
+    assert_fired_near_deadline,
+    deadline_started,
+    on_loop,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -80,8 +91,9 @@ def _answer(method: str, query: Query) -> Envelope:
         before = query.get("BEFORE")
         return {"result": [{"ID": value} for value in ALPHA_PAGES[None if before is None else int(before)]]}
     if method == "beta.list":
-        # The same identity 4 as alpha's first row: sources never share identity state.
-        return {"result": [{"ID": 4}] if int(query.get("start", "0")) == 0 else []}
+        # The same identity 4 as alpha's first row: sources never share identity state. The first page names a
+        # second one, which is empty and names none: two pages per binding.
+        return {"result": [{"ID": 4}], "next": 1} if int(query.get("start", "0")) == 0 else {"result": []}
     if method == "gamma.list":
         offset = int(query.get("start", "0"))
         rows = [{"ID": row} for row in range(offset, min(offset + 50, 1001))]
@@ -121,6 +133,10 @@ async def _collect(
     return events, _report(stream)
 
 
+async def _drain(stream: OperationStream[ReferenceOutcome[int]]) -> list[ReferenceOutcome[int]]:
+    return [event async for event in stream]
+
+
 def _rows(events: list[ReferenceOutcome[int]], index: int) -> list[object]:
     return [
         event.item["ID"] if isinstance(event.item, dict) else None
@@ -135,15 +151,15 @@ def _rows(events: list[ReferenceOutcome[int]], index: int) -> list[object]:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("order", [DeliveryOrder.READY, DeliveryOrder.INPUT])
 async def test_a28_different_templates_share_the_dispatcher_and_keep_separate_state(order: DeliveryOrder) -> None:
-    # An async source is read on the event loop; a list is pulled in a worker thread, whose timing
-    # would decide whether the second source's head reaches the first wave.
-    async def sources() -> AsyncIterator[ReferenceSource[int]]:
-        yield _alpha()
-        yield _beta()
-
     portal = BatchPortal(_answer)
     async with _client(portal) as api:
-        events, report = await _collect(api, sources(), dispatch=BatchDispatch(output_order=order))
+        # On the event loop: a worker-thread pull's timing would decide whether the second source's
+        # head reaches the first wave.
+        events, report = await _collect(
+            api,
+            on_loop((_alpha(), _beta())),
+            dispatch=BatchDispatch(output_order=order, coalesce_wait=UNREACHABLE_COALESCE_WAIT),
+        )
 
     if order is DeliveryOrder.READY:
         # Pages of both methods coalesce into shared physical batches. Under INPUT, as on the homogeneous
@@ -178,20 +194,38 @@ async def test_a28_fail_fast_facade_yields_reference_events() -> None:
 
 # --- A28-LATE -----------------------------------------------------------------------------------
 
+_ACTIVATION_TURNS = 200
+
 
 @pytest.mark.asyncio
 async def test_a28_late_sources_activate_before_the_counted_source_finishes() -> None:
-    async def slow(method: str, query: Query) -> Envelope:
-        await asyncio.sleep(0.002)
+    # Ordered by events, not by wall time: the late sources arrive once the counted head is
+    # answered and the first tail batch is in flight, and that batch is held until they have queued
+    # their first pages behind it. Their next pages then leave with tail pages the counted source
+    # still has to send, so a batch carries both sources while the counted one is unfinished.
+    tail_started = asyncio.Event()
+    late_yielded = asyncio.Event()
+
+    async def answer(method: str, query: Query) -> Envelope:
+        tail = method == "gamma.list" and query.get("start", "0") != "0"
+        if tail and not tail_started.is_set():
+            tail_started.set()
+            async with asyncio.timeout(HANG_BOUND):
+                await late_yielded.wait()
+            # Activating a source is in-loop work only, so loop turns, not time, bound it.
+            for _turn in range(_ACTIVATION_TURNS):
+                await asyncio.sleep(0)
         return _answer(method, query)
 
     async def sources() -> AsyncIterator[ReferenceSource[int]]:
         yield _gamma()
-        await asyncio.sleep(0.03)
+        async with asyncio.timeout(HANG_BOUND):
+            await tail_started.wait()
         for parent in (2, 3, 4):
             yield _beta(parent)
+        late_yielded.set()
 
-    portal = BatchPortal(slow)
+    portal = BatchPortal(answer)
     async with _client(portal) as api:
         events, report = await _collect(api, sources(), dispatch=BatchDispatch(batch_size=10))
 
@@ -205,6 +239,243 @@ async def test_a28_late_sources_activate_before_the_counted_source_finishes() ->
     terminal_order = [event.binding_index for event in events if isinstance(event, ReferenceComplete)]
     assert terminal_order[-1] == 0
     assert report.state is TerminalState.COMPLETED
+
+
+@pytest.mark.parametrize("turns", [3, 64, 1000])
+@pytest.mark.asyncio
+async def test_a28_late_pages_wait_for_a_counted_tail_on_its_way_to_the_queue(
+    monkeypatch: pytest.MonkeyPatch, turns: int
+) -> None:
+    """Late pages queued while the counted head is answered leave with the tail its answer starts.
+
+    The counted source stops being runnable as soon as its tail window is full, one or two loop turns
+    before those tail pages reach the queue; while they are on the way they still count as potential.
+    """
+    VirtualClock(turns).install(monkeypatch)
+    head_sent = asyncio.Event()
+    late_yielded = asyncio.Event()
+
+    async def answer(method: str, query: Query) -> Envelope:
+        if method == "gamma.list" and not head_sent.is_set():
+            head_sent.set()
+            async with asyncio.timeout(HANG_BOUND):
+                await late_yielded.wait()
+            for _turn in range(_ACTIVATION_TURNS):
+                await asyncio.sleep(0)
+        return _answer(method, query)
+
+    async def sources() -> AsyncIterator[ReferenceSource[int]]:
+        yield _gamma()
+        async with asyncio.timeout(HANG_BOUND):
+            await head_sent.wait()
+        for parent in (2, 3, 4):
+            yield _beta(parent)
+        late_yielded.set()
+
+    portal = BatchPortal(answer)
+    async with _client(portal) as api:
+        _events, report = await _collect(api, sources(), dispatch=BatchDispatch(batch_size=10))
+
+    assert report.state is TerminalState.COMPLETED
+    # The head travels alone; the late first pages then leave with the first tail pages, not before them.
+    assert portal.methods[0] == ("gamma.list",)
+    assert sorted(set(portal.methods[1])) == ["beta.list", "gamma.list"], portal.methods
+    assert portal.methods[1].count("beta.list") == 3  # noqa: PLR2004
+
+
+@pytest.mark.asyncio
+async def test_a28_a_binding_just_pulled_from_the_source_keeps_its_wave_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A binding counts as potential from the moment it leaves the source, not only once its task first runs.
+
+    With every activation slot taken, the producer waits for one right after the last pull: the binding
+    is no pending pull any more, and its task has not run yet. The first wave still carries every binding.
+    """
+    clock = VirtualClock().install(monkeypatch)
+    portal = BatchPortal(_answer)
+    async with _client(portal) as api:
+        _events, report = await _collect(
+            api,
+            on_loop([_beta(parent) for parent in (1, 2, 3)]),
+            dispatch=BatchDispatch(batch_size=3),
+            policy=ExecutionPolicy(max_active_references=3),
+        )
+
+    assert report.state is TerminalState.COMPLETED
+    assert portal.waves == [3, 3]
+    assert clock.timer_firings == 0
+
+
+@pytest.mark.asyncio
+async def test_a28_a_binding_refused_at_its_pull_never_holds_a_wave_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A local non-execution is never a producer: the waves of its neighbours leave without waiting for it."""
+    clock = VirtualClock().install(monkeypatch)
+    portal = BatchPortal(_answer)
+    refused = ReferenceSource(
+        Request.bare("beta.list", {}, ReplaySafety.SAFE), BETA, Binding("seeded", (), 5, start_cursor=3)
+    )
+    async with _client(portal) as api:
+        events, report = await _collect(
+            api,
+            on_loop([_beta(1), refused, _beta(3)]),
+            dispatch=BatchDispatch(batch_size=3),
+            policy=ExecutionPolicy(max_active_references=3),
+        )
+
+    assert [event.binding_index for event in events if isinstance(event, ReferenceNotExecuted)] == [1]
+    assert report.state is TerminalState.COMPLETED_WITH_FAILURES
+    assert portal.waves == [2, 2]
+    assert clock.timer_firings == 0
+
+
+# The counted fixture's tail is 20 pages: one window of 10, then 10 pages its consumer frees one by one.
+_TAIL_WAVES = {
+    (DeliveryOrder.READY, 1): [1, 10, 10],
+    (DeliveryOrder.INPUT, 1): [1, 10, 10],
+    (DeliveryOrder.READY, 3): [3, 10, 10, 10, 10, 10, 10],
+    # Under INPUT the bindings behind the frontier read ahead, so the heads leave together, and the
+    # tails share full batches as under READY.
+    (DeliveryOrder.INPUT, 3): [3, 10, 10, 10, 10, 10, 10],
+}
+
+
+@pytest.mark.parametrize(("order", "sources"), list(_TAIL_WAVES))
+@pytest.mark.asyncio
+async def test_a28_a_draining_consumer_refills_the_counted_tail_in_full_batches(
+    monkeypatch: pytest.MonkeyPatch, order: DeliveryOrder, sources: int
+) -> None:
+    """Pages freed one per consumed receipt coalesce instead of leaving one per batch.
+
+    The tail's next page waits only for its consumer to move past a receipt it holds, so the
+    dispatcher waits for it, as for an ordinary binding awaiting its consumer, with no timer firing.
+    """
+    clock = VirtualClock().install(monkeypatch)
+    portal = BatchPortal(_answer)
+    async with _client(portal) as api:
+        events, report = await _collect(
+            api,
+            on_loop([_gamma(parent) for parent in range(1, sources + 1)]),
+            dispatch=BatchDispatch(batch_size=10, output_order=order),
+        )
+
+    assert report.state is TerminalState.COMPLETED
+    assert all(_rows(events, index) == list(range(1001)) for index in range(sources))
+    assert [len(wave) for wave in portal.methods] == _TAIL_WAVES[order, sources]
+    assert clock.timer_firings == 0
+
+
+_DELTA_ROWS = 120
+_DELTA_PAGE = 2
+_DELTA_REFUSED_PAGE = 10
+
+
+def _delta(_method: str, query: Query) -> Envelope:
+    """Answer 120 rows per parent in pages of 2; parent 1 is refused its tenth tail page."""
+    parent, offset = int(query["PARENT"]), int(query.get("start", "0"))
+    if parent == 1 and offset == _DELTA_REFUSED_PAGE * _DELTA_PAGE:
+        return {"error": "ACCESS_DENIED", "error_description": "denied"}
+    envelope: Envelope = {
+        "result": [{"ID": row} for row in range(offset, min(offset + _DELTA_PAGE, _DELTA_ROWS))],
+        "total": _DELTA_ROWS,
+    }
+    if offset + _DELTA_PAGE < _DELTA_ROWS:
+        envelope["next"] = offset + _DELTA_PAGE
+    return envelope
+
+
+@pytest.mark.asyncio
+async def test_a28_a_wave_still_leaves_with_the_pages_a_failed_binding_abandoned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A binding refused mid-tail abandons its queued pages while their wave coalesces with other bindings' pages.
+
+    The wave still leaves, without the abandoned pages' ended deadlines, and every other binding completes.
+    """
+    VirtualClock().install(monkeypatch)
+    portal = BatchPortal(_delta)
+    async with _client(portal) as api:
+        stream = api.iter_reference_outcomes(
+            Request.bare("delta.list", {}, ReplaySafety.SAFE),
+            on_loop([_binding(parent) for parent in (1, 2, 3)]),
+            traversal=CountedTraversal(page_size=_DELTA_PAGE),
+            dispatch=BatchDispatch(concurrency=3),
+        )
+        async with stream:
+            # A stranded wave would hang the stream; the bound only turns that into a failure.
+            events = await asyncio.wait_for(_drain(stream), timeout=HANG_BOUND)
+
+    terminals = {event.binding_index: type(event) for event in events if not isinstance(event, ReferenceItem)}
+    assert terminals == {0: ReferenceFailure, 1: ReferenceComplete, 2: ReferenceComplete}
+    assert _rows(events, 1) == _rows(events, 2) == list(range(_DELTA_ROWS))
+
+
+@pytest.mark.parametrize("order", [DeliveryOrder.READY, DeliveryOrder.INPUT])
+@pytest.mark.asyncio
+async def test_a28_a_tail_window_filling_the_row_pool_refills_from_the_rows_its_consumer_returns(
+    monkeypatch: pytest.MonkeyPatch, order: DeliveryOrder
+) -> None:
+    """A window that holds the whole pool frees no rows until the consumer moves on; its refill still coalesces."""
+    clock = VirtualClock().install(monkeypatch)
+    portal = BatchPortal(_answer)
+    async with _client(portal) as api:
+        events, report = await _collect(
+            api,
+            on_loop([_gamma()]),
+            dispatch=BatchDispatch(batch_size=50, output_order=order),
+            policy=ExecutionPolicy(max_buffered_rows=500),
+        )
+
+    assert report.state is TerminalState.COMPLETED
+    assert _rows(events, 0) == list(range(1001))
+    assert [len(wave) for wave in portal.methods] == [1, 10, 10]
+    assert clock.timer_firings == 0
+
+
+@pytest.mark.parametrize("order", [DeliveryOrder.READY, DeliveryOrder.INPUT])
+@pytest.mark.asyncio
+async def test_a28_a_tail_whose_consumer_waits_for_the_chunk_is_not_waited_for(
+    monkeypatch: pytest.MonkeyPatch, order: DeliveryOrder
+) -> None:
+    """A two-page window filling the row pool: refills pair up, and no chunk waits out its deadline.
+
+    While both window pages wait in a chunk, the consumer waits for them and frees no slot, so that
+    chunk leaves at once; each later refill reserves the rows its held receipt returns. With a single
+    binding the row gate alone already keeps the first case from waiting, so this pins the outcome.
+    """
+    clock = VirtualClock().install(monkeypatch)
+    portal = BatchPortal(_answer)
+    async with _client(portal) as api:
+        events, report = await _collect(
+            api,
+            on_loop([_gamma()]),
+            dispatch=BatchDispatch(batch_size=10, output_order=order),
+            policy=ExecutionPolicy(max_buffered_rows=100),
+        )
+
+    assert report.state is TerminalState.COMPLETED
+    assert _rows(events, 0) == list(range(1001))
+    assert [len(wave) for wave in portal.methods] == [1] + [2] * 10
+    assert clock.timer_firings == 0
+
+
+@pytest.mark.asyncio
+async def test_a28_a_slow_tail_consumer_bounds_each_refill_wait_by_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A consumer slower than the coalescing deadline costs at most one deadline per batch, never a stall."""
+    clock = VirtualClock(turns=3).install(monkeypatch)
+    portal = BatchPortal(_answer)
+    events: list[ReferenceOutcome[int]] = []
+    async with _client(portal) as api:
+        stream = api.iter_reference_source_outcomes(on_loop([_gamma()]), dispatch=BatchDispatch(batch_size=10))
+        async with stream:
+            async for event in stream:
+                events.append(event)
+                for _turn in range(10):
+                    await asyncio.sleep(0)
+
+    assert _report(stream).state is TerminalState.COMPLETED
+    assert _rows(events, 0) == list(range(1001))
+    assert 0 < clock.timer_firings <= len(portal.methods)
 
 
 # --- A28-MATRIX ---------------------------------------------------------------------------------
@@ -506,11 +777,13 @@ async def test_a28_pending_holds_at_most_one_pull_and_closes_the_source_once_at_
     source = _PendingSource()
     portal = BatchPortal(_answer)
     async with _client(portal) as api:
-        stream = api.iter_reference_source_outcomes(source, policy=ExecutionPolicy(max_elapsed=0.2))
+        budget_started = deadline_started()
+        stream = api.iter_reference_source_outcomes(source, policy=ExecutionPolicy(max_elapsed=DEADLINE_BUDGET))
         events: list[ReferenceOutcome[int]] = []
         with pytest.raises(BudgetExceededError, match="reference input exceeded operation time budget"):
-            async with asyncio.timeout(5), stream:
+            async with asyncio.timeout(HANG_BOUND), stream:
                 events.extend([event async for event in stream])
+        assert_fired_near_deadline(budget_started)
     assert source.max_in_flight == 1
     assert source.closes == 1
     assert _report(stream).state is not TerminalState.COMPLETED
@@ -542,17 +815,23 @@ async def test_ahomo_sources_of_one_template_trace_exactly_like_the_homogeneous_
     method = "alpha.list" if traversal is ALPHA else "seq.list"
     request = Request.bare(method, {}, ReplaySafety.SAFE)
     parents = (1, 2, 3)
+    # Both runs' waves close by size or by the end of input, so the comparison never rides on a timer.
+    dispatch = BatchDispatch(coalesce_wait=UNREACHABLE_COALESCE_WAIT)
 
     homogeneous = BatchPortal(answer)
     async with _client(homogeneous) as api:
-        stream = api.iter_reference_outcomes(request, [_binding(parent) for parent in parents], traversal=traversal)
+        stream = api.iter_reference_outcomes(
+            request, on_loop([_binding(parent) for parent in parents]), traversal=traversal, dispatch=dispatch
+        )
         async with stream:
             expected = [event async for event in stream]
     expected_report = _report(stream)
 
     heterogeneous = BatchPortal(answer)
     async with _client(heterogeneous) as api:
-        events, report = await _collect(api, [ReferenceSource(request, traversal, _binding(p)) for p in parents])
+        events, report = await _collect(
+            api, on_loop([ReferenceSource(request, traversal, _binding(p)) for p in parents]), dispatch=dispatch
+        )
 
     assert events == expected
     assert heterogeneous.waves == homogeneous.waves
@@ -563,3 +842,58 @@ async def test_ahomo_sources_of_one_template_trace_exactly_like_the_homogeneous_
         expected_report.logical_pages,
         expected_report.state,
     )
+
+
+@pytest.mark.usefixtures("coalescing")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["references", "sources"])
+@pytest.mark.parametrize(
+    ("dispatch", "policy", "measured", "bound"),
+    [
+        (BatchDispatch(batch_size=50, concurrency=4), ExecutionPolicy(max_buffered_commands=5), "batch", 5),
+        (DirectDispatch(concurrency=8), ExecutionPolicy(max_direct_concurrency=2), "in_flight", 2),
+    ],
+    ids=["max_buffered_commands", "max_direct_concurrency"],
+)
+async def test_the_operation_policy_bounds_every_reference_operation_s_dispatch(
+    api: str,
+    dispatch: BatchDispatch | DirectDispatch,
+    policy: ExecutionPolicy,
+    measured: str,
+    bound: int,
+) -> None:
+    # The dispatch asks for more than the policy allows: a batch holds at most max_buffered_commands, and direct
+    # pages in flight are at most max_direct_concurrency, whichever API built the operation. The bindings arrive on
+    # the loop and a wave coalesces by loop turns (``VirtualClock``), so the dispatch reaches the bound by
+    # construction, on any machine: the policy, not a slow source, is what holds it there.
+    in_flight, peak = 0, 0
+
+    async def answer(_method: str, query: Query) -> Envelope:
+        # A direct page is one request: count the pages answered at once, each held long enough, in loop turns,
+        # for every page the dispatch would allow to be sent meanwhile (8 without the policy's bound).
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        for _turn in range(50):
+            await asyncio.sleep(0)
+        in_flight -= 1
+        return {"result": [{"ID": 1}] if query.get("start", "0") == "0" else []}
+
+    portal = BatchPortal(answer)
+    request = Request.bare("beta.list", {}, ReplaySafety.SAFE)
+    bindings = [
+        Binding("parent", (ParameterUpdate(ParameterPath(("PARENT",)), parent),), parent) for parent in range(40)
+    ]
+    client = Bitrix24(Settings(webhook_url="https://fixture.invalid/rest/1/token/"), transport=portal, policy=policy)
+    async with client:
+        stream = (
+            client.iter_reference_outcomes(request, on_loop(bindings), traversal=BETA, dispatch=dispatch)
+            if api == "references"
+            else client.iter_reference_source_outcomes(
+                on_loop([ReferenceSource(request, BETA, binding) for binding in bindings]), dispatch=dispatch
+            )
+        )
+        outcomes = [outcome async for outcome in stream]
+
+    assert len(outcomes) == len(bindings) * 2
+    assert (max(portal.waves) if measured == "batch" else peak) == bound

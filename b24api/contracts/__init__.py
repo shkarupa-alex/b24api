@@ -155,7 +155,7 @@ from b24api.contracts.traversal import (
     TraversalSpec,
     traversal_control_paths,
 )
-from b24api.contracts.wire import BodyEncoding, RequestHeaders
+from b24api.contracts.wire import BodyEncoding, RawContent, RequestHeaders
 
 __all__ = [
     "AdaptedPage",
@@ -260,6 +260,7 @@ __all__ = [
     "PositionalLayout",
     "Present",
     "RangeKeysetExecution",
+    "RawContent",
     "RawTotalSource",
     "ReferenceComplete",
     "ReferenceEvent",

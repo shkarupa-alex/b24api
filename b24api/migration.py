@@ -1,7 +1,7 @@
-"""Root import migration for the 3.0 public surface (spec §3.12, C7).
+"""Root import migration for the public surface of 2.4 (spec §3.12, C7).
 
 ``ROOT_MOVES`` is the single source for every name that left the ``b24api`` root: it maps the name to
-the public aggregator that exports the same object. The old root paths no longer resolve in 3.0; the
+the public aggregator that exports the same object. The old root paths no longer resolve since 2.4; the
 migration guide's table is generated from this map.
 
 Run ``python -m b24api.migration PATH...`` to list old root imports in files or directories.

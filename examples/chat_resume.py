@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from b24api import (
     Binding,
@@ -36,6 +37,9 @@ from b24api.contracts import CallerStop, ContinuePage, CursorDomain, DeliveryOrd
 from b24api.testing import ScriptedExchange, ScriptedTransport
 from examples._support.evidence import RecipeEvidence
 from examples._support.sqlite_sink import SqliteMirror
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 METHOD = "im.dialog.messages.get"
 EXPECTED = {"A": (105, 104, 103, 102, 101), "B": (115, 114, 113)}
@@ -74,16 +78,16 @@ def _transport(pages: tuple[tuple[str, int | None, tuple[int, ...]], ...]) -> Sc
     )
 
 
-def _bindings(sink: SqliteMirror) -> tuple[Binding[str], ...]:
-    return tuple(
-        Binding(
+async def _bindings(sink: SqliteMirror) -> AsyncIterator[Binding[str]]:
+    # An asynchronous source is read on the event loop. A synchronous one is read in a worker thread, so whether
+    # B's first page is sent before the reader closes would race that thread, and the first run's sends with it.
+    for parent in EXPECTED:
+        yield Binding(
             parent,
             (ParameterUpdate(ParameterPath(("DIALOG_ID",)), parent),),
             parent,
             start_cursor=sink.checkpoint(parent),
         )
-        for parent in EXPECTED
-    )
 
 
 class _Commit:
@@ -147,7 +151,8 @@ async def pause_and_resume(
     with tempfile.TemporaryDirectory(prefix="b24api-example-") as temporary:
         sink = SqliteMirror(Path(temporary) / "mirror.sqlite3")
         try:
-            first = _transport((("A", None, (105, 104)),))
+            # The single dispatch slot sends B's first page once A stops; the reader closes before it is delivered.
+            first = _transport((("A", None, (105, 104)), ("B", None, (115, 114))))
             first_report = await _run_once(sink, first, pause_a=True)
             if (
                 first_report.state is not TerminalState.EARLY_CLOSED

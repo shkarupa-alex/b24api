@@ -53,10 +53,10 @@ from b24api.contracts import (
 from b24api.errors import BudgetExceededError
 from b24api.execution.context import ExecutionContext
 from b24api.references.dispatch import _RowBuffer
-from tests.scripting import BatchPortal, client_for
+from tests.scripting import BatchPortal, VirtualClock, client_for, on_loop
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable
+    from collections.abc import Callable
 
     from b24api.contracts import ReferenceOutcome, TraversalSpec
     from tests.scripting import Envelope, Query
@@ -159,6 +159,8 @@ _TRAVERSALS: dict[str, tuple[str, Callable[[], TraversalSpec]]] = {
     "cursor": ("cursor.list", _cursor),
     "sequential_keyset": ("keyset.list", lambda: _keyset(SequentialKeysetExecution())),
     "range": ("keyset.list", lambda: _keyset(RangeKeysetExecution(_CONTRACT))),
+    # Windows a page of identity values wide, whatever the density: sparse rows take a window each.
+    "narrow-range": ("keyset.list", lambda: _keyset(RangeKeysetExecution(_CONTRACT, window_width=10))),
     "partitioned": ("keyset.list", lambda: _keyset(PartitionedKeysetExecution(_CONTRACT, target_lanes=4))),
     "auto": ("keyset.list", lambda: _keyset(AutoKeysetExecution(_CONTRACT, target_lanes=4))),
 }
@@ -300,29 +302,30 @@ async def test_a_short_frontier_page_keeps_its_unused_rows_for_the_frontier() ->
 
 
 @pytest.mark.asyncio
-async def test_a_binding_waiting_for_its_lease_never_holds_a_wave_back_to_coalesce() -> None:
+async def test_a_binding_waiting_for_its_lease_never_holds_a_wave_back_to_coalesce(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A fast binding parked until a lease frees cannot add a command, so waves do not wait for it.
 
     The first range binding holds the pool's only floor-sized lease and runs hundreds of
-    one-command waves; with a one-second coalescing window, waiting on the parked neighbour would
-    take minutes instead of milliseconds.
+    one-command waves over narrow windows. On a virtual clock every wave whose wait its deadline ended is counted, so a
+    wave held back for the parked neighbour fails the test however fast the host runs; the sources
+    come on the event loop, whose turns are the clock's only pace.
     """
-    sources = [_Source("range", "p0", tuple(range(123, 123 + 113 * 50, 113))), _Source("range", "p1", ())]
+    clock = VirtualClock().install(monkeypatch)
+    sources = [_Source("narrow-range", "p0", tuple(range(123, 123 + 113 * 50, 113))), _Source("range", "p1", ())]
     portal = BatchPortal(_portal(sources))
     async with client_for(portal, policy=ExecutionPolicy(max_buffered_rows=40)) as client:
         stream = client.iter_reference_source_outcomes(
-            [_reference(source) for source in sources],
-            dispatch=BatchDispatch(batch_size=25, coalesce_wait=1.0),
+            on_loop([_reference(source) for source in sources]),
+            dispatch=BatchDispatch(batch_size=25),
         )
-
-        async def drain() -> list[ReferenceOutcome[str]]:
-            async with stream:
-                return [event async for event in stream]
-
-        events = await asyncio.wait_for(drain(), timeout=10)
+        async with stream:
+            events = [event async for event in stream]
     completes = {event.correlation: event.row_count for event in events if isinstance(event, ReferenceComplete)}
     assert completes == {"p0": 50, "p1": 0}
     assert len(portal.waves) > 100
+    assert clock.timer_firings == 0
 
 
 @pytest.mark.parametrize("frontier", ["offset", "cursor"])
@@ -372,31 +375,31 @@ async def test_a_contended_input_frontier_sends_its_own_pages_before_a_later_hea
 
     With 20 buffered rows the frontier's short pages give rows back. The 2.5.2 scheduler let the
     third binding's head take them, sending ``p0@0, p1@0, p2@0, p0@10, p0@20, p0@25, ...``; the
-    frontier reserve now keeps them for the frontier, so ``p2@0`` follows ``p0``'s pages. Events and
-    the report are unchanged; only this physical send order differs.
+    frontier reserve then kept them for the frontier, so ``p2@0`` followed ``p0``'s pages. A binding
+    now reads its pages ahead instead of waiting for the consumer to leave each, so the frontier's
+    pages fill the pool before ``p1@0`` reserves. Events and the report are unchanged; only this
+    physical send order differs.
 
     The bindings come from an async iterable, read on the event loop: a list is pulled in a worker
     thread, so when a later head reaches the queue would depend on thread scheduling.
     """
-
-    async def bindings() -> AsyncIterator[Binding[str]]:
-        for parent in ("p0", "p1", "p2", "p3"):
-            yield Binding(parent, (ParameterUpdate(_PARENT, parent),), parent)
-
     portal = BatchPortal(_offset_answer)
     async with client_for(portal, policy=ExecutionPolicy(max_buffered_rows=20)) as client:
         stream = client.iter_reference_outcomes(
             Request.bare("offset.list", {}, ReplaySafety.SAFE),
-            bindings(),
+            on_loop(
+                Binding(parent, (ParameterUpdate(_PARENT, parent),), parent) for parent in ("p0", "p1", "p2", "p3")
+            ),
             traversal=SequentialTraversal(identity=_identity(), page_size=PAGE),
             dispatch=BatchDispatch(batch_size=2, output_order=DeliveryOrder.INPUT, coalesce_wait=0.0),
         )
         async with stream:
             events = [event async for event in stream]
     sent = [(query["PARENT"], query.get("start", "0")) for query in portal.queries]
+    # Each binding ends at its page without ``next``: nothing is requested past its last rows.
     assert sent == [
-        ("p0", "0"), ("p1", "0"), ("p0", "10"), ("p0", "20"), ("p0", "25"), ("p2", "0"), ("p3", "0"),
-        ("p1", "3"), ("p3", "10"), ("p3", "20"), ("p3", "30"), ("p3", "40"), ("p3", "41"),
+        ("p0", "0"), ("p0", "10"), ("p0", "20"), ("p1", "0"), ("p2", "0"),
+        ("p3", "0"), ("p3", "10"), ("p3", "20"), ("p3", "30"), ("p3", "40"),
     ]  # fmt: skip
     completes = {event.correlation: event.row_count for event in events if isinstance(event, ReferenceComplete)}
     assert completes == {"p0": 25, "p1": 3, "p2": 0, "p3": 41}

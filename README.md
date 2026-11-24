@@ -12,8 +12,72 @@ uv sync --frozen
 export BITRIX24_API_WEBHOOK_URL='https://portal.example/rest/.../'
 ```
 
-Keep the webhook out of source, logs and command arguments. Reuse one client for a related unit of
-work so its HTTP/2 connection pool and rate state are reused.
+Keep the webhook out of source, logs and command arguments. Reuse one client for a related unit of work
+so its HTTP/2 connection pool and rate state are reused. The URL has the form
+`https://<portal>/rest/<user>/<token>/`, with a numeric user and a token of letters, digits, `_` and
+`-`. `http` is accepted. Letter case is normalized only in the scheme and host, which are lowered: the
+path keeps its case, so the token is sent as written and `/REST/` is refused. A default port is dropped
+and any other kept, `.` and `..` segments are resolved, a missing trailing slash is added, and leading
+and trailing control characters U+0000–U+001F and spaces are dropped. A host of non-ASCII letters
+is IDNA-encoded, an empty userinfo (`https://@portal/...`, `https://:@portal/...`) is dropped, and a
+host with a trailing dot is accepted as written; see
+[the webhook URL rule](https://github.com/shkarupa-alex/b24api/blob/master/docs/migration.md#transport-hygiene-webhook-urls-unsendable-requests-error-chains)
+for all of it. Any other form is refused, one with a user name or password, a query, a fragment, a
+percent-encoded path, or a surrounding DEL (U+007F) or non-ASCII space (a no-break space, for example)
+included, since the token is its only credential and is registered for redaction as it is sent.
+
+`Settings` reads only the process environment. It never reads a `.env` file, so a library call
+cannot pick up a credential from whatever directory the process runs in; the `b24api` CLI is the only
+reader of `.env` (see [CLI](#cli)). `Settings` cannot be pickled, because it holds the webhook
+credential: build it in each process from the environment.
+
+`Settings` reads two limits as well. `BITRIX24_API_HTTP_TIMEOUT` bounds each attempt of the client's own
+HTTPX transport in seconds (30 by default, finite): connecting, TLS included, waiting for a pooled
+connection, writing the request and each read of the answer; a transport you inject keeps its own
+timeouts. `BITRIX24_API_MAX_CONCURRENT_REQUESTS` is how many requests one client
+keeps in flight at once, all its calls, streams and retries together (10 by default). An operation's own
+limits only narrow it, and which of them apply depends on the dispatch. A `DirectDispatch` sends at most
+the smallest of its `concurrency`, `ExecutionPolicy.max_direct_concurrency`,
+`ExecutionPolicy.max_active_references` and the client limit at once, so
+`DirectDispatch(concurrency=40)` alone still runs 10 requests at a time. A `BatchDispatch` bounds
+physical batches, not requests: it keeps at most the smallest of its `concurrency`,
+`max_active_references` and the client limit in flight, and `max_direct_concurrency` does not limit it.
+When a REST 3.0 envelope of `SAFE` commands may have run without an answer, its unresolved commands are
+sent again alone, one at a time, within the slot of that envelope's batch. `fan_out()` and
+`fan_out_outcomes()` divide `max_buffered_rows` among the results they may have in flight at once: the
+requests of a `DirectDispatch`, or `batch_size` commands per physical batch of a `BatchDispatch`, at most
+`max_active_references`. That share is what a command reserves before it is sent. A longer result takes
+the rest from the free rows, first in line for the rows that come back, while the commands already reserved
+or the consumer may still free all it lacks; a result longer than the budget, or one whose missing rows are
+held by other results waiting to grow, ends with `ResultTooLargeError` (see Resource boundaries). A `BatchDispatch`
+share never drops below a full 50-row portal page while
+the budget holds one per command of a batch: fewer commands are counted, and the row budget holds back
+the commands beyond them, which coalesce into fewer, fuller batches: a batch whose commands fit only
+once a batch in flight lands waits for it (`coalesce_wait=0` sends it at once, in more requests). Of the
+default 2,500 rows that gives:
+
+| Dispatch | Share (rows) | In flight at once |
+| --- | --- | --- |
+| `DirectDispatch()` | 250 | 10 requests |
+| `BatchDispatch()` | 50 | 1 batch of 50 |
+| `BatchDispatch(batch_size=1, concurrency=8)` | 312 | 8 batches of 1 |
+| `BatchDispatch(batch_size=5, concurrency=4)` | 125 | 4 batches of 5 |
+| `BatchDispatch(concurrency=2)` | 50 | 1 batch of 50 |
+| `BatchDispatch(batch_size=20, concurrency=4)` | 50 | 2 batches of 20 |
+
+Raise `max_buffered_rows` or narrow the dispatch for longer results. Raise the client limit only as far
+as the portal's rate limits allow. `Bitrix24.from_webhook()` takes both limits
+as arguments:
+
+<!-- tested: tests/settings_test.py::test_effective_concurrency_is_the_smallest_of_the_client_and_operation_limits -->
+```python
+import os
+
+from b24api import Bitrix24, Request
+
+async with Bitrix24.from_webhook(os.environ["BITRIX24_API_WEBHOOK_URL"], max_concurrent_requests=20) as client:
+    users = await client.call(Request.bare("user.get", {"ID": 1}))
+```
 
 ## Quickstart
 
@@ -36,8 +100,8 @@ Four things are at work:
   `async with` closes it. `Bitrix24()` reads the same URL from the environment.
 - **The request.** `Request.bare()` names a REST method and its parameters and sends them to the
   classic `/rest/` endpoint. The route is always explicit: `Request.v3()` targets the V3 API.
-- **`iter_list()`.** It walks the list page by page and reads one more, empty, page to confirm
-  the end.
+- **`iter_list()`.** It walks the list page by page, following the server's `next`, and stops at
+  the page that has none.
 - **The report.** `deals.report` says how the traversal ended. `completed` means every page was
   read; a traversal that stops early or fails records why.
 
@@ -49,8 +113,14 @@ users = await client.call(Request.bare("user.get", {"ID": 1}))
 ```
 
 The client owns the transport it creates. An injected transport remains caller-owned. `aclose()` is
-idempotent and closes active streams before the owned transport. To prove that no row is missing or
-repeated, give the traversal an identity (see [Choosing a list operation](#choosing-a-list-operation)).
+idempotent and closes active streams before the owned transport. A closed client raises
+`ClientClosedError` (from `b24api.errors`) for every call awaited and every stream created after
+`aclose()` (the method that creates the stream raises it), and for the calls still waiting for a permit
+when it closed. It is a `TransportError` of phase `not_dispatched`, so the attempt it stopped was not
+sent, and it is never retried. It is a `RuntimeError` as well. The phase covers only that attempt: a
+`SAFE` request that waited for the permit of a retry may already have run on an earlier attempt. To
+prove that no row is missing or repeated, give the traversal an identity (see
+[Choosing a list operation](#choosing-a-list-operation)).
 
 ## Direct calls
 
@@ -72,6 +142,34 @@ over `filename`), or `None`; `archive.evidence.filename_status` records whether 
 absent, parsed or malformed. The name is caller-facing metadata, not a safe path: it is never
 normalized, truncated or reduced to a basename, and it stays out of the representation and
 diagnostics. Sanitize it before using it on a filesystem.
+
+A few actions refuse a POST or read a raw body instead of parameters. `BodyEncoding.QUERY_STRING` sends a
+request's parameters in the URL's query, in the PHP encoding of form bodies. Without `content` it is a GET:
+`crm.site.fileuploader.preview`, `crm.site.fileuploader.download`, `call.Track.download` and
+`crm.timeline.ai.mergefields` accept nothing else. With `content=RawContent(data, content_type)` it is a
+POST of those bytes as they are, under the declared content type, as `crm.site.fileuploader.upload` reads a
+chunk. The query is part of the URL, which the portal's web server and any proxy may log: send nothing
+secret in it. The client's own HTTPX log records keep the path and drop the query.
+
+<!-- tested: tests/query_string_request_test.py::test_raw_content_is_posted_byte_for_byte_with_its_type_and_the_parameters_in_the_query -->
+```python
+from b24api import ReplaySafety, Request
+from b24api.contracts import BodyEncoding, RawContent, RequestHeaders
+
+preview = await client.call_bytes(
+    Request.bare("crm.site.fileuploader.preview", {"fileId": 7}, ReplaySafety.SAFE, encoding=BodyEncoding.QUERY_STRING)
+)
+chunk = b"the first bytes of the file"
+uploaded = await client.call(
+    Request.bare(
+        "crm.site.fileuploader.upload",
+        replay_safety=ReplaySafety.UNSAFE,
+        encoding=BodyEncoding.QUERY_STRING,
+        headers=RequestHeaders({"X-Upload-Content-Name": "chunk.bin"}),
+        content=RawContent(chunk, "application/octet-stream"),
+    )
+)
+```
 
 <!-- tested: tests/client_v2_test.py::test_call_and_call_response_have_stable_detached_types -->
 ```python
@@ -95,10 +193,31 @@ may already have reached Bitrix:
 | `UNKNOWN` | The caller has not established whether replay is safe. This is the default. | Same conservative behavior as `UNSAFE`, while diagnostics preserve that safety was unknown rather than known unsafe. |
 
 A failure that proves the request did not run is retried whatever its safety: a transport failure
-before dispatch, or a refusal listed in `AmbiguityPolicy`, which by default is an unstructured 423, 425
-or 429 (`refusal_http_statuses`) or a `QUERY_LIMIT_EXCEEDED` / `OPERATION_TIME_LIMIT` /
+before dispatch, or a refusal listed in `AmbiguityPolicy`, which by default is a 423, 425 or 429 whose
+body is a gateway's page (`refusal_http_statuses`: not JSON, or JSON without a top-level `error` and
+without a repeated top-level member) or a `QUERY_LIMIT_EXCEEDED` / `OPERATION_TIME_LIMIT` /
 REST 3.0 `BITRIX_REST_V3_EXCEPTION_RATELIMITEXCEPTION` refusal (`refusal_api_codes`). A code or
-status added only to `RetryPolicy` is retried for `SAFE` work alone.
+status added only to `RetryPolicy` is retried for `SAFE` work alone. An answer that proves nothing
+leaves `UNSAFE` and `UNKNOWN` work ambiguous, and `call()` raises `AmbiguousExecutionError` with that
+answer's failure as its cause: an ambiguous status (408 or any 5xx by default, `ambiguous_unstructured_statuses`),
+structured or not, unless its code is a listed refusal; a 2xx body that cannot be decoded, has no `result`, or
+contradicts itself (both a `result` and an `error`, or a repeated member name where the answer is decided).
+Any other structured error or status outside 2xx is the request's answer and is raised as it is. A request
+that HTTPX could not build was never sent: it fails at once with a `TransportError` of phase `not_dispatched`,
+never as ambiguous, and is not counted as a physical request. An exception from an injected client's event hook, auth flow, transport or response
+stream may follow dispatch. An HTTPX request error (`httpx.RequestError`, such as a connection or read
+error) follows the same phase rule as one from the network. A builtin `TimeoutError` counts as the
+attempt's deadline passing after possible dispatch: `SAFE` work is retried, `UNSAFE` and `UNKNOWN`
+work raises `AmbiguousExecutionError`. Any other `Exception` is not retried and counts as possibly
+sent, with the same consequence for `UNSAFE` and `UNKNOWN` work; the failure itself is a
+`TransportError` that names the exception's class and any HTTP status the client received
+(`error.http_status`), without the exception, which would carry the webhook URL, on its chain. A
+cancellation is re-raised with the same arguments, without the HTTPX frames it was raised in, and an
+exception that is not an `Exception` (`KeyboardInterrupt`) passes through as it is but without those
+frames, which hold the request, and without its chain (`__cause__` and `__context__` are cleared), which
+may be an HTTPX exception that holds it too. A response the
+transport refuses itself is reported as `ProtocolError` (a status outside 100-599) or
+`ResponseTooLargeError` rather than `TransportError`.
 A physical batch applies these rules to each command: after a failure, only the commands that
 may run again are sent again, in a smaller batch, and an `UNSAFE` command of a batch that may have run
 arrives as unknown. Replay rounds spend the same attempt and retry-time budget as the sends before
@@ -115,11 +234,9 @@ one_attempt = ExecutionPolicy(max_attempts_per_request=1)
 result = await client.call(request, policy=one_attempt)
 ```
 
-A `policy=` argument replaces the client's default policy wholesale; fields are never merged. The
-client default is `ExecutionPolicy.from_settings(settings)`: the library defaults with
-`max_retry_elapsed_per_request` taken from `Settings.http_timeout` (30 s by default, while a bare
-`ExecutionPolicy()` allows 120 s). To change one field and keep the configured timeout, derive the
-per-call policy from that default:
+A `policy=` argument replaces the client's default policy, `ExecutionPolicy()`, wholesale; fields are
+never merged. `Settings` puts nothing in the policy, so a `policy=` keeps the configured attempt timeout
+and concurrency. To change one field of a policy, derive it with `dataclasses.replace`:
 
 <!-- tested: tests/settings_test.py::test_a_per_call_policy_replaces_the_client_default_without_merging -->
 ```python
@@ -127,14 +244,78 @@ import dataclasses
 
 from b24api import ExecutionPolicy
 
-one_attempt = dataclasses.replace(ExecutionPolicy.from_settings(settings), max_attempts_per_request=1)
+one_attempt = dataclasses.replace(ExecutionPolicy(max_requests=500), max_attempts_per_request=1)
 result = await client.call(request, policy=one_attempt)
 ```
 
+`max_retry_elapsed_per_request` (120 s by default) is each request's retry window. It opens when the
+request's first send gets a permit from the client's shared limiter, so waiting in that queue spends
+only the operation's `max_elapsed` (900 s by default; lower it to bound the queue, at the cost of first
+sends that a long queue leaves only a sliver of it, and a known pause that outlasts it fails at once).
+Every send, retry wait and later permit wait then comes out of the window. Each attempt is also bounded
+by its transport's timeout (`Settings.http_timeout` for the client's own transport), so an attempt that
+hangs leaves the rest of the window to its retries; one that times out before anything was sent
+(connecting, the TLS handshake, waiting for a pooled connection) is retried whatever its safety.
+
+The portal's load limits slow down what they limit, for every request of the client. A request-rate
+refusal (`QUERY_LIMIT_EXCEEDED`, the REST 3.0 rate limit, or a 429) holds the whole portal for the
+server's hint (`Retry-After` or `X-Bitrix-RateLimit-Reset`). Without one, it paces the portal: the
+portal limits a webhook by its request rate, so requests that waited out a pause together would be
+refused together again. The client's sends then leave one gap apart, those waiting for a connection
+slot included. The gap starts at the retry backoff's initial delay (0.5 s by default) and grows by its
+factor, up to its maximum delay, with each refusal of a request sent after it last grew. Each answer to
+a request sent after that quickens the pace a step (a 32nd of the initial delay's rate), and past 16
+times that rate the client sends at full speed again; an answer about the load (a 429, a 503 or a
+limit's code) does not. A batch is one request, and its answer is about the load if any of its
+commands' entries carries a limit's code. Only answers quicken it, not time: a client that
+went idle keeps its gap until its next requests are answered. The pace holds every kind of work alike,
+so batches keep their share of the sends it lets through. So 300 reads from 10 tasks or from 300, against a
+limit of 2 requests a second, all succeed in about the time the limit allows, with some 20 sends
+refused. An `OPERATION_TIME_LIMIT` holds its method
+alone: for the hint, else until the method's operating time resets, as its latest answer said
+(`time.operating_reset_at`, of a classic batch command too), else for the backoff. A hint on any
+other answer than a 429, a 503 or a load limit's code holds nothing. A retry waits the longer of its
+own exponential backoff and those holds, so a hint of zero or a past date never cancels the backoff. A
+hint given as a date is measured against the response's `Date`, so a local clock running ahead cannot
+shorten it, unless that `Date` is more than a minute behind the local clock (a stale answer or a server
+clock set back), when the local clock measures it: a dated hint never waits more than a minute longer
+than the local clock says, and never more than an hour.
+
+A retry of an `UNSAFE` or `UNKNOWN` request is sent only while the window it would have left is at
+least as long as it waited (as planned, or longer when the wait overran); a `SAFE` retry is sent with
+whatever window is left. When the hold alone outlasts what the window allows, the request ends with the
+server's refusal, its code and evidence (`ApiResponseError` with `normalized_code`
+`operation_time_limit` or `query_limit_exceeded`, or the 429 or 503 itself), proven not run where the
+refusal proves it: under the default 120 s window, a `Retry-After` of 60 s or more ends an `UNSAFE` or
+`UNKNOWN` request so even when its first send took no time. When the backoff makes the wait too long,
+it ends with `BudgetExceededError`, whose cause is that refusal. The same holds for the replay rounds
+of a classic batch and the replays of a REST 3.0 envelope: a command its own entry or element answered
+keeps that answer; one whose batch was refused as a whole ends with that refusal when its own hold
+alone outlasts the window, or with `BudgetExceededError` caused by it. Each command is weighed against
+its own method's hold, as known when its round is planned. The rounds share the batch's attempts, so a
+round waits for the longest hold among its commands when each of them can wait that long, and sends them
+all; when an `UNSAFE` or `UNKNOWN` command cannot (the wait must leave it as much window again), the
+round waits for the longest hold those commands can afford, sends every command held no longer, and the
+`SAFE` commands held longer go together in the next round;
+one still waiting when `max_attempts_per_request` is spent is not sent again. A hold that appears during a round's wait stops the whole round at its permit when it
+outlasts the window. The first send of a `batch()` or `batch_outcomes()` chunk weighs its commands the
+same way, by how much longer their methods are held than the portal: the least held go at once, a
+command held longer goes in a later envelope once its hold ends, and only one whose hold outlasts what
+the operation has left is not sent and ends with `BudgetExceededError`. A chunk whose every command can
+go at once, or none can, and every chunk of a fail-fast `batch()`, which is never split, waits within
+`max_elapsed` as a lone request does, and so do traversal pages and `fan_out()` waves. By default
+`SAFE` requests are also retried after an unstructured 408, 500, 502, 503 or 504
+(`RetryPolicy.transient_http_statuses`).
+
 ### Error codes
 
-A structured refusal raises `ApiResponseError`. Its message, `wire_code`, `normalized_code`, `code`
-(lower case) and `to_safe_dict()` name the server's code, so failures can be told apart:
+Every error of `b24api.errors` survives `pickle` and `copy` with its message and attributes, so it can
+cross a process pool or a task queue. The exception is an error that holds a caller's correlation:
+`BatchFailed` and `ReferenceFailed` keep their outcomes, each with its correlation, so `pickle` fails on
+them when the correlation cannot be pickled, and `copy.deepcopy()` when it cannot be deep-copied, with
+the error the correlation raises (`TypeError` for a lock, for example); `copy.copy()` still works. A structured refusal raises `ApiResponseError`. Its
+message, `wire_code`, `normalized_code`, `code` (lower case) and `to_safe_dict()` name the server's
+code, so failures can be told apart:
 
 ```text
 API error [BITRIX_REST_V3_EXCEPTION_ACCESSDENIEDEXCEPTION]: Access denied
@@ -156,14 +337,17 @@ after the server's `Retry-After`:
 
 | Code | Status | Retried |
 |---|---|---|
-| `BITRIX_REST_V3_EXCEPTION_RATELIMITEXCEPTION` | 429 | Any direct request: the limiter refuses before the method runs. In a REST 3.0 batch envelope only `SAFE` commands, as for any structured envelope error. |
+| `BITRIX_REST_V3_EXCEPTION_RATELIMITEXCEPTION` | 429 | Any direct request: the limiter refuses before the method runs. In a REST 3.0 batch envelope only `SAFE` commands: the limiter counts each command, so its refusal of the envelope may follow commands that ran. |
 | `BITRIX_REST_V3_EXCEPTION_LIMITER_QUERYTIMELIMITEXCEPTION` | 503 | `SAFE` requests only: the method may have run. |
 
-Every other REST 3.0 code is a deterministic refusal and is raised at once, including a 429 or 503
-that a module declares for a longer-lived state (`LANDING_AI_SITE_MODERATION_BLOCK_LIMIT`,
-`LANDING_AI_MODULE_UNAVAILABLE`). List more codes in `RetryPolicy.transient_api_codes` (and in
-`AmbiguityPolicy.refusal_api_codes` when the code proves the method did not run). The request
-faults `BITRIX_REST_V3_EXCEPTION_VALIDATION_REQUESTVALIDATIONEXCEPTION` and
+Every other REST 3.0 code is not retried. Outside an ambiguous status (408 or any 5xx by default,
+`ambiguous_unstructured_statuses`) it is the request's answer and is raised at once as `ApiResponseError`,
+a 429 that a module declares for a longer-lived state (`LANDING_AI_SITE_MODERATION_BLOCK_LIMIT`)
+included. At an ambiguous status (`LANDING_AI_MODULE_UNAVAILABLE` with 503) it proves nothing about
+whether the method ran: `SAFE` work raises the `ApiResponseError`, `UNSAFE` and `UNKNOWN` work raise
+`AmbiguousExecutionError` caused by it. List more codes in
+`RetryPolicy.transient_api_codes` (and in `AmbiguityPolicy.refusal_api_codes` when the code proves the
+method did not run). The request faults `BITRIX_REST_V3_EXCEPTION_VALIDATION_REQUESTVALIDATIONEXCEPTION` and
 `BITRIX_REST_V3_EXCEPTION_METHODNOTFOUNDEXCEPTION` in a REST 3.0 error envelope are never retried,
 even when listed.
 
@@ -198,6 +382,11 @@ async with client.batch(commands, batch_size=25) as stream:
 
 `batch()` is fail-fast. `batch_outcomes()` continues where safe and yields one of
 `CommandSuccess`, `CommandFailure`, `CommandNotExecuted` or `CommandOutcomeUnknown` in input order.
+It does not continue past its budgets: once `max_requests` refuses a send, it yields the outcomes of
+the commands it has already read, those never sent as `CommandFailure` with `BudgetExceededError`,
+then raises `BudgetExceededError`, reads no further input and closes the source, as when
+`max_elapsed` runs out. Its report is `incomplete` and records the `budget_exhausted` violation.
+`fan_out_outcomes()` and the reference traversals end the same way.
 
 <!-- tested: tests/client_v2_test.py::test_batch_outcomes_retains_typed_failure_without_halting_later_commands -->
 ```python
@@ -215,10 +404,15 @@ async with client.batch_outcomes(commands) as stream:
 Commands whose request uses `RouteKind.API_V3` travel in native REST 3.0 batch envelopes: one JSON
 array of at most 50 commands, never mixed with classic commands and grouped into contiguous runs of
 one replay safety (`UNSAFE` and `UNKNOWN` share a run). Envelopes go out in input order: a classic
-command between two v3 commands travels in its own envelope between theirs. The transport must
+command between two v3 commands travels in its own envelope between theirs. The one exception is a
+command whose method is held longer than the rest of its envelope's: it goes in a later envelope, after
+the chunk's other envelopes (see the load limits above). Outcomes come back in input order either way.
+The transport must
 advertise JSON-array bodies, as `HttpxTransport` does; otherwise such a command fails with
 `CapabilityError` before any request. Each array element is checked against its own request's
 embedded-error contract, so one failed command neither fails nor resends its successful neighbours.
+An element of a request with no `result_error` contract is its result, whatever it holds: the client
+cannot tell an error element from data without one, so such a command is a `CommandSuccess`.
 
 <!-- tested: tests/v3_batch_test.py::test_a21_wire_four_safe_v3_reads_travel_in_one_envelope_in_input_order -->
 ```python
@@ -234,13 +428,41 @@ async with client.batch_outcomes(v3_commands) as stream:
         handle(outcome)
 ```
 
-REST 3.0 does not roll a batch back. When a whole envelope fails after it may have run, `SAFE`
-commands of a transient failure get one envelope retry within their attempt budget, and commands
+REST 3.0 does not roll a batch back. An envelope refused for its credentials (a 401) is answered whole:
+each command is a `CommandFailure` with that error and is not sent alone, as in a classic batch. Any other
+error on a REST 3.0 envelope, structured, unreadable or contradictory, may come from the command that
+aborted it after earlier ones ran, unless it is a gateway's page (not JSON, or JSON without a top-level `error`
+and without a repeated top-level member) at a listed refusal status, which proves the envelope was refused. A classic
+envelope answered with an ambiguous status (408 or a 5xx) that is not a listed refusal leaves each of its commands unknown, as a REST 3.0 one does. When a whole envelope fails after it may have
+run, `SAFE` commands of a transient failure get one envelope retry within their attempt budget, and commands
 still unresolved are sent individually (`RetryPolicy.isolate_safe_batch_abort`, enabled by default)
-under the same attempt lineage; `UNSAFE` and `UNKNOWN` commands arrive
+under the same attempt lineage. That isolation waits and is admitted as a retry is (backoff, throttle
+hint, attempts, retry window, deadline), then sends one command at a time, so it stays within the
+dispatch's concurrency; `UNSAFE` and `UNKNOWN` commands arrive
 as `CommandOutcomeUnknown` without a resend. The report counts `ambiguous_physical_attempts` and
 `batch_isolation_requests`. Fail-fast `batch()` finishes resolving the envelope it already sent and
-then raises without reading further input.
+then raises without reading further input. A batch stream that ends before it delivered every outcome
+(cancelled mid-envelope, say) tells the admitted commands it never delivered apart in its report:
+`undelivered_possibly_run` counts those a send may have run (in flight, or sent without an answer),
+`undelivered_not_sent` those never sent; the rest were answered.
+
+A classic (non-REST 3.0) batch sends each command as a PHP query string, which cannot carry every
+JSON value with the meaning a direct call gives it. A command is sent in a classic batch only when its
+query string means what its JSON would mean; otherwise it fails alone with `CapabilityError` before any
+request (as a `CommandFailure` in `batch_outcomes()` and `fan_out_outcomes()`), and the message says
+which value is the problem. These values are refused:
+
+- `None` (a direct call sends `null`, which a filter or update reads as "empty"; the query string drops
+  the key, which changes what the command selects or writes);
+- an empty array or object, which the query string drops the same way;
+- an empty key, a key holding `[`, `]` or NUL, and a top-level key holding `.` or a space, which PHP
+  renames;
+- text holding a reference pattern (`$result[`, `$result_error[`, `$result_total[`, `$result_next[` or
+  `$result_time[`, in any letter case), which the batch handler replaces inside any value.
+
+Send such a command directly (`client.call()`, or `fan_out()` with `DirectDispatch`), or by REST 3.0. A
+`bool` is sent as `1` or `0`, as PHP's `http_build_query` writes it. `Request.classic_batch_obstacle`
+names what would keep a request out of classic batch, or is `None`.
 
 For independently dispatchable commands, use `fan_out()` or `fan_out_outcomes()` with
 `DirectDispatch` or `BatchDispatch`. Delivery order is explicitly `READY` or `INPUT`.
@@ -252,7 +474,7 @@ more specialized mechanics have explicit names and explicit preconditions.
 
 | Operation | Use it when | Network mechanics | Completion proof |
 |---|---|---|---|
-| `iter_list` | The method supports ordinary offset pagination. | Sequential requests follow server `next` (the next offset). Ordinary counted Bitrix list endpoints do server-side COUNT for `total` plus LIMIT/OFFSET page retrieval. | Continuation and empty terminal page; add identity for duplicate detection. |
+| `iter_list` | The method supports ordinary offset pagination. | Sequential requests follow server `next` (the next offset). Ordinary counted Bitrix list endpoints do server-side COUNT for `total` plus LIMIT/OFFSET page retrieval. | The last page carries no `next`; a reported `total` must match the rows read; add identity for duplicate detection. |
 | `iter_list_counted` | The first response provides an exact filtered `total` and stable offset pages. | Head page is direct; all known tail offsets are grouped into physical Bitrix batches. | Exact total, ranges and identities. |
 | `iter_list_keyset` | The method may omit `total`, but reliably supports ordering and filtering by a unique integer identity. | Auto by default: it plans first, then selects boundary-only, sequential, range, or partitioned execution; runtime sends no diagnostic canaries. | Caller-asserted keyset contract, strict monotonic identity, active bound validation, and terminal empty confirmation. |
 | `iter_list_cursor` | Each next request depends on a cursor from the previous response. | Sequential dependent cursor requests. | Strict unique monotonic cursor and empty terminal page. |
@@ -270,7 +492,7 @@ exact `limit_path`; the client never guesses method-specific parameter names.
 ![List traversal comparison](https://raw.githubusercontent.com/shkarupa-alex/b24api/master/list-traversal-comparison.svg)
 
 The animation replays traces executed against a scripted portal with 1,000 dense IDs at 50 rows
-per page. `iter_list` sends 20 pages and one empty confirmation (21 HTTP). `iter_list_counted` sends
+per page. `iter_list` sends 20 pages and stops at the one without `next` (20 HTTP). `iter_list_counted` sends
 the head and one batch of 19 pages (2 HTTP). `iter_list_keyset` in auto mode selects range
 execution: it reads both ends of the range in one batch, the 19 ranges between them in a second, and
 confirms the end with one call for `ID > 1000` (3 HTTP). A `BoundedIdentityRange` with a qualified
@@ -280,14 +502,28 @@ auto chooses from the observed geometry, so the plan and its request count can d
 
 ### Sequential offset
 
-This is the canonical default. It follows the `next` returned by the server and confirms the end
-with an empty page. For ordinary counted Bitrix list endpoints, `next` is an offset for the next
+This is the canonical default. It follows the `next` returned by the server and ends at the first
+page without one. For ordinary counted Bitrix list endpoints, `next` is an offset for the next
 LIMIT/OFFSET page, not a keyset cursor. Producing `total` involves a separate server-side count
 query in addition to retrieving the page. These database operations are performed inside the same
 REST request: the client does not issue an additional HTTP call just for the count. This distinction
 matters for performance: not making a separate HTTP count call does **not** mean avoiding server-side
-COUNT work. `iter_list` does not suppress that work; a returned `total` is observational and does not
-control this strategy's completion. Exact database implementation is endpoint-specific.
+COUNT work. `iter_list` does not suppress that work; a returned `total` never ends this strategy,
+but it is checked against the rows read at the end (below). Exact database implementation is
+endpoint-specific.
+
+Nothing is requested past the last page. Many endpoints cannot answer such a request with an empty
+page: `crm.lead.list`, `crm.deal.list`, `crm.activity.list` and `tasks.task.list` round `start` down to
+a multiple of 50 and answer a `start` at or past the end with their last page again, and
+`department.get` ignores `start` and always returns everything without `next`. The page without
+`next` is therefore the end on every Bitrix list endpoint. A Bitrix list `total` counts the filter's
+rows, so when the traversal started at the first page, a `total` reported by the last page (or, if
+it has none, by the latest page that had one) must equal the number of rows read; otherwise the traversal raises `IncompleteTraversalError` caused by a
+`PaginationError` with the `total_drift` page rejection, and the report is `incomplete`, never
+`completed`. An endpoint whose `total` is not an exact count of its rows can declare that with
+`ConsistencyPolicy(total_semantics=TotalSemantics.ADVISORY)`: a mismatch is then the
+`advisory_total_mismatch` warning. `TotalSemantics.GLOBAL` declares a `total` that counts every row of
+the endpoint rather than the filter's, so it is never compared with the rows read.
 
 <!-- tested: tests/client_v2_test.py::test_iter_list_is_sequential_mechanics_only_and_report_is_post_cleanup -->
 ```python
@@ -313,6 +549,36 @@ async with stream:
 
 Without `identity`, successful exhaustion is reported as `MECHANICS_ONLY`: pagination completed,
 but the client cannot prove that the portal did not duplicate or substitute rows.
+
+A page identical to an earlier page fails the traversal: rows alone cannot tell such a page from a
+portal that ignored `start` and returned the same page again, and a changed `next` or `total` cannot
+either, because an endpoint that ignores `start` can still compute them from it. A narrow `select`
+whose rows repeat by content, such as `{"select": ["STAGE_ID"]}`, therefore needs a unique field in
+the rows: add `ID` to the `select` and declare it as `identity`.
+
+A row whose identity is missing or does not match its coercion raises `IdentityContractError`, a
+`PaginationError`, as the cause of `IncompleteTraversalError` on every traversal; it names the path,
+the coercion, the observed JSON type and the row offset, never the value. The offset counts rows of
+the traversal; a fast keyset counts them within the lane that read the page. Identities and cursors
+are read before a `page_adapter` runs, so an adapter never sees a row that breaks them.
+`DECIMAL_STRING_INTEGER` accepts an integer or the canonical decimal string of one: ASCII digits
+without a leading zero, with a minus only before a non-zero value (`"0"`, `"12"`, `"-7"`). `"012"`,
+`" 12"`, `"1_2"` and `"+12"` are refused, so two different wire values never become one identity.
+
+`OffsetContinuation.SERVER_NEXT` is the default. An endpoint that honors `start` exactly but sends no
+`next` declares `OffsetContinuation.OBSERVED_COUNT`: the next offset is the current one plus the rows
+read, and an empty page ends the traversal. Such an endpoint has no Bitrix list envelope, so its
+`total` is not read unless the caller qualifies it (`EXACT_QUALIFIED`, or an `ADVISORY` comparison);
+the same holds for `FIXED_STEP`. An empty page that still carries `next` is refused only where `next`
+is followed, under `SERVER_NEXT`; cursor, continuation and window traversals, an observed count and a
+fixed step do not read it. `ConsistencyPolicy(confirmation_policy=EMPTY_AFTER_BOUNDARY)`
+asks for such an empty page, so it is refused with `CapabilityError` before any request under
+`SERVER_NEXT`, whose end is the page without `next`.
+`TotalTermination.EXACT_QUALIFIED` requires every page to carry the same exact `total` and the rows
+to reach it; under `OBSERVED_COUNT` or `FIXED_STEP` the page that reaches it ends the traversal
+without an empty confirmation. A first page with no rows, no `next` and no usable `total` (missing,
+`null` or `-1`, as `user.get` answers a filter that matches nothing) completes as an observed empty
+source, as it does for `iter_list_counted` below.
 
 An endpoint that honors `start` only at a fixed server window and signals its end only with a
 shorter page (no usable `total`, no `next`) can declare that stop rule with
@@ -343,7 +609,9 @@ async with stream:
 
 The first direct page must contain an exact filtered `total` and, when more rows exist, `next`.
 The client derives all remaining offsets from the observed head width and sends tail pages through
-bounded physical batches.
+bounded physical batches. A tail page whose rows do not fit what `max_buffered_rows` leaves it is
+dropped: the pages before it are yielded, and the traversal raises `IncompleteTraversalError` caused
+by `ResultTooLargeError`.
 
 <!-- tested: tests/client_v2_test.py::test_counted_traversal_preserves_frozen_request_shape_and_exact_identity -->
 ```python
@@ -358,17 +626,23 @@ stream = client.iter_list_counted(
 ```
 
 Use it only when `total` is exact for the supplied filter and offset pages are stable. Any missing
-range, overlap, duplicate identity or total contradiction raises `IncompleteTraversalError`.
+range, overlap, duplicate identity or total contradiction, a head without `next` short of its `total`
+included, raises `IncompleteTraversalError`. As in `iter_list`, every other failure (an API error, a
+missing `total`, a result of the wrong shape, a spent budget) is raised as it is, and the report says
+`failed` (`incomplete` for a budget). The exact `total` is known from the head, so a range the page,
+request, row-buffer or in-memory identity budget cannot hold is refused right there with
+`BudgetExceededError`, before any row is yielded; the head is traced as rejected with the
+`budget_exhausted` page rejection.
 
 A filtered call that matches nothing may omit `total` entirely, as `user.get` does with
 `result: []`. A first page with no rows, no `next` and no usable `total` (missing, `null`, or the
 `-1` unknown sentinel) therefore completes as an observed empty source after that one request: the
 report is `completed` and `exhausted`, but its assurance is `mechanics_only` (`identity_exact` with an
 identity), never a count-matched claim, and no total is invented. A first page that reports
-`total: 0` keeps the count-matched result. Rows without a usable total, a remaining `next`, a
-positive total with no rows, a fixed step, or a `ConsistencyPolicy` whose `confirmation_policy` is
-`QUALIFIED_TOTAL` (from `b24api.contracts.policy.ConfirmationPolicy`) stay strict and raise
-`IncompleteTraversalError`.
+`total: 0` keeps the count-matched result. Rows without a usable total, a remaining `next`, a fixed
+step, or a `ConsistencyPolicy` whose `confirmation_policy` is `QUALIFIED_TOTAL` (from
+`b24api.contracts.policy.ConfirmationPolicy`) stay strict and raise `CapabilityError`; a positive
+total with no rows raises `IncompleteTraversalError`.
 
 Physical batching reduces HTTP exchanges, but does not suppress server-side COUNT in ordinary
 counted list subrequests. Each command still performs its own offset page retrieval and associated
@@ -397,7 +671,12 @@ operation silently. Reference traversal can opt into the same selection for each
 terminal report carries a compact `keyset_selection` (`requested_kind`, `selected_kind`, `reason`)
 for every keyset traversal. A `page_stop` callback needs the ordered page stream, so auto reports
 `AUTO`, `SEQUENTIAL`, `PAGE_STOP`; an explicit `SequentialKeysetExecution()` reports
-`EXPLICIT_SEQUENTIAL`. The detailed `keyset_execution` report is present only when the fast path ran.
+`EXPLICIT_SEQUENTIAL`. Fast execution sends classic batch commands, so for a request that classic batch
+cannot carry (see [Logical batch and correlation](#logical-batch-and-correlation)) auto reports `AUTO`,
+`SEQUENTIAL`, `BATCH_UNREPRESENTABLE` and sends its pages directly, while an explicit fast execution
+raises `CapabilityError` before any request. A fast or automatic reference binding fails with that
+error before its first request: under `BatchDispatch` its sequential pages would travel in classic
+batch too, so such a binding needs `SequentialKeysetExecution()` under `DirectDispatch`. The detailed `keyset_execution` report is present only when the fast path ran.
 
 Use `await client.verify_keyset_capability(...)` as a development/CI/staging guard on a stable
 representative fixture. It performs five strict-bound checks and returns only a `VERIFIED` report;
@@ -482,6 +761,12 @@ previous boundary. `continuation=ResponseFlagTerminal(ResultSelector(("hasNextPa
 traversal on a `False` flag, even on a non-empty page, instead of requesting an empty confirmation
 page; a missing or non-boolean flag fails closed. An explicit global ascending or descending
 `ConsistencyPolicy` order contradicting a reversed page order is refused before any request.
+
+The cursor and the row identity are independent. Without `identity` the cursor value is the identity.
+An `identity` on another field, or on the cursor field with another coercion, only has to be unique:
+the cursor alone carries the order, so the identity's values may come in any order unless the
+consistency policy declares an order. An explicit `ConsistencyPolicy(order_semantics=...)` then
+applies to that identity, independently of the cursor's direction, and a page breaking it fails.
 
 ### Response-driven continuation
 
@@ -628,6 +913,15 @@ messages = client.iter_references(
 `Binding` has no valid caller correlation, so it terminates the source with `InputSourceError`
 rather than fabricating a reference outcome. Already accepted bindings retain their real outcomes.
 
+With `DeliveryOrder.INPUT` the bindings are delivered in source order, and each still reads its pages
+ahead while earlier bindings are being consumed, holding their rows within
+`ExecutionPolicy.max_buffered_rows`, so physical batches stay well filled. They fill less than under
+`READY`, whose consumer takes pages as they come: a sequential traversal of many bindings with several
+pages each may send up to four or five times `READY`'s requests with the default pool, and up to twice
+with a larger one; a counted traversal sends at most about twice as many, and often fewer. A binding
+with a `page_stop` fetches its next page only once the consumer has received the page and the callback
+has returned, so its pages travel in small batches.
+
 ### Keyset references
 
 `KeysetTraversal` bindings run sequentially by default (`SequentialKeysetExecution()`), unlike
@@ -649,10 +943,11 @@ delivery, once it is the next binding to deliver); a binding that cannot obtain 
 other binding can release rows fails with `BudgetExceededError`, and waiting for a share never
 outlasts `max_elapsed`.
 
-Fast and automatic keyset references need `BatchDispatch`. With a `page_stop`, automatic execution
-runs sequentially and reports `PAGE_STOP`; an explicit fast mode with a `page_stop` or
-`DirectDispatch` is refused before any request. A `KeysetSpec.boundary` remains unavailable in
-references.
+Fast and automatic keyset references need `BatchDispatch` with a `batch_size` of at least 2: every
+wave travels in one shared physical batch, and the first holds both boundary probes. With a
+`page_stop`, automatic execution runs sequentially and reports `PAGE_STOP`; an explicit fast mode with
+a `page_stop`, and either fast mode without one under `DirectDispatch` or `batch_size=1`, is refused
+before any request. A `KeysetSpec.boundary` remains unavailable in references.
 
 ### Counted references
 
@@ -720,7 +1015,11 @@ assert page.report.partial
 ```
 
 Helpers do not pull an extra row just to prove exhaustion. Reaching a requested limit is therefore
-`EARLY_CLOSED`, never a false `COMPLETED`. Cancellation and cleanup preserve the primary exception
+`EARLY_CLOSED`, never a false `COMPLETED`. When the stream fails, the error a helper raises carries the
+items it read before the failure as `partial_values`. A client serves the event loop it was first used
+in. A call, a stream's first read or the client's close from another loop raises `RuntimeError` before it
+reads a source or sends a request, and the client stays open: create one client per event loop, and close it there. A started stream stays the
+client's until it ends, so a stream the application drops is still closed with its client. Cancellation and cleanup preserve the primary exception
 and publish the same final report where the Python exception type permits it.
 
 ## Resource boundaries
@@ -729,6 +1028,171 @@ and publish the same final report where the Python exception type permits it.
 buffered commands and rows, retained unordered identity keys, direct concurrency and active
 references. The default response ceiling is 16 MiB and is enforced while streaming, before JSON
 decoding.
+
+A command's decoded rows are known only once it has run, so `max_buffered_rows` bounds what an operation
+holds rather than what it sends. `batch()` and `batch_outcomes()` share the budget among a window's
+results in input order, one row per outcome and a success's other rows while they fit; `fan_out()` and
+`fan_out_outcomes()` reserve each command an equal share among the results their dispatch may have in
+flight at once, under a `BatchDispatch` never below a 50-row page while the budget holds one per
+command of a batch (50 rows under the default `BatchDispatch`, 250 under the default `DirectDispatch`,
+see the table above). A longer result grows into free rows. While it waits for them, the rows that come
+back are its first: no other command reserves rows (under `INPUT` delivery, none but the frontier's), and
+the commands reserved before it are still sent. It waits while the rows it lacks may all come back without
+it: a command already reserved lands, or the consumer takes rows (its own earlier pages and, under `READY`
+delivery, any). Under `INPUT` delivery a result behind the frontier
+waits for the frontier to reach it: the rows the results before it hold come back by then, those waiting to
+grow as well, while rows read ahead for the results behind it come back only after it. While a result waits its decoded rows are held beside the budget, not in it:
+at most one result per command in flight, each no longer than the budget. A result longer than the whole
+budget, or one whose missing rows are held by results waiting to grow as well or, under `INPUT`, read ahead
+behind it, does not fit and is dropped at once: its command ends as a `CommandFailure` with `ResultTooLargeError`, a `BudgetExceededError` that
+says the command ran and was answered, so it is never replayed, and every other command keeps its own
+outcome. A result still waiting when `max_elapsed` runs out is dropped the same way, its command answered, and
+the operation ends with its time budget. A page's wait for row capacity before its send, while the
+consumer has not yet taken the rows other pages hold, is bounded by `max_elapsed`: when it runs out, the
+binding or `fan_out()` command fails with its waiting page unsent, with `BudgetExceededError` ("row
+buffer wait exceeded operation time budget"). A binding's wait for the consumer to take a page already
+handed to it (under `READY` delivery, or with a `page_stop`) is not bounded: it lasts as long as the
+consumer takes.
+
+`max_elapsed` is checked at the operation's scheduling points: when a request, a page or a source item
+is admitted, while a send waits for its permit (a pause included), while a page waits for row capacity
+and while a source, synchronous or asynchronous, is pulled. A send in flight is cut at what is left of
+the operation or of its retry window, whichever is shorter. It does not bound the time the application
+spends while it holds control: in a `page_stop` callback, or as a consumer that is slow between pulls of
+the stream. Nothing interrupts the application when the budget runs out meanwhile; the next scheduling
+point ends the operation, even when all that is left is to read the end of the source. Once that end
+was read, a deadline that passes while the application holds control ends nothing. A deadline that ends the
+operation leaves the report `incomplete`, with `BudgetExceededError` as its terminal reason and a `budget_exhausted` violation.
+The operation's page budget (`max_pages`) ends it the same way once it refuses a page, as `max_requests`
+does once it refuses a send: the source is not read further.
+The stream raises a plain `BudgetExceededError`, except that a fail-fast stream whose stop failed a
+command or a binding raises its wrapper (`BatchFailed` or `ReferenceFailed`, whose report carries that
+reason). A stop at a source pull or at the end-of-source check fails none by itself, but `batch()` and
+`batch_outcomes()` still send the commands they read into the window before it, which the budget refuses
+in turn (each a `CommandFailure` with `BudgetExceededError`), so `batch()` then raises `BatchFailed`. So
+for a fail-fast stream it depends on where the budget stopped the stream, not on the operation (a
+tolerant stream raises the plain error): handle both, or read the report. A refusal of one request while
+time is left ends that request alone: a retry whose wait is longer than the time left, one whose own
+retry window closed first, a known pause that outlasts what it may wait, or a spent
+`max_attempts_per_request`. It ends with that refusal, `BudgetExceededError`, caused by the failure of
+the send it followed, except when that failure is the server's load refusal and its hold alone outlasts
+the window: then it ends with that load refusal itself (see the load limits above). Either way, a
+request or command that send proved not run fails with it, and one that send may have run is unknown
+(`AmbiguousExecutionError`, named after that send, with the refusal as its cause; a lone call raises the
+refusal). Nothing is recorded as the operation's refusal, and a tolerant stream
+goes on: with no other failure it ends `completed_with_failures`, with no `budget_exhausted`. Cleanup
+never ends a stream with the budget. A send cut in flight is another case: its command may have run, so
+it is unknown (`AmbiguousExecutionError`), and a fail-fast stream may end on that ambiguity instead.
+
+Cleanup runs once the operation has ended, often because `max_elapsed` ran out, so it is not cut at
+the budget: each of its steps (closing the source, stopping the operation's own tasks) waits for what
+is left of `max_elapsed`, but at least 0.1 s. A source whose close ends at once (a list, a generator,
+an async generator whose `aclose()` returns) closes within that grace, and the report records the
+budget's end alone. A close that blocks longer goes on in the background: the report adds a
+`cleanup_failure` violation, and the stream still raises the error that ended it. When nothing else
+ended it, the close raises `b24api.errors.CleanupOverrunError`, a `BudgetExceededError` that refused
+no work, and the report is the one a close that raised any other error gets, with no
+`budget_exhausted`: after `break` or an early `aclose()`, `early_closed` with the terminal reason
+"stream cleanup failed"; on a stream read to its end, `failed`. Either way its `cleanup_failure`
+violation names `CleanupOverrunError`. A cancelled read, close or `async with` exit (an exit whose body a
+cancellation ended, Ctrl-C included, counts as cancelled) waits for cleanup only one second, not for
+what is left of `max_elapsed`, and one cancellation is deferred for one second in all, however many exits
+it unwinds (the stream's, then the client's), and a second cancellation
+during that second ends with it. An exit that must raise another exception in its place (the body's own, or
+a failed read or close) replays the cancellation at the task's next `await`: the replay is a new delivery,
+and each exit it then reaches waits at most one second more. Cleanup still running then
+goes on in the background, and the close raises the cancellation, which caused that overrun, with the
+overrun recorded behind it ("stream cleanup also failed (CleanupOverrunError)"); `client.aclose()` does the
+same, and so do `collect()` and `first()`, which close as an `async with` exit does. A close nobody cancelled
+waits for its cleanup, so `finally: await stream.aclose()` after a cancelled read waits for all of it: close
+with `async with stream` to keep the grace. A cancellation outranks the budget's error or a failure only when it came first: a consumer
+cancelled before the budget or a failure ended the stream receives its `CancelledError`, with a
+`cancelled` report, even when the close then overruns.
+One cancelled after them, while the cleanup waits, receives the budget's error (or the failure), with
+an `incomplete` (or `failed`) report, and the cancellation is delivered at its next `await`. A stream
+closed before its first pull closes its source the same way. A synchronous source is pulled and closed in worker threads, in
+one `contextvars.Context`; a pull the deadline cut while it still runs is waited for before the close
+runs in that context, so a pull that outlasts the grace leaves its close to the background the same way.
+An asynchronous source also runs every pull and its close in one context of its own, copied when the call
+that creates the stream is made and driven by the task that reads it, so a context variable a generator sets
+before a `yield` is still set when it resumes. A context variable the caller sets after that call (a tracing
+span around the `async for` loop, say) is not seen by the source: set it before creating the stream.
+
+Every `Exception` a source raises, from a pull or from its close, is its failure: the stream raises
+`InputSourceError` (`batch()` and `fan_out()`: `BatchFailed`, whose `__cause__` is that
+`InputSourceError`) with the source's exception as its `__cause__`, whether the source is synchronous
+or asynchronous and even when that exception is a library error of its own. An item that is not what
+the family reads fails the source too, with a `TypeError` as that cause. Every family reports a
+failed close the same way. When nothing failed before it, the close is what failed: the terminal
+reason is "stream cleanup failed" and the report carries one `cleanup_failure` violation, "stream
+cleanup failed (X)", where X is `InputSourceError` or `CleanupOverrunError`. Behind an earlier failure,
+that failure stays the terminal reason and the close adds "stream cleanup also failed (X)". So does a
+close that fails behind the reader's cancellation: the reader gets its `CancelledError`, the stream is
+`cancelled` with the terminal reason "iteration cancelled", whether the cancellation landed while a
+read waited or between reads. That `CancelledError` carries the close's failure as its `__cause__`
+(`InputSourceError`, whose own `__cause__` is your source's exception) and the report as `.report`. An
+interrupt is the exception: a `KeyboardInterrupt` or `SystemExit` raised anywhere in the operation (by
+a close, a pull, or your transport inside one of the library's own tasks) is never behind anything. It
+is what the stream raises, whatever ended the stream before it (its end, a failure, the reader's
+cancellation, a timeout, a close from another task), and the report has one shape for it: `failed`
+with the terminal reason "operation interrupted", every violation recorded before it kept (an earlier
+failure's first), and one `interrupted` violation last, "operation interrupted (X)", where X is
+`KeyboardInterrupt` or `SystemExit`. The raised interrupt carries that report as `.report`, as the
+`CancelledError` does. A close that fails after an interrupt ended the stream is "stream cleanup also
+failed (X)", as behind any other end that came first.
+
+A failure is an `Exception`. Any other `BaseException` that is neither an interrupt nor a cancellation is
+no failure: the library never catches it as one, never wraps it, never makes it an outcome and never ranks
+it; it propagates as Python propagates it. Raised by your source's close it replaces whatever ended the
+stream, as an exception raised in a `finally` does, and under `async with` it replaces your own exception,
+which becomes its `__context__`. The library guarantees only this, in every family: it reaches you as it
+is, whether your transport raised it in your read or between your reads (in the stream's background work),
+or your source's pull or close did; the source is closed once; nothing hangs waiting for an end it took
+the place of; and it is never lost silently: when no read got it (you closed the stream between reads, or
+the close cancelled the send or the pull that raised it), the close raises it, once. A read the close ends
+in another task raises `b24api.errors.StreamClosedError`. One delivered to a read or a close never reaches the event loop's
+exception handler and is never left in a task whose exception nobody retrieves; one the library could no
+longer deliver to a read or a close (raised by work that outlived the stream's cleanup window, a second
+one behind what the close already raises, or one a close or a read could not raise because its coroutine was
+closed while it ran the stream's end) is reported to the loop's exception handler, once, with the
+stream's report as `report`. So is one of a stream nothing ever ends (left open when `asyncio.run` shuts
+down, or dropped): as asyncio reports a task's exception nobody retrieved, it is reported once the
+stream's work is collected, on a closed loop too. What the report says about it, and how it ranks behind
+other ends, is not promised.
+
+An interrupt raised while no read is waiting (by a send the stream runs between your reads, while you work
+on an item) does not wait for your next read: it leaves the event loop at once, out of `asyncio.run`, as
+asyncio raises any task's, and the operation's end follows: its work cancelled, its source closed and its
+report published, attached to the interrupt as `.report`. A read or close you start before that end is
+over runs it or waits for it, then finds the stream ended (a read raises `StopAsyncIteration`, a close
+returns); neither raises the interrupt, which the loop has. Under `asyncio.run` the interrupt stops the
+loop before the end begins, and the end is the close that `asyncio.run`'s shutdown runs as it cancels your
+tasks: the exit of an `async with stream` around your reads, or of the client's `async with`. A read or
+close cancelled while it runs the end still lets the end publish, with "stream cleanup also failed
+(CancelledError)" before the `interrupted` violation. The stream gets no end, so its source stays open and
+there is no report, only when nothing closes it: you never close the stream nor its client, or
+`asyncio.run` was already shutting down (your main coroutine had returned) when the interrupt was raised.
+The interrupt leaves `asyncio.run` in every case. An
+interrupt raised after the operation ended (by a close or a send still running past the cleanup window) is
+never dropped either: it leaves the event loop the same way, unless the stream already raised one. So does
+one that ends a close or a read whose coroutine was closed while it ran the stream's end, unless a read that
+close ended raises it. A stream
+raises one interrupt at most; a second one is reported to the loop's exception handler, like any escape the
+stream could no longer deliver, so it never stops the loop again while you unwind from the first. A library
+error carries this in its report (`error.report`), not as a note; your own exception raised inside
+`async with stream` stays what is raised and carries one note, the report's `cleanup_failure` violation
+word for word. Once the
+stream ends, its source is closed, even when the stream's own tasks outlast the cleanup window. A close from
+another task while a read is in flight is an early close: the read it ends raises `StreamClosedError`,
+which carries the report as `.report`, or the close's failure when the close failed (an interrupt
+included), which the close raises too. A reader whose own task is cancelled gets its `CancelledError`,
+unless an interrupt ends the stream within the one second its read waits for the close: then it gets the
+interrupt, which the close raises too.
+A close from another task while a failed read cleans up returns quietly; the read raises its failure. A
+close ends the stream before failures no read reached, a source's failure in the read-ahead included:
+it returns, and the report is `early_closed`. A stream its reader's cancellation ended reports
+`cancelled` with the terminal reason "iteration cancelled", whatever its source had reached.
+`report.emitted` counts the items the reader got.
 
 Sequential, counted, and multi-reference exact traversal retain at most `max_identity_keys`
 observed identities per operation in memory (100,000 by default). All active reference bindings
@@ -743,7 +1207,9 @@ Strict keyset and cursor traversal retain only monotonic progression state when 
 ## CLI
 
 The wheel installs `b24api`. Stdout contains only result data; list rows are JSONL. Reports and safe
-errors go to stderr. Credentials come only from `Settings` and cannot be passed as CLI arguments.
+errors go to stderr. Credentials come only from `Settings` and cannot be passed as CLI arguments. The
+CLI reads the environment and then a `.env` file in its working directory, if one exists; the
+environment wins.
 
 <!-- tested-console: tests/cli_test.py::test_call_routes_replay_safety_and_keeps_success_data_on_stdout -->
 ```console
@@ -755,10 +1221,32 @@ b24api list example.item.list --route bare --strategy counted --contract @counte
 
 The `--raw` CLI option selects the response envelope; it does not alter the Python API. Advanced
 list strategies use closed JSON `version: 1` contracts. The entire contract is validated before
-client construction. Run `b24api --help` and `b24api list --help` for the compact option surface.
+client construction. `--params -` and `--contract -` read stdin (not both in one run); input that is
+not UTF-8 or not valid JSON is a usage error. Output to a terminal or pipe that cannot write Unicode
+gets JSON with `\u` escapes instead of failing. Run `b24api --help` and `b24api list --help` for the compact option surface.
 
 Exit codes are `0` success, `2` usage/contract error, `3` unavailable configuration, `4`
-remote/protocol/correctness/incomplete failure, `5` broken output consumer and `130` cancellation.
+remote/protocol/correctness/incomplete failure, `5` broken output consumer, `6` keyset bounds
+unsupported and `7` keyset verification inconclusive (both from `verify-keyset`), `130`
+cancellation (Ctrl-C), and `128 + signal` for `SIGTERM` (`143`) or `SIGHUP` (`129`). A signal ends a
+`list` as Ctrl-C does: the stream closes and its report is written to stderr.
+`5` takes priority whenever a write to stdout or stderr finds its reader gone, including a run whose
+data was delivered but whose diagnostic hit a closed stderr, and a run started with stdout or stderr
+already closed. Any other failed write, such as to a full
+disk, exits `4`.
+
+## Testing without a portal
+
+`b24api.testing` holds two offline tools. `ScriptedTransport` plays a fixed table of exchanges
+(`ScriptedExchange.json()`, `.batch()` for a classic batch, `.v3_batch()` for a REST 3.0 envelope) to a
+client built on it, with no socket and no credential. A call matches an exchange only when it sends what
+the exchange names: the same method, route, replay safety, body encoding (JSON, form or query string), scoped
+headers, raw content and parameters. Parameters compare as JSON values, so the order of mapping keys does not matter for a
+match; `calls` keeps each request with its keys in the order they were sent, for a test that checks the
+sort priority of `order`. A call nothing matches fails its send, as a transport failure, and is kept in
+`unexpected`; `assert_exhausted()` reports such calls and exchanges never used. `.batch()` refuses a
+command a classic batch would refuse (see [Logical batch and correlation](#logical-batch-and-correlation)).
+`run_transport_conformance()` checks your own transport against the cases the client relies on.
 
 ## Correctness boundaries
 
@@ -798,9 +1286,11 @@ make qc
 git diff --check
 ```
 
-`make qc` runs the lint, type and default test checks that CI blocks on. It leaves out the internal
-benches (the pytest marker `slow`: the evidence harness contracts and the 50k/100k-scale runs, which
-take several minutes). `make bench` runs them, and so does the blocking CI job `slow`.
+`make qc` runs the lint, type and default test checks that CI blocks on. The tests run in parallel, one
+worker process per CPU: `make qc PYTEST_WORKERS=2` bounds them, `PYTEST_WORKERS=0` runs them in one
+process. It leaves out the internal benches (the pytest marker `slow`: the evidence harness contracts and
+the 50k/100k-scale runs, which take several minutes). `make bench` runs them, in one process, and so does
+the blocking CI job `slow`.
 
 The wheel regression installs into an isolated environment, executes the `b24api` entry point and
 checks that tests, live/evidence tooling and credentials are excluded.

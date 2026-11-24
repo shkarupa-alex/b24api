@@ -50,7 +50,7 @@ from b24api.errors import AmbiguousExecutionError, BatchCommandError, Incomplete
 from b24api.execution import ExecutionContext, RateCoordinator
 from b24api.references.budget_view import BindingBudgetView, RowLease
 from b24api.references.dispatch import _RowBuffer
-from tests.scripting import BatchPortal, client_for
+from tests.scripting import UNREACHABLE_COALESCE_WAIT, BatchPortal, client_for, on_loop
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -293,6 +293,12 @@ def _shared(rows: int) -> ExecutionContext:
     return ExecutionContext(ExecutionPolicy(max_buffered_rows=rows), RateCoordinator(max_concurrency=1))
 
 
+def test_a_view_planning_after_its_pool_closed_keeps_its_lease() -> None:
+    """A lease only grows as its binding plans: a pool closed meanwhile has reclaimed its rows and grows none."""
+    view = BindingBudgetView.over(_shared(100), RowLease(80), grow=lambda: 0)
+    assert view.planning_rows() == view.lease.capacity == view.policy.max_buffered_rows == 80
+
+
 @pytest.mark.asyncio
 async def test_a_trimmed_view_names_its_capacity_and_never_drops_below_its_held_rows() -> None:
     view = BindingBudgetView.over(_shared(100), RowLease(80))
@@ -527,9 +533,9 @@ async def test_a_lost_part_of_a_split_wave_leaves_its_binding_unknown_even_after
         outcomes, report = await _drain(
             client.iter_reference_outcomes(
                 _base(),
-                [_parent(name) for name in data],
+                on_loop(_parent(name) for name in data),
                 traversal=_traversal(RangeKeysetExecution(_CONTRACT)),
-                dispatch=BatchDispatch(batch_size=3),
+                dispatch=BatchDispatch(batch_size=3, coalesce_wait=UNREACHABLE_COALESCE_WAIT),
             )
         )
 

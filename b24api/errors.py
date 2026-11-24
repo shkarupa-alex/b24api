@@ -11,6 +11,7 @@ from b24api.contracts.error_base import B24ApiError, BudgetExceededError
 from b24api.contracts.evidence import ResponseEvidence
 from b24api.contracts.keyset_capability import KeysetCapabilityReport, KeysetCapabilityVerdict, KeysetInconclusiveReason
 from b24api.contracts.policy import AmbiguityReason, IdentityCoercion, ReplayDisposition
+from b24api.contracts.report import PageRejectionCode
 from b24api.contracts.response import ResultCollectionShape
 from b24api.contracts.v3_codes import render_code
 from b24api.redaction import DEFAULT_REDACTOR, Redactor, SafeText
@@ -61,6 +62,34 @@ class TransportError(B24ApiError):
     def to_safe_dict(self) -> dict[str, object]:
         """Return the to safe dict representation."""
         return {**super().to_safe_dict(), "phase": self.phase.value, "possible_acceptance": self.possible_acceptance}
+
+
+class ClientClosedError(TransportError, RuntimeError):
+    """The client, its rate limiter or its transport was closed before this attempt of the request was sent.
+
+    A transport lifecycle failure of phase ``not_dispatched``: the attempt it stopped never left the process,
+    and it is never retried. The phase covers that attempt alone: a ``SAFE`` request waiting for the permit
+    of a retry may have run on an earlier attempt. An ``UNSAFE`` or ``UNKNOWN`` request is retried only after
+    a failure that proved it did not run (a transport failure before dispatch, or a refusal listed in
+    ``AmbiguityPolicy``), so it stays proven not run. It is also a ``RuntimeError``, the type
+    a closed client raised before, so existing ``except RuntimeError`` handlers keep catching it.
+    """
+
+    def __init__(
+        self,
+        message: str = "client is closed",
+        *,
+        request_summary: RequestSummary | None = None,
+        redactor: Redactor = DEFAULT_REDACTOR,
+    ) -> None:
+        """Refuse before dispatch, without a retry."""
+        super().__init__(
+            message,
+            phase=FailurePhase.NOT_DISPATCHED,
+            request_summary=request_summary,
+            retryable=False,
+            redactor=redactor,
+        )
 
 
 class HTTPGatewayError(B24ApiError):
@@ -191,9 +220,27 @@ class CapabilityError(B24ApiError):
 
 
 class PaginationError(B24ApiError):
-    """Pagination invariant violation."""
+    """Pagination invariant violation.
+
+    ``rejection_code`` names the page check that rejected a page, when the error is one (for example
+    ``PageRejectionCode.DUPLICATE_IDENTITY``); the rejected page's ``PageRecord`` carries the same code.
+    """
 
     default_origin = ErrorOrigin.PAGINATION
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        rejection_code: PageRejectionCode | None = None,
+        request_summary: RequestSummary | None = None,
+        redactor: Redactor = DEFAULT_REDACTOR,
+    ) -> None:
+        """Build the error; ``rejection_code`` is ``None`` unless a page check rejected a page."""
+        if rejection_code is not None and not isinstance(rejection_code, PageRejectionCode):
+            raise TypeError("rejection_code must be a PageRejectionCode")
+        self.rejection_code = rejection_code
+        super().__init__(message, request_summary=request_summary, redactor=redactor)
 
 
 class ContinuationError(PaginationError):
@@ -421,10 +468,57 @@ class KeysetCapabilityError(CapabilityError):
         return safe
 
 
+class CleanupOverrunError(BudgetExceededError):
+    """A cleanup step was still running when its cleanup window ended; it goes on in the background.
+
+    An operation's cleanup (closing the caller's source, cancelling the work still in flight) may wait the time the
+    operation has left, but at least a short grace, so the end of ``max_elapsed`` itself never fails it. A step that
+    outlasts that window raises this from ``aclose()`` or the ``async with`` exit when nothing else ended the
+    operation, and is reported as a ``cleanup_failure``. It refused no work: unlike any other
+    ``BudgetExceededError``, it never records the operation's refusal, and a caller's cancellation outranks it
+    (the ``CancelledError`` propagates, the overrun is recorded behind it). A cancelled close stops waiting after
+    the cancellation grace (``CANCEL_GRACE_SECONDS``): that overrun is the cancellation's doing, so the close always
+    raises the cancellation and only the report records the overrun.
+    """
+
+
 class ResponseTooLargeError(B24ApiError):
     """A decompressed response exceeded the configured byte ceiling."""
 
     default_origin = ErrorOrigin.PROTOCOL
+
+
+class ResultTooLargeError(BudgetExceededError):
+    """A command ran and was answered, but its decoded result holds more rows than the row budget leaves it.
+
+    The client drops the result rather than hold it past ``ExecutionPolicy.max_buffered_rows``, so the command's
+    outcome is a ``CommandFailure`` carrying this error: it ran, unlike a command a budget refused before its send,
+    and it is never replayed. ``rows`` is how many rows the result decoded to (the length of a list result),
+    ``limit`` how many the budget left it; ``evidence`` is the answer's, its HTTP status and request id included.
+    """
+
+    def __init__(
+        self,
+        *,
+        rows: int,
+        limit: int,
+        request_summary: RequestSummary | None = None,
+        evidence: ResponseEvidence | None = None,
+    ) -> None:
+        """Name the result's rows and the rows the budget left it."""
+        self.rows = rows
+        self.limit = limit
+        super().__init__(
+            f"decoded result of {rows} rows exceeds the {limit} the buffered row budget leaves it",
+            request_summary=request_summary,
+            evidence=evidence,
+        )
+
+    def to_safe_dict(self) -> dict[str, object]:
+        """Return the row counts with the safe fields."""
+        safe = super().to_safe_dict()
+        safe.update({"rows": self.rows, "limit": self.limit})
+        return safe
 
 
 class AmbiguousExecutionError(B24ApiError):
@@ -506,6 +600,20 @@ class InputSourceError(B24ApiError):
     default_origin = ErrorOrigin.CAPABILITY
 
 
+class StreamClosedError(B24ApiError):
+    """A stream was closed, by another task or by its client, while this read of it was in progress.
+
+    The read ends without an item: the close ended the stream first. It carries the stream's report as ``.report``.
+    A read that starts after the stream ended raises ``StopAsyncIteration`` instead, as any read of an ended stream.
+    """
+
+    default_origin = ErrorOrigin.CAPABILITY
+
+    def __init__(self, message: str = "stream was closed while this read was in progress") -> None:
+        """Name the close that ended the read."""
+        super().__init__(message)
+
+
 class BatchFailed[C](B24ApiError):  # noqa: N818 - normative public name
     """Bounded fail-fast batch window plus its final report."""
 
@@ -534,6 +642,8 @@ __all__ = (
     "BatchFailed",
     "BudgetExceededError",
     "CapabilityError",
+    "CleanupOverrunError",
+    "ClientClosedError",
     "ContinuationError",
     "ContinuationReason",
     "EnvelopeContractError",
@@ -551,6 +661,8 @@ __all__ = (
     "ReferenceFailed",
     "ResponseTooLargeError",
     "ResultShapeError",
+    "ResultTooLargeError",
+    "StreamClosedError",
     "TransportError",
     "ValidationIssue",
 )

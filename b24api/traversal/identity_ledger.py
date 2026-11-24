@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from b24api.contracts.identity_store import identity_store_key
+from b24api.contracts.report import PageRejectionCode
 from b24api.errors import PaginationError
 
 if TYPE_CHECKING:
@@ -43,9 +44,15 @@ class _ExternalIdentityStore:
             try:
                 added = self._store.add_if_absent(identity_store_key(value))
             except Exception as error:
-                raise PaginationError("identity store could not record a traversal identity") from error
+                raise PaginationError(
+                    "identity store could not record a traversal identity",
+                    rejection_code=PageRejectionCode.IDENTITY_STORE,
+                ) from error
             if type(added) is not bool:
-                raise PaginationError("identity store must answer add_if_absent with a bool")
+                raise PaginationError(
+                    "identity store must answer add_if_absent with a bool",
+                    rejection_code=PageRejectionCode.IDENTITY_STORE,
+                )
             if added:
                 self._count += 1
             else:

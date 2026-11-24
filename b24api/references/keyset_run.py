@@ -11,18 +11,18 @@ dispatcher, and its page evidence is recorded into the shared operation gate und
 
 from __future__ import annotations
 import asyncio
+import functools
 from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol
 
 from b24api.completion.reference_recorder import ReferenceFastLedger
-from b24api.contracts.completion import CommandSettlement
-from b24api.contracts.policy import KernelState
 from b24api.contracts.report import KeysetSelectionSummary, Violation, ViolationSeverity
 from b24api.errors import PaginationError
+from b24api.execution.context import latch_escape
 from b24api.references.budget_view import BindingBudgetView, RowLease
-from b24api.references.dispatch import _DoneEvent, _failed_settlement, _FailureEvent, _PageEvent
+from b24api.references.dispatch import _DoneEvent, _FailureEvent, _PageEvent, _Producing
 from b24api.references.wave_engine import SharedWaveEngine, WaveHost
-from b24api.traversal.keyset_eligibility import validate_fast_keyset
+from b24api.traversal.keyset_eligibility import reject_unencodable_fast_request, validate_fast_keyset
 from b24api.traversal.keyset_observation import FastTraceRecorder
 from b24api.traversal.keyset_runtime import KeysetRuntime
 
@@ -57,8 +57,16 @@ class FastKeysetHost(WaveHost, Protocol):
         """Wait for and hold the binding's row lease in the shared pool."""
         ...
 
+    def grow_lease(self, run: _ReferenceRun, fast: FastKeysetProgram, lease: _Reservation) -> int:
+        """Grow the binding's lease to its share as it plans; return the rows it holds."""
+        ...
+
     async def settle_lease(self, lease: _Reservation, rows: int) -> None:
         """Fix the planned binding's lease at ``rows``, giving the rest back to the shared pool."""
+        ...
+
+    async def publish_terminal(self, run: _ReferenceRun, event: _DoneEvent | _FailureEvent) -> None:
+        """Publish the binding's terminal event; it stops counting as a producer first."""
         ...
 
 
@@ -80,8 +88,11 @@ async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKe
             execution=fast.execution,
             policy=host.context.policy,
         )
+        reject_unencodable_fast_request(request)
         lease = await host.lease_rows(run, fast)
-        view = BindingBudgetView.over(host.context, RowLease.of(lease))
+        view = BindingBudgetView.over(
+            host.context, RowLease.of(lease), functools.partial(host.grow_lease, run, fast, lease)
+        )
         runtime = KeysetRuntime(
             request=request,
             identity=fast.identity,
@@ -108,10 +119,11 @@ async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKe
             await _deliver(host, run, runtime, rows)
         closure, witnesses = runtime.completion_closure()
         await runtime.aclose()
-        ledger.close(successful=True, reason=KernelState.COMPLETED.value, unsettled=CommandSettlement.NOT_EXECUTED)
+        ledger.close(successful=True)
         closure = _witnessed(closure, ledger)
         report = runtime.report_fragment()
-        await run.output.put(
+        await host.publish_terminal(
+            run,
             _DoneEvent(
                 run.work,
                 run.partial_rows,
@@ -126,19 +138,21 @@ async def run_fast_keyset(host: FastKeysetHost, run: _ReferenceRun, fast: FastKe
     except asyncio.CancelledError:
         raise
     except BaseException as error:
-        # The scheduler's per-reference boundary turns the error into this binding's terminal event.
+        latch_escape(error)  # Latched before the await, so no cancellation of it can ever replace it.
         if runtime is not None and not runtime.closed:
             await runtime.aclose()
-        ledger.close(successful=False, reason=KernelState.FAILED.value, unsettled=_failed_settlement(error))
-        run.failure = _FailureEvent(
-            run.work,
-            error,
-            None,
-            run.page_state,
-            run.partial_rows,
-            () if runtime is None else _binding_violations(runtime.violations),
-            _page_records(host, run, trace),
-        )
+        ledger.close(successful=False)
+        if isinstance(error, Exception):
+            # A failure: the scheduler's per-reference boundary turns it into this binding's terminal event.
+            run.failure = _FailureEvent(
+                run.work,
+                error,
+                None,
+                run.page_state,
+                run.partial_rows,
+                () if runtime is None else _binding_violations(runtime.violations),
+                _page_records(host, run, trace),
+            )
         raise
     finally:
         if runtime is not None and not runtime.closed:
@@ -162,10 +176,7 @@ async def _deliver(
     """
     state, key = host.producer_state, run.producer_key
     continuing = not runtime.terminal
-    state.runnable.discard(key)
-    if continuing:
-        state.pending_continuations.add(key)
-    state.touch()
+    state.move(key, _Producing.AWAITING_CONSUMER if continuing else _Producing.WAITING)
     acknowledged = asyncio.get_running_loop().create_future()
     await run.output.put(
         _PageEvent(
@@ -183,9 +194,8 @@ async def _deliver(
     )
     await acknowledged
     run.partial_rows += len(rows)
-    state.pending_continuations.discard(key)
-    state.runnable.add(key)
-    state.touch()
+    if continuing:
+        state.move(key, _Producing.RUNNABLE)
 
 
 def _page_records(host: FastKeysetHost, run: _ReferenceRun, trace: FastTraceRecorder) -> tuple[PageRecord, ...]:

@@ -43,6 +43,7 @@ from b24api.contracts import (
     BodyEncoding,
     Command,
     CommandFailure,
+    CommandOutcomeUnknown,
     CommandSuccess,
     CompositeIdentitySpec,
     IdentityComponent,
@@ -90,6 +91,11 @@ OBSERVED_REQUESTS = 2
 REFERENCE_OUTCOMES = 2
 FANOUT_COMMANDS = 3
 DISTINCT_REQUESTS = 2
+# Only a hung child process reaches this: interpreter start and imports on a loaded host stay well inside.
+_CHILD_PROCESS_GUARD = 60
+# The child's own event loop, its 0.02 s close timeout included, ends well inside this on a loaded host;
+# a shutdown that waited for the cancellation-resistant cleanup would not.
+_CHILD_LOOP_BOUND = 2.0
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
@@ -346,16 +352,20 @@ async def test_unstructured_post_dispatch_status_is_ambiguous_for_unknown() -> N
 async def test_malformed_nonempty_2xx_remains_protocol_error_under_broad_ambiguity_policy(
     safety: ReplaySafety,
 ) -> None:
+    # The decoder's failure stays a ProtocolError; a request that is not SAFE carries it as the cause of its
+    # ambiguity, since the server may have run it before the answer was garbled.
     transport = ResponderTransport(lambda _request: WireResponse(200, (), b"not-json"))
     policy = ExecutionPolicy(ambiguity=AmbiguityPolicy(frozenset(range(100, 600))))
 
-    with pytest.raises(ProtocolError) as captured:
+    with pytest.raises((ProtocolError, AmbiguousExecutionError)) as captured:
         await Executor(transport).execute(
             Request("example.list", replay_safety=safety, route=RouteKind.BARE),
             policy=policy,
         )
 
-    assert type(captured.value).__name__ == "ProtocolError"
+    protocol = captured.value if safety is ReplaySafety.SAFE else captured.value.__cause__
+    assert type(protocol).__name__ == "ProtocolError"
+    assert isinstance(captured.value, AmbiguousExecutionError) is (safety is not ReplaySafety.SAFE)
 
 
 @pytest.mark.asyncio
@@ -606,8 +616,11 @@ async def test_conformance_runner_preserves_loop_affinity_and_isolates_case_resp
 
 
 def test_cancellation_resistant_cleanup_cannot_block_process_shutdown() -> None:
+    # The child times its own event loop, start to shutdown, so interpreter start and imports on a busy
+    # host do not count; the process timeout only turns a hung shutdown into a failure.
     script = """
 import asyncio
+import time
 from b24api.testing import ConformanceCase, run_transport_conformance
 from b24api.testing import transport as module
 
@@ -631,17 +644,20 @@ async def main():
     )
     assert report.failures[0].detail == "CleanupDeadlineExceeded"
 
+started = time.monotonic()
 asyncio.run(main())
+print(time.monotonic() - started)
 """
     result = subprocess.run(  # noqa: S603 - fixed interpreter and in-repository regression script
         [sys.executable, "-c", script],
         check=False,
         capture_output=True,
         text=True,
-        timeout=1,
+        timeout=_CHILD_PROCESS_GUARD,
     )
 
     assert result.returncode == 0, (result.stdout, result.stderr)
+    assert float(result.stdout) < _CHILD_LOOP_BOUND
 
 
 @pytest.mark.asyncio
@@ -1096,8 +1112,9 @@ async def test_batch_isolates_embedded_shape_failure_and_normalizes_terminal_nex
     )
     outcomes = [outcome async for outcome in stream]
 
-    assert isinstance(outcomes[0], CommandFailure)
-    assert isinstance(outcomes[0].error, ProtocolError)
+    # A malformed embedded error proves nothing about what the command did, so it stays unknown.
+    assert isinstance(outcomes[0], CommandOutcomeUnknown)
+    assert isinstance(outcomes[0].error.__cause__, ProtocolError)
     assert outcomes[0].replay_disposition is ReplayDisposition.NOT_ELIGIBLE
     assert isinstance(outcomes[1], CommandSuccess)
     assert outcomes[1].response.next is None
@@ -1280,7 +1297,11 @@ async def test_reference_fail_fast_classifies_underlying_pagination_failure() ->
     assert any(item.code == "pagination_invariant" for item in captured.value.report.violations)
     assert captured.value.report.terminal_reason == "PaginationError"
     assert "_ReferenceWindowError" not in repr(captured.value.report)
-    assert "_PageRejectionError" not in repr(captured.value.report)
+    # The failure chains to a public error, which names the page check that rejected the page.
+    cause = captured.value.__cause__
+    assert type(cause) is PaginationError
+    assert cause.rejection_code is PageRejectionCode.DUPLICATE_IDENTITY
+    assert cause.to_safe_dict()["type"] == "PaginationError"
 
 
 @pytest.mark.asyncio
@@ -1534,3 +1555,16 @@ async def test_page_stride_accepts_an_aligned_initial_offset() -> None:
     rows = [item async for item in stream]
     assert len(rows) == PAGE_SIZE
     assert starts == [900, 900 + PAGE_SIZE]
+
+
+@pytest.mark.parametrize("code", ["duplicate_identity", 1, object()])
+def test_a_pagination_error_refuses_a_rejection_code_that_is_not_one(code: object) -> None:
+    # The code names the page check that rejected a page, as its ``PageRecord`` does: a raw value is no such name.
+    with pytest.raises(TypeError, match="rejection_code must be a PageRejectionCode"):
+        PaginationError("rejected", rejection_code=code)  # type: ignore[arg-type]
+
+
+def test_a_pagination_error_keeps_its_rejection_code() -> None:
+    assert PaginationError("rejected").rejection_code is None
+    error = PaginationError("rejected", rejection_code=PageRejectionCode.TOTAL_DRIFT)
+    assert error.rejection_code is PageRejectionCode.TOTAL_DRIFT

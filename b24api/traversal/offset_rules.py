@@ -3,12 +3,11 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
 
-from b24api.completion.closure import DECLARED_SHORT_PAGE_REACHED, QUALIFIED_TOTAL_REACHED
+from b24api.completion.closure import DECLARED_SHORT_PAGE_REACHED, NO_CONTINUATION_REACHED, QUALIFIED_TOTAL_REACHED
 from b24api.contracts.policy import ConfirmationPolicy, DuplicatePolicy, IdentityRequirement, TotalSemantics
 from b24api.contracts.report import PageRejectionCode
 from b24api.contracts.traversal import OffsetContinuation, OffsetSpec, ShortPageTermination, TotalTermination
 from b24api.errors import CapabilityError, PaginationError
-from b24api.traversal.identity import _PageRejectionError
 from b24api.traversal.plans import OffsetSequentialPlan, OffsetTerminalRule
 
 _EMPTY_PAGE_TERMINAL = "empty page confirmed terminal"
@@ -20,14 +19,23 @@ if TYPE_CHECKING:
 
 
 def offset_terminal_rules(offset: OffsetSpec) -> frozenset[OffsetTerminalRule]:
-    """Keep sparse raw closure separate from selected-row emptiness."""
+    """Return the evidence that ends an offset traversal: the server's end, an empty page, or a declared rule.
+
+    A server-next traversal ends at the first page without ``next``; the other progressions end at an
+    empty page. Sparse raw closure stays separate from selected-row emptiness.
+    """
     if offset.sparse_raw_bound is not None:
         return frozenset({OffsetTerminalRule.SPARSE_RAW_BOUND})
     if offset.short_page_termination is ShortPageTermination.DECLARED_TERMINAL:
         return frozenset({OffsetTerminalRule.EMPTY_PAGE, OffsetTerminalRule.DECLARED_SHORT_PAGE})
+    end = (
+        OffsetTerminalRule.NO_CONTINUATION
+        if offset.continuation is OffsetContinuation.SERVER_NEXT and offset.page_index is None
+        else OffsetTerminalRule.EMPTY_PAGE
+    )
     if offset.total_termination is TotalTermination.DISABLED:
-        return frozenset({OffsetTerminalRule.EMPTY_PAGE})
-    return frozenset({OffsetTerminalRule.EMPTY_PAGE, OffsetTerminalRule.QUALIFIED_TOTAL})
+        return frozenset({end})
+    return frozenset({end, OffsetTerminalRule.QUALIFIED_TOTAL})
 
 
 def sequential_offset_plan(
@@ -127,7 +135,17 @@ def offset_terminal(
     accepted: int,
     confirmation: ConfirmationPolicy,
 ) -> str | None:
-    """Return the terminal reason a committed offset page proves, if any."""
+    """Return the terminal reason a committed offset page proves, if any.
+
+    A server-next page ends the traversal exactly when it carries no ``next``; under a caller-qualified
+    exact total the driver then requires the rows to match it. Any other progression ends at an empty
+    page, or earlier at a qualified exact total unless the caller requires the empty confirmation.
+    """
+    if OffsetTerminalRule.NO_CONTINUATION in plan.terminal:
+        if response.next is not None:
+            return None
+        exact = OffsetTerminalRule.QUALIFIED_TOTAL in plan.terminal
+        return QUALIFIED_TOTAL_REACHED if exact else NO_CONTINUATION_REACHED
     if page_size == 0 and OffsetTerminalRule.EMPTY_PAGE in plan.terminal:
         return _EMPTY_PAGE_TERMINAL
     if confirmation is ConfirmationPolicy.EMPTY_AFTER_BOUNDARY:
@@ -137,10 +155,23 @@ def offset_terminal(
         and response.total is not None
         and response.total >= 0
         and accepted == response.total
-        and (response.next is None or plan.continuation is OffsetContinuation.FIXED_STEP)
     ):
         return QUALIFIED_TOTAL_REACHED
     return None
+
+
+def reported_total_contradiction(*, total: int | None, delivered: int) -> PaginationError | None:
+    """Return the failure of a source that ended with a row count its server-reported total contradicts.
+
+    A Bitrix list ``total`` counts every row of the filter, so a traversal read from its first page that
+    ends with a different number of rows skipped or repeated some: it must not report completion.
+    """
+    if total is None or total < 0 or total == delivered:
+        return None
+    return PaginationError(
+        "traversal ended with a row count that contradicts the reported total",
+        rejection_code=PageRejectionCode.TOTAL_DRIFT,
+    )
 
 
 def declared_short_page_terminal(
@@ -163,15 +194,15 @@ def declared_short_page_terminal(
         raise PaginationError("response exceeded the declared page cap")
     if rows == width:
         if response.next is not None and response.next != offset + plan.fixed_step:
-            raise _PageRejectionError(
+            raise PaginationError(
                 "declared short-page traversal observed a continuation that contradicts its fixed step",
-                PageRejectionCode.RANGE_CONTRADICTION,
+                rejection_code=PageRejectionCode.RANGE_CONTRADICTION,
             )
         return None
     if response.next is not None:
-        raise _PageRejectionError(
+        raise PaginationError(
             "declared short-page traversal observed a continuation after a short or empty page",
-            PageRejectionCode.RANGE_CONTRADICTION,
+            rejection_code=PageRejectionCode.RANGE_CONTRADICTION,
         )
     return _EMPTY_PAGE_TERMINAL if rows == 0 else DECLARED_SHORT_PAGE_REACHED
 
@@ -191,8 +222,6 @@ def next_offset(
         return current + step
     if plan.continuation is OffsetContinuation.SERVER_NEXT:
         if response.next is None:
-            raise PaginationError("server-next traversal has no continuation")
-        return response.next
-    if plan.continuation is OffsetContinuation.SERVER_NEXT_OR_OBSERVED_COUNT and response.next is not None:
+            raise RuntimeError("a server-next page without next is terminal and has no successor")
         return response.next
     return current + observed

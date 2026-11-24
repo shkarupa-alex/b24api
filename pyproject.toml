@@ -28,6 +28,7 @@ classifiers = [
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Internet :: WWW/HTTP",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Typing :: Typed",
@@ -38,6 +39,8 @@ dependencies = [
     # verified against, and widening either bound reruns the hpack matrix (httpx-latest job).
     "h2>=4.3.0,<4.5",
     "hpack>=4.1.0,<4.3",
+    # The conformance responder in b24api.testing reads requests with h11, the HTTP/1.1 parser under HTTPX.
+    "h11>=0.16",
     "pydantic>=2.12.0",
     "pydantic-settings>=2.10.1",
 ]
@@ -57,7 +60,15 @@ include = ["b24api*"]
 b24api = ["py.typed"]
 
 [dependency-groups]
+# The build backend of [build-system], locked: the release and wheel-typing jobs build without isolation
+# from this group, so a published distribution is built by the versions in uv.lock.
+build = [
+    "setuptools>=80.9.0",
+    "setuptools-git-versioning>=2.1.0",
+    "wheel>=0.45.1",
+]
 dev = [
+    { include-group = "build" },
     "cryptography>=50.0.1",
     "hypothesis>=6.168.1",
     "jsonschema>=4.25.1",
@@ -66,13 +77,11 @@ dev = [
     "pytest-cov>=7.1.0",
     "pytest-env>=1.1.5",
     "pytest-mock>=3.14.1",
+    "pytest-xdist>=3.8.0",
     "pyyaml>=6.0.3",
     "ruff>=0.15.5",
-    "setuptools>=80.9.0",
-    "setuptools-git-versioning>=2.1.0",
     "types-jsonschema>=4.26.0.20260113",
     "types-pyyaml>=6.0.12.20260906",
-    "wheel>=0.45.1",
 ]
 
 [tool.ruff]
@@ -105,6 +114,8 @@ known-third-party = []
 
 [tool.mypy]
 strict = true
+# Checked as the oldest supported Python, whatever runs mypy: the stubs, and so the ratchet's count, follow it.
+python_version = "3.12"
 
 [[tool.mypy.overrides]]
 module = [

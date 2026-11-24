@@ -1,13 +1,15 @@
 """Bounded fail-fast and total-outcome Bitrix batch execution."""
 
 from __future__ import annotations
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Self, cast
 
 from b24api._sources import OwnedSource
 from b24api.batch.correlation import _Command
 from b24api.batch.engine import (
     BatchExecutor,
+    BatchProgress,
     BatchSource,
     BatchStreamItem,
     _batch_outcome_row_weight,
@@ -16,7 +18,8 @@ from b24api.batch.engine import (
     _Chunk,
     _raise_source_error,
 )
-from b24api.batch.outcome import BatchSuccess
+from b24api.batch.outcome import BatchFailure, BatchSuccess, settlement_of
+from b24api.contracts.completion import CommandSettlement
 from b24api.contracts.policy import (
     CompletionAssurance,
     ExecutionPolicy,
@@ -30,6 +33,7 @@ from b24api.execution import (
     AsyncIteratorController,
     ExecutionContext,
 )
+from b24api.execution.facts import dropped_result
 from b24api.execution.lifecycle import (
     CleanupAttempt,
     LifecycleHooks,
@@ -43,6 +47,58 @@ from b24api.execution.snapshot import KernelReport
 
 if TYPE_CHECKING:
     from types import TracebackType
+
+
+@dataclass(frozen=True, slots=True)
+class _ChunkRead:
+    """A chunk read from the source and not handed to a send: none of its commands was sent."""
+
+    commands: range
+
+    def settlement(self, index: int) -> CommandSettlement:
+        """Return ``NOT_EXECUTED``: the command never left."""
+        del index
+        return CommandSettlement.NOT_EXECUTED
+
+
+@dataclass(frozen=True, slots=True)
+class _ChunkSending:
+    """A chunk handed to a send: where each command stands is its ``BatchProgress``, ended when the send ends."""
+
+    commands: range
+    progress: BatchProgress
+
+    def settlement(self, index: int) -> CommandSettlement:
+        """Return how the command settles from what it did so far."""
+        return self.progress.settlement(index)
+
+
+@dataclass(frozen=True, slots=True)
+class _ChunkFailed:
+    """A chunk whose send failed as a whole with ``error``: where each command stood is its ended ``BatchProgress``."""
+
+    commands: range
+    progress: BatchProgress
+    error: BaseException
+
+    def settlement(self, index: int) -> CommandSettlement:
+        """Return how the command settles from what it did before the chunk failed."""
+        return self.progress.settlement(index)
+
+
+@dataclass(frozen=True, slots=True)
+class _ChunkAnswered:
+    """A chunk whose send ended with an outcome per command, as the stream yields it."""
+
+    commands: range
+    outcomes: Mapping[int, BatchStreamItem]
+
+    def settlement(self, index: int) -> CommandSettlement:
+        """Return how the command's outcome settles."""
+        return settlement_of(self.outcomes[index])
+
+
+type _ChunkState = _ChunkRead | _ChunkSending | _ChunkFailed | _ChunkAnswered
 
 
 class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
@@ -66,12 +122,18 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
             raise ValueError("shared batch context must use the exact stream policy")
         self._context = context or batch_executor.executor.context(policy)
         self._logical_page_per_command = logical_page_per_command
-        self._source_controller: AsyncIteratorController[_BatchItem] | None = None
-        self._source_taken = False
+        # Owns the source from the start, so even a close before the first pull is bounded by the cleanup window.
+        self._source_controller = AsyncIteratorController(
+            self._source,
+            input_error="batch input exceeded operation time budget",
+            cleanup_error="batch source cleanup exceeded operation time budget",
+        )
         self._started = False
         self._batch_requests = 0
         self._batch_commands = 0
         self._emitted = 0
+        # The latest chunk read and how far it went: read, handed to a send, or answered.
+        self._chunk: _ChunkState = _ChunkRead(range(0))
         self.report = KernelReport()
         self._runner = OperationRunner(
             self._run(),
@@ -82,6 +144,38 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
     def __aiter__(self) -> Self:
         """Return this asynchronous iterator."""
         return self
+
+    @property
+    def chunk_start(self) -> int:
+        """Return the stream index of the first command of the batch the latest outcome came from.
+
+        An outcome's ``command_index`` counts the whole stream; less this, it is the command's index in its batch.
+        """
+        return self._chunk.commands.start
+
+    def settlement(self, index: int) -> CommandSettlement:
+        """Return how the command at stream index ``index`` settles from the state of the chunk it joined.
+
+        A command past the latest chunk never joined one: the source handed it to a pull that was cut short (a
+        cancellation while the chunk filled), so it was not executed. A command of the latest chunk settles as that
+        chunk's state says (``_ChunkState``). The stream reads a chunk only once it has yielded the one before whole,
+        so a command of an earlier chunk has already been yielded with its outcome and is not asked for.
+        """
+        chunk = self._chunk
+        if index >= chunk.commands.stop:
+            return CommandSettlement.NOT_EXECUTED
+        if index < chunk.commands.start:
+            raise RuntimeError("a command of an earlier chunk was yielded with its outcome")
+        return chunk.settlement(index)
+
+    def failed_chunk(self, error: BaseException) -> int | None:
+        """Return the stream index of the first command of the chunk whose send ``error`` failed as a whole, if it did.
+
+        A chunk-wide failure leaves no outcome per command: its commands settle from where each stood
+        (``settlement``), and the stream ends with the chunk's error.
+        """
+        chunk = self._chunk
+        return chunk.commands.start if isinstance(chunk, _ChunkFailed) and chunk.error is error else None
 
     async def __anext__(self) -> BatchStreamItem:
         """Return the next asynchronous item."""
@@ -107,13 +201,7 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
     async def _run(self) -> AsyncGenerator[BatchStreamItem]:
         self._started = True
         await self._context.start()
-        source = AsyncIteratorController(
-            self._source,
-            input_error="batch input exceeded operation time budget",
-            cleanup_error="batch source cleanup exceeded operation time budget",
-        )
-        self._source_controller = source
-        self._source_taken = True
+        source = self._source_controller
         next_index = 0
         while True:
             chunk = await _next_chunk(
@@ -127,12 +215,18 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
                 context=self._context,
             )
             if not chunk.commands:
+                # The source has ended. The operation ends with its budget if the budget refused work, as a reference
+                # operation's does; a deadline that passed with nothing left to admit refused none.
+                self._context.raise_if_refused()
                 break
+            self._chunk = _ChunkRead(range(next_index, next_index + len(chunk.commands)))
             next_index += len(chunk.commands)
             if chunk.source_error is not None:
                 _raise_source_error(chunk.source_error)
             self._batch_commands += len(chunk.commands)
-            outcomes = await self._execute(chunk.commands)
+            # The window has run: a result its rows leave no room for is dropped as answered, never lost unsent.
+            outcomes = _within_row_budget(await self._execute(chunk.commands), self._context.policy.max_buffered_rows)
+            self._chunk = _ChunkAnswered(self._chunk.commands, {outcome.command_index: outcome for outcome in outcomes})
             buffered_rows = sum(_batch_outcome_row_weight(outcome) for outcome in outcomes)
             await self._context.set_buffered_rows(buffered_rows)
             for outcome in outcomes:
@@ -141,6 +235,8 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
                 yield outcome
                 buffered_rows -= outcome_rows
                 await self._context.set_buffered_rows(buffered_rows)
+            if chunk.refusal is not None:
+                raise chunk.refusal
 
     def _count_batch_request(self) -> None:
         """Count one physical batch envelope the chunk sends in its first round."""
@@ -154,12 +250,21 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
                 for _ in commands:
                     reservation = await self._context.reserve_page()
                     reservations.append(reservation)
+            progress = BatchProgress()
+            self._chunk = _ChunkSending(self._chunk.commands, progress)
             outcomes = await self._executor.execute_chunk(
-                commands, context=self._context, halt=False, on_envelope=self._count_batch_request
+                commands,
+                context=self._context,
+                halt=False,
+                on_envelope=self._count_batch_request,
+                progress=progress,
             )
-        except BaseException:
+        except BaseException as error:
             for reservation in reservations:
                 self._context.release_page(reservation)
+            sending = self._chunk
+            if isinstance(sending, _ChunkSending):
+                self._chunk = _ChunkFailed(sending.commands, sending.progress, error)
             raise
         if reservations:
             for reservation, outcome in zip(reservations, outcomes, strict=True):
@@ -170,15 +275,8 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
         return outcomes
 
     async def _cleanup(self) -> None:
-        source = self._source_controller
-        if source is None:
-            if not self._source_taken:
-                # No controller took the source this stream opened (closed before the first pull, or the
-                # context failed to start), so the stream closes it itself. OwnedSource.aclose is idempotent.
-                (await self._source.aclose()).raise_failure()
-            return
         await self._context.set_buffered_rows(0)
-        await source.aclose(remaining=max(0.0, self._context.policy.max_elapsed - self._context.elapsed))
+        await self._source_controller.aclose(self._context)
 
     async def _finalize(self, cause: TerminalCause, failure: str | None, attempt: CleanupAttempt) -> KernelReport:
         if not self._started:
@@ -224,6 +322,49 @@ class _BatchOutcomeStream(AsyncIterator[BatchStreamItem]):
         return self.report
 
 
+def _within_row_budget(
+    outcomes: tuple[BatchSuccess | BatchFailure, ...], max_rows: int
+) -> tuple[BatchSuccess | BatchFailure, ...]:
+    """Fit a window's decoded results into the row budget; a result that does not fit is dropped, never delivered.
+
+    The window has run when its rows are known, so the budget can no longer refuse to send it; it bounds what the
+    stream holds. Each outcome holds at least one row (a window never has more commands than the budget has rows),
+    and a success holds its result's rows: in window order, each is charged while it fits what the budget has left
+    after the one row of each later outcome. A success whose rows do not fit becomes a failure that keeps the
+    execution facts: the command ran and was answered (``dropped_result``), so it is neither a success, nor proven
+    not run, nor replayed.
+    """
+    left = max_rows
+    fitted: list[BatchSuccess | BatchFailure] = []
+    for position, outcome in enumerate(outcomes):
+        room = left - (len(outcomes) - position - 1)
+        kept = outcome
+        if isinstance(outcome, BatchSuccess) and _batch_outcome_row_weight(outcome) > room:
+            kept = _dropped(outcome, room)
+        left -= _batch_outcome_row_weight(kept)
+        fitted.append(kept)
+    return tuple(fitted)
+
+
+def _dropped(outcome: BatchSuccess, limit: int) -> BatchFailure:
+    """Return the failure that replaces a success whose result does not fit the ``limit`` rows left to it."""
+    request = outcome.request
+    return BatchFailure(
+        outcome.command_index,
+        outcome.stable_key,
+        request,
+        dropped_result(
+            rows=outcome.decoded_rows,
+            limit=limit,
+            request_summary=request.summary,
+            evidence=None if outcome.response is None else outcome.response.evidence,
+        ),
+        replay_safety=request.replay_safety,
+        correlation=outcome.correlation,
+        evidence=outcome.evidence,
+    )
+
+
 def _failure_report(cause: TerminalCause, reason: str, attempt: CleanupAttempt) -> KernelReport:
     return failed_kernel_report(cause, reason, attempt)
 
@@ -262,6 +403,11 @@ async def _next_chunk(
     start_index: int,
     context: ExecutionContext,
 ) -> _Chunk:
+    """Read up to ``size`` commands; a source failure or a budget refusal after the first ends the chunk.
+
+    A pull the operation's budget refused (``ExecutionContext.ended_by``) is no source failure: it is carried as the
+    chunk's ``refusal``, and the commands read before it are sent as any chunk is, the budget refusing each send.
+    """
     commands: list[_Command] = []
     for offset in range(size):
         try:
@@ -271,6 +417,8 @@ async def _next_chunk(
         except Exception as error:
             if not commands:
                 raise
+            if context.ended_by(error):
+                return _Chunk(tuple(commands), refusal=error)
             return _Chunk(tuple(commands), error)
         index = start_index + offset
         request, correlation = (item, None) if isinstance(item, Request) else (item.request, item.correlation)

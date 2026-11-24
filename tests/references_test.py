@@ -31,9 +31,11 @@ from b24api.errors import (
     CapabilityError,
     FailurePhase,
     ProtocolError,
+    ResultTooLargeError,
     TransportError,
 )
 from b24api.execution import Executor, WireResponse
+from b24api.execution.facts import Execution, execution
 from b24api.references.outcome import KernelReferenceFailure, KernelReferenceItem, ReferenceRequest
 from b24api.references.stream import iter_references
 from b24api.traversal.plans import (
@@ -49,7 +51,18 @@ from b24api.traversal.plans import (
     SingleResponsePlan,
 )
 from tests.ledger_hold import LedgerHold
-from tests.scripting import Blocker, ResponderTransport, attached_report, replies
+from tests.scripting import (
+    DEADLINE_BUDGET,
+    HANG_BOUND,
+    UNREACHABLE_COALESCE_WAIT,
+    Blocker,
+    ResponderTransport,
+    assert_fired_near_deadline,
+    attached_report,
+    deadline_started,
+    reached,
+    replies,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Iterator
@@ -59,8 +72,6 @@ if TYPE_CHECKING:
 PAGE_SIZE = 1
 TWO_REFERENCES = 2
 EXPECTED_LOGICAL_PAGES = 4
-CLEANUP_TEST_TIMEOUT = 0.2
-PULL_TEST_TIMEOUT = 0.15
 REFERENCE_FAILURE_COUNT = 140
 RETAINED_VIOLATION_LIMIT = 128
 
@@ -173,6 +184,32 @@ async def test_reference_bindings_share_one_operation_identity_budget() -> None:
     assert len({item.reference_key for item in items}) == 1
     assert len(failures) == 1
     assert isinstance(failures[0].error, BudgetExceededError)
+
+
+@pytest.mark.asyncio
+async def test_a_raw_source_raising_its_own_budget_error_fails_the_stream() -> None:
+    # A raw source's own BudgetExceededError (a nested operation's, say) is not this operation's budget refusing a
+    # pull: nothing was refused here, so it fails the stream as any source failure does, not as a read-out source.
+    def source() -> Iterator[ReferenceRequest]:
+        yield _reference("a")
+        raise BudgetExceededError("nested operation budget")
+
+    stream = iter_references(
+        Executor(ResponderTransport(lambda _request: {"result": [{"ID": 1}]})),
+        source(),
+        plan=_one_page_plan(),
+        _page_cap_hint=PAGE_SIZE,
+        dispatch=KernelDirectDispatch(concurrency=1),
+        identity=_identity(),
+        tolerant=True,
+        policy=ExecutionPolicy(max_active_references=1, max_buffered_rows=1),
+    )
+
+    with pytest.raises(BudgetExceededError, match="nested operation budget"):
+        async for _outcome in stream:
+            pass
+
+    assert stream.report.state is KernelState.FAILED
 
 
 @pytest.mark.asyncio
@@ -434,7 +471,7 @@ async def test_batch_dispatch_coalesces_pages_and_preserves_total_metadata() -> 
         Executor(transport),
         [_reference("a"), _reference("b")],
         plan=CountedOffsetPlan(limit_path=ParameterPath(("limit",)), requested_page_size=PAGE_SIZE),
-        dispatch=KernelBatchDispatch(batch_size=TWO_REFERENCES),
+        dispatch=KernelBatchDispatch(batch_size=TWO_REFERENCES, coalesce_wait=UNREACHABLE_COALESCE_WAIT),
         identity=_identity(),
         policy=ExecutionPolicy(max_active_references=TWO_REFERENCES, max_buffered_rows=TWO_REFERENCES),
     )
@@ -452,7 +489,8 @@ async def test_batch_dispatch_coalesces_pages_and_preserves_total_metadata() -> 
 
 
 @pytest.mark.asyncio
-async def test_reference_batch_preserves_tolerant_duplicate_json_members() -> None:
+async def test_reference_batch_refuses_a_repeated_command_key() -> None:
+    # Two answers under one command key leave the page unreadable: it is not taken as either of them.
     class DuplicateMemberTransport:
         host = "fixture.invalid"
 
@@ -480,10 +518,10 @@ async def test_reference_batch_preserves_tolerant_duplicate_json_members() -> No
         identity=_identity(),
     )
 
-    outcomes = [outcome async for outcome in stream]
+    with pytest.raises(AmbiguousExecutionError) as raised:
+        [outcome async for outcome in stream]
 
-    assert len(outcomes) == 1
-    assert isinstance(outcomes[0], KernelReferenceItem)
+    assert isinstance(raised.value.__cause__, ProtocolError)
 
 
 @pytest.mark.asyncio
@@ -502,7 +540,7 @@ async def test_batch_fan_out_coalesces_whole_results_as_one_item_per_reference()
     stream = fan_out(
         Executor(transport),
         [_reference("a"), _reference("b")],
-        dispatch=KernelBatchDispatch(batch_size=TWO_REFERENCES),
+        dispatch=KernelBatchDispatch(batch_size=TWO_REFERENCES, coalesce_wait=UNREACHABLE_COALESCE_WAIT),
         policy=ExecutionPolicy(max_active_references=TWO_REFERENCES, max_buffered_rows=TWO_REFERENCES),
     )
 
@@ -617,9 +655,11 @@ async def test_fan_out_list_result_obeys_decoded_row_buffer(dispatch: DispatchPl
         policy=ExecutionPolicy(max_buffered_rows=TWO_REFERENCES),
     )
 
-    with pytest.raises(BudgetExceededError, match="decoded page") as captured:
+    # The command ran and was answered: its result is dropped, never delivered, and its failure says it ran.
+    with pytest.raises(ResultTooLargeError, match="decoded result of 3 rows") as captured:
         await anext(stream)
 
+    assert execution(captured.value) is Execution.ANSWERED
     assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.FAILED
     assert stream.report.emitted_rows == 0
@@ -653,8 +693,9 @@ async def test_input_order_rejects_oversized_whole_result_behind_blocked_head() 
         ),
     )
     first = asyncio.create_task(anext(stream))
-    await head_started.wait()
-    await later_started.wait()
+    async with asyncio.timeout(HANG_BOUND):
+        await head_started.wait()
+        await later_started.wait()
     for _ in range(10):
         await asyncio.sleep(0)
     snapshot = await stream._scheduler.context.snapshot()  # noqa: SLF001 - bounded retention regression
@@ -662,12 +703,15 @@ async def test_input_order_rejects_oversized_whole_result_behind_blocked_head() 
     assert snapshot.counters.buffered_rows_high_water == 0
 
     release_head.set()
-    head = await first
+    async with asyncio.timeout(HANG_BOUND):
+        head = await first
     assert isinstance(head, KernelReferenceItem)
     assert head.reference_key == "head"
 
-    with pytest.raises(BudgetExceededError, match="decoded page"):
-        await anext(stream)
+    with pytest.raises(ResultTooLargeError, match="decoded result of 10 rows") as captured:
+        async with asyncio.timeout(HANG_BOUND):
+            await anext(stream)
+    assert execution(captured.value) is Execution.ANSWERED
     assert stream.report.buffered_rows_high_water == 1
 
 
@@ -697,13 +741,13 @@ async def test_tolerant_reference_failure_preserves_total_correlation() -> None:
     assert stream.report.state is KernelState.COMPLETED
     assert [violation.code for violation in stream.report.violations] == ["reference_failure"]
     bad_record = next(record for record in stream.report.page_trace if record.reference_index == 0)
-    assert bad_record.outcome is PageOutcome.UNKNOWN
+    assert bad_record.outcome is PageOutcome.REJECTED
     assert bad_record.dispatch is PageDispatch.DIRECT
     assert bad_record.rejection_code is PageRejectionCode.COMMAND_FAILURE
 
 
 @pytest.mark.asyncio
-async def test_tolerant_batch_command_failure_records_unknown_page_provenance() -> None:
+async def test_tolerant_batch_command_failure_records_rejected_page_provenance() -> None:
     def handler(request: Request) -> object:
         commands = request.copy_parameters()["cmd"]
         assert isinstance(commands, dict)
@@ -730,7 +774,7 @@ async def test_tolerant_batch_command_failure_records_unknown_page_provenance() 
     assert isinstance(outcomes[0], KernelReferenceFailure)
     assert len(stream.report.page_trace) == 1
     record = stream.report.page_trace[0]
-    assert record.outcome is PageOutcome.UNKNOWN
+    assert record.outcome is PageOutcome.REJECTED
     assert record.dispatch is PageDispatch.BATCH
     assert record.batch_index == 0
     assert record.reference_index == 0
@@ -904,16 +948,20 @@ async def test_async_reference_input_pull_obeys_operation_elapsed_budget() -> No
         yield _reference("first")
         await asyncio.Future[None]()
 
+    budget_started = deadline_started()
     stream = fan_out(
         Executor(ResponderTransport(lambda _request: {"result": {"ok": True}})),
         source(),
         dispatch=KernelDirectDispatch(),
-        policy=ExecutionPolicy(max_active_references=1, max_elapsed=0.03),
+        policy=ExecutionPolicy(max_active_references=1, max_elapsed=DEADLINE_BUDGET),
     )
 
     assert isinstance(await anext(stream), KernelReferenceItem)
+    # The bound is far above the budget, so even a stalled loop cannot let both expire on one tick and
+    # cancel the pull that the deadline is about to fail.
     with pytest.raises(BudgetExceededError, match="reference input") as captured:
-        await asyncio.wait_for(anext(stream), timeout=PULL_TEST_TIMEOUT)
+        await asyncio.wait_for(anext(stream), timeout=HANG_BOUND)
+    assert_fired_near_deadline(budget_started)
 
     assert attached_report(captured.value) is stream.report
     assert stream.report.state is KernelState.FAILED
@@ -939,21 +987,24 @@ async def test_cancellation_resistant_reference_pull_is_closed_after_late_comple
         finally:
             closed.set()
 
+    budget_started = deadline_started()
     stream = fan_out(
         Executor(ResponderTransport(lambda _request: {"result": {"ok": True}})),
         source(),
         dispatch=KernelDirectDispatch(),
-        policy=ExecutionPolicy(max_active_references=1, max_elapsed=0.03),
+        policy=ExecutionPolicy(max_active_references=1, max_elapsed=DEADLINE_BUDGET),
     )
 
-    assert isinstance(await anext(stream), KernelReferenceItem)
-    with pytest.raises(BudgetExceededError) as captured:
-        await asyncio.wait_for(anext(stream), timeout=0.15)
-    assert attached_report(captured.value) is stream.report
-    assert not closed.is_set()
-
-    release.set()
-    await asyncio.wait_for(closed.wait(), timeout=0.2)
+    try:
+        assert isinstance(await anext(stream), KernelReferenceItem)
+        with pytest.raises(BudgetExceededError) as captured:
+            await asyncio.wait_for(anext(stream), timeout=HANG_BOUND)
+        assert_fired_near_deadline(budget_started)
+        assert attached_report(captured.value) is stream.report
+        assert not closed.is_set()
+    finally:
+        release.set()
+    await reached(closed)
 
 
 @pytest.mark.asyncio
@@ -973,20 +1024,23 @@ async def test_late_reference_source_cleanup_error_does_not_reopen_the_published
             closed.set()
             raise RuntimeError("late reference close boom")
 
+    budget_started = deadline_started()
     stream = fan_out(
         Executor(ResponderTransport(lambda _request: {"result": {"ok": True}})),
         source(),
         dispatch=KernelDirectDispatch(),
-        policy=ExecutionPolicy(max_active_references=1, max_elapsed=0.03),
+        policy=ExecutionPolicy(max_active_references=1, max_elapsed=DEADLINE_BUDGET),
     )
-    assert isinstance(await anext(stream), KernelReferenceItem)
-    with pytest.raises(BudgetExceededError) as failed:
-        await anext(stream)
-    report = stream.report
-    assert attached_report(failed.value) is report
-
-    release.set()
-    await asyncio.wait_for(closed.wait(), timeout=0.2)
+    try:
+        assert isinstance(await anext(stream), KernelReferenceItem)
+        with pytest.raises(BudgetExceededError) as failed:
+            await asyncio.wait_for(anext(stream), timeout=HANG_BOUND)
+        assert_fired_near_deadline(budget_started)
+        report = stream.report
+        assert attached_report(failed.value) is report
+    finally:
+        release.set()
+    await reached(closed)
     # The report was published once, after the bounded cleanup; a repeated close changes nothing (§3.1).
     await stream.aclose()
     assert stream.report is report
@@ -1015,21 +1069,23 @@ async def test_blocking_sync_reference_pull_does_not_block_event_loop_or_deadlin
         def close(self) -> None:
             closed.set()
 
+    budget_started = deadline_started()
     stream = fan_out(
         Executor(ResponderTransport(lambda _request: {"result": {"ok": True}})),
         BlockingPull(),
         dispatch=KernelDirectDispatch(),
-        policy=ExecutionPolicy(max_active_references=1, max_elapsed=0.03),
+        policy=ExecutionPolicy(max_active_references=1, max_elapsed=DEADLINE_BUDGET),
     )
 
-    assert isinstance(await anext(stream), KernelReferenceItem)
-    started = asyncio.get_running_loop().time()
-    with pytest.raises(BudgetExceededError):
-        await asyncio.wait_for(anext(stream), timeout=PULL_TEST_TIMEOUT)
-    assert asyncio.get_running_loop().time() - started < PULL_TEST_TIMEOUT
-
-    release.set()
-    assert await asyncio.to_thread(closed.wait, 0.2)
+    try:
+        assert isinstance(await anext(stream), KernelReferenceItem)
+        # The second pull blocks until released, so only the deadline can end this wait.
+        with pytest.raises(BudgetExceededError):
+            await asyncio.wait_for(anext(stream), timeout=HANG_BOUND)
+        assert_fired_near_deadline(budget_started)
+    finally:
+        release.set()
+    assert await asyncio.to_thread(closed.wait, HANG_BOUND)
 
 
 @pytest.mark.asyncio
@@ -1381,53 +1437,49 @@ async def test_late_direct_response_after_suppressed_cancellation_cannot_commit_
     release = asyncio.Event()
     returned = asyncio.Event()
 
-    class CancellationResistantTransport:
-        host = "fixture.invalid"
+    async def resist_cancellation(_request: Request) -> object:
+        started.set()
+        try:
+            await asyncio.Future[None]()
+        except asyncio.CancelledError:
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+        returned.set()
+        return {"result": {"ok": True}}
 
-        async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-            del request, attempt_timeout, max_response_bytes
-            started.set()
-            try:
-                await asyncio.Future[None]()
-            except asyncio.CancelledError:
-                while not release.is_set():
-                    try:
-                        await release.wait()
-                    except asyncio.CancelledError:
-                        continue
-            returned.set()
-            body = json.dumps({"result": {"ok": True}}).encode()
-            return WireResponse(200, (("content-type", "application/json"),), body)
-
+    budget_started = deadline_started()
     stream = fan_out(
-        Executor(CancellationResistantTransport()),
+        Executor(ResponderTransport(resist_cancellation)),
         [_reference("a")],
         dispatch=KernelDirectDispatch(),
-        policy=ExecutionPolicy(max_elapsed=0.03),
+        policy=ExecutionPolicy(max_elapsed=DEADLINE_BUDGET),
     )
+    loop = asyncio.get_running_loop()
     task = asyncio.create_task(anext(stream))
-    await started.wait()
-    task.cancel()
-
-    async def safety_release() -> None:
-        await asyncio.sleep(0.2)
-        release.set()
-
-    safety = asyncio.create_task(safety_release())
-    started_at = asyncio.get_running_loop().time()
+    # A cleanup that ignored its deadline would wait for the send; this late release then fails the test
+    # instead of hanging it.
+    safety = loop.call_later(HANG_BOUND, release.set)
     try:
-        with pytest.raises(BudgetExceededError, match="reference task cleanup") as captured:
+        await reached(started)
+        task.cancel()
+        # The caller's cancellation leaves, not the cleanup that overran its window: that is recorded behind it.
+        with pytest.raises(asyncio.CancelledError):
             await task
+        # The cleanup gave up at the operation deadline, long before the safety release could end the send.
+        assert_fired_near_deadline(budget_started)
     finally:
         release.set()
         safety.cancel()
-        await asyncio.gather(safety, return_exceptions=True)
-    assert asyncio.get_running_loop().time() - started_at < CLEANUP_TEST_TIMEOUT
     frozen_report = stream.report
-    assert attached_report(captured.value) is frozen_report
+    assert frozen_report.state is KernelState.CANCELLED
+    assert [violation.code for violation in frozen_report.violations] == ["cleanup_failure"]
+    assert "CleanupOverrunError" in frozen_report.violations[0].message
     assert frozen_report.logical_pages == 0
 
-    await asyncio.wait_for(returned.wait(), timeout=0.2)
+    await reached(returned)
     for _ in range(10):
         await asyncio.sleep(0)
     snapshot = await stream._scheduler.context.snapshot()  # noqa: SLF001
@@ -1442,36 +1494,34 @@ async def test_primary_reference_failure_survives_secondary_cleanup_budget_failu
     slow_returned = asyncio.Event()
     release = asyncio.Event()
 
-    class CancellationResistantTransport:
-        host = "fixture.invalid"
+    async def resist_cancellation(request: Request) -> object:
+        if request.method == "bad":
+            await slow_started.wait()
+            return WireResponse(200, (), b"{")
+        slow_started.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+        slow_returned.set()
+        return {"result": {"ok": True}}
 
-        async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-            del attempt_timeout, max_response_bytes
-            if request.method == "bad":
-                await slow_started.wait()
-                return WireResponse(200, (), b"{")
-            slow_started.set()
-            while not release.is_set():
-                try:
-                    await release.wait()
-                except asyncio.CancelledError:
-                    continue
-            slow_returned.set()
-            body = json.dumps({"result": {"ok": True}}).encode()
-            return WireResponse(200, (("content-type", "application/json"),), body)
-
+    budget_started = deadline_started()
     stream = fan_out(
-        Executor(CancellationResistantTransport()),
+        Executor(ResponderTransport(resist_cancellation)),
         [
-            ReferenceRequest(Request("bad", route=RouteKind.BARE), "bad"),
+            # A SAFE read: its malformed answer is its failure itself, not an ambiguity around it.
+            ReferenceRequest(Request("bad", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), "bad"),
             ReferenceRequest(Request("slow", route=RouteKind.BARE), "slow"),
         ],
         dispatch=KernelDirectDispatch(concurrency=TWO_REFERENCES),
-        policy=ExecutionPolicy(max_active_references=TWO_REFERENCES, max_elapsed=0.04),
+        policy=ExecutionPolicy(max_active_references=TWO_REFERENCES, max_elapsed=DEADLINE_BUDGET),
     )
     try:
         with pytest.raises(ProtocolError, match="Malformed JSON response") as captured:
-            await anext(stream)
+            await asyncio.wait_for(anext(stream), timeout=HANG_BOUND)
+        assert_fired_near_deadline(budget_started)
     finally:
         release.set()
 
@@ -1481,7 +1531,7 @@ async def test_primary_reference_failure_survives_secondary_cleanup_budget_failu
     cleanup = [violation for violation in stream.report.violations if violation.code == "cleanup_failure"]
     assert len(cleanup) == 1
     assert cleanup[0].severity is ViolationSeverity.BLOCKING
-    await asyncio.wait_for(slow_returned.wait(), timeout=CLEANUP_TEST_TIMEOUT)
+    await reached(slow_returned)
 
 
 @pytest.mark.asyncio
@@ -1512,27 +1562,31 @@ async def test_closed_batch_worker_exits_after_transport_temporarily_resists_can
             ).encode()
             return WireResponse(200, (("content-type", "application/json"),), body)
 
+    budget_started = deadline_started()
     stream = fan_out(
         Executor(CancellationResistantTransport()),
         [_reference("a")],
         dispatch=KernelBatchDispatch(batch_size=1),
-        policy=ExecutionPolicy(max_elapsed=0.05),
+        policy=ExecutionPolicy(max_elapsed=DEADLINE_BUDGET),
     )
     task = asyncio.create_task(anext(stream))
-    await started.wait()
-    task.cancel()
+    try:
+        await reached(started)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=HANG_BOUND)
+        assert_fired_near_deadline(budget_started)
+        assert stream.report.state is KernelState.CANCELLED
+        assert [violation.code for violation in stream.report.violations] == ["cleanup_failure"]
 
-    with pytest.raises(BudgetExceededError) as captured:
-        await asyncio.wait_for(task, timeout=0.2)
-    assert attached_report(captured.value) is stream.report
-
-    dispatcher = stream._scheduler.dispatcher  # noqa: SLF001
-    worker = dispatcher._workers[1]  # type: ignore[union-attr]  # noqa: SLF001
-    assert worker is not None
-    assert not worker.done()
-    release.set()
+        dispatcher = stream._scheduler.dispatcher  # noqa: SLF001
+        worker = dispatcher._workers[1]  # type: ignore[union-attr]  # noqa: SLF001
+        assert worker is not None
+        assert not worker.done()
+    finally:
+        release.set()
     with contextlib.suppress(asyncio.CancelledError):
-        await asyncio.wait_for(asyncio.shield(worker), timeout=0.2)
+        await asyncio.wait_for(asyncio.shield(worker), timeout=HANG_BOUND)
     assert worker.done()
 
 
@@ -1585,7 +1639,7 @@ async def test_source_close_failure_does_not_skip_owned_resource_cleanup() -> No
 
 
 @pytest.mark.asyncio
-async def test_reference_iteration_cancellation_propagates_source_cleanup_error() -> None:
+async def test_reference_iteration_cancellation_outranks_a_source_cleanup_error() -> None:
     pulling = asyncio.Event()
 
     class RaisingCloseSource:
@@ -1613,36 +1667,30 @@ async def test_reference_iteration_cancellation_propagates_source_cleanup_error(
         policy=ExecutionPolicy(max_active_references=1),
     )
     assert isinstance(await anext(stream), KernelReferenceItem)
-    observed: list[tuple[str, object]] = []
+    observed: list[str] = []
     independent_transport = ResponderTransport(lambda _request: {"result": {"ok": True}})
 
     async def consume() -> None:
-        current = asyncio.current_task()
-        assert current is not None
         try:
             await anext(stream)
-        except RuntimeError as error:
-            observed.append((str(error), current.cancelling()))
-        try:
-            await Executor(independent_transport).execute(Request("independent", route=RouteKind.BARE))
         except asyncio.CancelledError as cancellation:
-            observed.append((str(cancellation), current.cancelling()))
-        while current.cancelling():
-            current.uncancel()
+            observed.append(str(cancellation))
+            raise
+        await Executor(independent_transport).execute(Request("independent", route=RouteKind.BARE))
 
     task = asyncio.create_task(consume())
     await pulling.wait()
     task.cancel("external-caller")
 
-    await task
-    assert observed == [("reference close boom", 1), ("external-caller", 1)]
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert observed == ["external-caller"]
     assert independent_transport.requests == []
-    assert stream.report.state is KernelState.FAILED
-    # The source close failure and the caller cancellation that arrived during cleanup are both
-    # secondary to the raised failure, as in every stream family (§3.1).
+    # The caller's cancellation came first, as in every stream family (§3.1): it is raised, and the failed close
+    # is recorded behind it.
+    assert stream.report.state is KernelState.CANCELLED
     assert [violation.message for violation in stream.report.violations] == [
-        "reference cleanup also failed (RuntimeError)",
-        "reference cleanup also failed (CancelledError)",
+        "stream cleanup also failed (RuntimeError)"
     ]
 
 
@@ -1674,16 +1722,18 @@ async def test_stalled_source_cleanup_is_bounded_after_owned_resources_close() -
             },
         }
 
+    budget_started = deadline_started()
     stream = fan_out(
         Executor(ResponderTransport(handler)),
         StalledCloseSource(),
         dispatch=KernelBatchDispatch(batch_size=1),
-        policy=ExecutionPolicy(max_active_references=1, max_elapsed=0.05),
+        policy=ExecutionPolicy(max_active_references=1, max_elapsed=DEADLINE_BUDGET),
     )
 
     assert isinstance(await anext(stream), KernelReferenceItem)
     with pytest.raises(BudgetExceededError, match="source cleanup") as captured:
-        await asyncio.wait_for(stream.aclose(), timeout=0.2)
+        await asyncio.wait_for(stream.aclose(), timeout=HANG_BOUND)
+    assert_fired_near_deadline(budget_started)
 
     assert attached_report(captured.value) is stream.report
     dispatcher = stream._scheduler.dispatcher  # noqa: SLF001
@@ -1715,24 +1765,26 @@ async def test_blocking_sync_source_close_does_not_block_event_loop_or_cleanup_d
             release_close.wait()
             close_finished.set()
 
+    budget_started = deadline_started()
     stream = fan_out(
         Executor(ResponderTransport(lambda _request: {"result": {"ok": True}})),
         BlockingCloseIterator(),
         dispatch=KernelDirectDispatch(),
-        policy=ExecutionPolicy(max_active_references=1, max_elapsed=0.05),
+        policy=ExecutionPolicy(max_active_references=1, max_elapsed=DEADLINE_BUDGET),
     )
 
-    assert isinstance(await anext(stream), KernelReferenceItem)
-    started = asyncio.get_running_loop().time()
-    with pytest.raises(BudgetExceededError, match="source cleanup") as captured:
-        await asyncio.wait_for(stream.aclose(), timeout=0.2)
-    elapsed = asyncio.get_running_loop().time() - started
-
-    assert elapsed < CLEANUP_TEST_TIMEOUT
-    assert attached_report(captured.value) is stream.report
-    assert stream._scheduler.buffer._closed  # noqa: SLF001
-    release_close.set()
-    assert await asyncio.to_thread(close_finished.wait, 0.2)
+    try:
+        assert isinstance(await anext(stream), KernelReferenceItem)
+        # close() blocks its worker thread until released, so only the cleanup deadline can end this
+        # close, and only a free event loop can run that deadline.
+        with pytest.raises(BudgetExceededError, match="source cleanup") as captured:
+            await asyncio.wait_for(stream.aclose(), timeout=HANG_BOUND)
+        assert_fired_near_deadline(budget_started)
+        assert attached_report(captured.value) is stream.report
+        assert stream._scheduler.buffer._closed  # noqa: SLF001
+    finally:
+        release_close.set()
+    assert await asyncio.to_thread(close_finished.wait, HANG_BOUND)
 
 
 def test_batch_reference_stream_construction_is_lazy_outside_an_event_loop() -> None:

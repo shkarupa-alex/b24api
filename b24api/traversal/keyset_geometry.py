@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 from dataclasses import dataclass, replace
+from fractions import Fraction
+from typing import TYPE_CHECKING
 
 from b24api.contracts.keyset_execution import (
     AutoKeysetExecution,
@@ -11,6 +13,10 @@ from b24api.contracts.keyset_execution import (
     RangeKeysetExecution,
 )
 from b24api.traversal.keyset_fast_plan import LaneBounds, LaneSpec, LaneState, plan_lanes_from_anchors
+from b24api.traversal.keyset_waves import IdentityRun, LaneShape, WaveRules, probe_waves, simulate_lanes, window_shapes
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 _MINIMUM_LANES = 2
 
@@ -56,28 +62,75 @@ class SelectorInputs:
     boundary: BoundaryFacts
     effective_page_cap: int
     batch_capacity: int
+    available_rows: int
     target_lanes: int
-    max_range_waves: int
     range_window_width: int | None
     completion: KeysetPageCompletion
     advisory_total: int | None
     descending: bool = False
+    remaining_requests: int | None = None
+    remaining_pages: int | None = None
+
+    @property
+    def head_rows(self) -> int:
+        """Return the rows of the boundary page output starts with, admitted before any body wave."""
+        return self.boundary.tail_rows if self.descending else self.boundary.head_rows
+
+    def body_rows(self, *, anchors: int) -> int:
+        """Return the rows the buffer leaves a plan's body waves beside the tail page and ``anchors`` anchors.
+
+        ``available_rows`` is what the buffer left beside both boundary pages; the head page drains
+        before the first body wave, the tail page and every retained anchor stay to the end.
+        """
+        return self.available_rows + self.head_rows - anchors
+
+    def probe_waves(self, probes: int) -> int | None:
+        """Return the waves ``probes`` anchor probes take beside the boundary pages, or ``None`` with no room."""
+        return probe_waves(
+            probes, capacity=self.batch_capacity, free_rows=self.available_rows, reserve=self.effective_page_cap
+        )
+
+    def fits(self, *, requests: int = 0, pages: int = 0) -> bool:
+        """Return whether ``requests`` and ``pages`` fit what is left of the operation budget."""
+        return (self.remaining_requests is None or requests <= self.remaining_requests) and (
+            self.remaining_pages is None or pages <= self.remaining_pages
+        )
+
+    def admit(self, estimate: CostEstimate) -> CostEstimate:
+        """Keep a fast plan eligible only if its minimum cost fits the operation budget left.
+
+        The minimum cost (``min_requests``, ``min_pages``) never extrapolates the interior density, so
+        an over-counted interior does not rule a plan out; a plan is refused only when it must fail.
+        """
+        fits = self.fits(requests=estimate.min_requests, pages=estimate.min_pages)
+        return replace(estimate, eligible=estimate.eligible and fits)
 
 
 @dataclass(frozen=True, slots=True)
 class CostEstimate:
-    """Deterministic physical-request cost estimate."""
+    """Deterministic physical-request and logical-page cost of one plan.
+
+    ``requests`` and ``pages`` come from running the body-wave rule over the plan's lanes at the
+    estimated rows (``keyset_waves.simulate_lanes``); an ineligible plan carries its minimum cost.
+    """
 
     kind: KeysetExecutionKind
     requests: int
     eligible: bool
+    pages: int = 0
+    # What the plan must spend whatever the interior holds; the budget check uses only these.
+    min_requests: int = 0
+    min_pages: int = 0
+    # Anchor probes still to send, counted in the estimate.
+    probes: int = 0
     window_width: int | None = None
     window_count: int | None = None
     lane_count: int | None = None
-    depth: int | None = None
-    rows_per_window: int | None = None
-    groups: int | None = None
-    planning_waves: int | None = None
+
+
+ANCHOR_PROBE_WAVES = 2
+# Every fast plan ends with one finish request, which reads the tail boundary's remainder.
+FINISH_REQUESTS = 1
 
 
 def ceil_div(numerator: int, denominator: int) -> int:
@@ -85,17 +138,184 @@ def ceil_div(numerator: int, denominator: int) -> int:
     return (numerator + denominator - 1) // denominator
 
 
+def _priced(
+    inputs: SelectorInputs,
+    estimate: CostEstimate,
+    shapes: tuple[LaneShape, ...],
+    *,
+    anchors: int,
+    request_limit: int,
+) -> CostEstimate:
+    """Price ``estimate`` by running the body-wave rule over ``shapes``, after its probes and before its finish.
+
+    The estimate's anchor probes (``probes``) go first, in their waves; ``anchors`` anchor
+    rows stay in the buffer beside the lanes. Range windows slide: no more of them are open than a
+    wave carries. A plan whose minimum cost does not fit the budget left, or whose body the buffer
+    cannot hold or that spends more requests than ``request_limit``, stays ineligible at its minimum cost.
+    """
+    admitted = inputs.admit(estimate)
+    if not admitted.eligible:
+        return admitted
+    # An eligible plan's probes fit the buffer (``partition_estimate``).
+    planning_waves = inputs.probe_waves(estimate.probes) or 0
+    rules = WaveRules(
+        inputs.effective_page_cap,
+        inputs.completion,
+        inputs.batch_capacity,
+        inputs.body_rows(anchors=anchors),
+    )
+    body = simulate_lanes(
+        shapes,
+        rules,
+        sliding=estimate.kind is KeysetExecutionKind.RANGE,
+        request_limit=max(0, request_limit - planning_waves - FINISH_REQUESTS),
+    )
+    if body is None:
+        return replace(admitted, eligible=False)
+    return replace(
+        admitted,
+        requests=planning_waves + body.requests + FINISH_REQUESTS,
+        pages=estimate.probes + body.pages + FINISH_REQUESTS,
+    )
+
+
+def range_estimate(
+    inputs: SelectorInputs,
+    density: BoundaryDensity,
+    runs: tuple[IdentityRun, ...],
+    *,
+    request_limit: int,
+) -> CostEstimate:
+    """Estimate the range windows the runtime builds at the boundary ``density``, as it reads them.
+
+    The windows are known before any of them is read: their count and width are exact. ``runs``
+    spread the interior's estimated rows over its identity values, in ascending order; each window
+    holds the rows of the values it spans. Every window is read at least once, at most
+    ``batch_capacity`` a wave.
+    """
+    span, numerator, denominator = density.span, density.numerator, density.denominator
+    width = range_window_width(
+        page_cap=inputs.effective_page_cap,
+        span=span,
+        density_numerator=numerator,
+        density_denominator=denominator,
+        explicit=inputs.range_window_width,
+    )
+    windows = ceil_div(span, width - 1) if span else 0
+    minimum = ceil_div(windows, max(1, inputs.batch_capacity)) + FINISH_REQUESTS
+    estimate = CostEstimate(
+        KeysetExecutionKind.RANGE,
+        minimum,
+        eligible=inputs.batch_capacity > 0,
+        pages=windows + FINISH_REQUESTS,
+        min_requests=minimum,
+        min_pages=windows + FINISH_REQUESTS,
+        window_width=width,
+        window_count=windows,
+    )
+    shapes = window_shapes(runs, step=width - 1)
+    return _priced(
+        inputs,
+        estimate,
+        shapes[::-1] if inputs.descending else shapes,
+        anchors=0,
+        request_limit=request_limit,
+    )
+
+
+def partition_estimate(
+    inputs: SelectorInputs,
+    shapes: tuple[LaneShape, ...],
+    *,
+    probes: int,
+    anchors: int,
+    request_limit: int,
+) -> CostEstimate:
+    """Estimate ``probes`` anchor probes still to send, then the lanes of ``shapes``, as the runtime reads them.
+
+    Every probe is a page, in the waves ``SelectorInputs.probe_waves`` gives; ``anchors`` anchor rows
+    stay in the buffer beside the lanes. The minimum cost is every probe, and one page for each lane:
+    all of them once the anchors are known (no probe left), only one while they come from probes still
+    to send.
+    """
+    capacity = max(1, inputs.batch_capacity)
+    lanes = sum(shape.count for shape in shapes)
+    planning_waves = inputs.probe_waves(probes)
+    known_lanes = 1 if probes else lanes
+    # Probes the buffer cannot carry leave the plan ineligible; its minimum then counts a wave a probe.
+    minimum = (probes if planning_waves is None else planning_waves) + ceil_div(known_lanes, capacity) + FINISH_REQUESTS
+    estimate = CostEstimate(
+        KeysetExecutionKind.PARTITIONED,
+        minimum,
+        eligible=inputs.batch_capacity > 0 and planning_waves is not None,
+        pages=probes + known_lanes + FINISH_REQUESTS,
+        min_requests=minimum,
+        min_pages=probes + known_lanes + FINISH_REQUESTS,
+        probes=probes,
+        lane_count=lanes,
+    )
+    return _priced(
+        inputs,
+        estimate,
+        shapes,
+        anchors=anchors,
+        request_limit=request_limit,
+    )
+
+
+def _uniform_partition(
+    inputs: SelectorInputs,
+    span: int,
+    interior_rows: int,
+    *,
+    probes: int,
+    request_limit: int,
+) -> CostEstimate:
+    """Estimate ``probes`` evenly spaced probes and the ``probes + 1`` lanes they leave, all alike."""
+    lanes = probes + 1
+    shape = LaneShape(ceil_div(interior_rows, lanes), ceil_div(span, lanes), lanes)
+    return partition_estimate(
+        inputs,
+        (shape,),
+        probes=probes,
+        anchors=probes,
+        request_limit=request_limit,
+    )
+
+
+def anchor_probe_count(
+    inputs: SelectorInputs,
+    span: int,
+    interior_rows: int,
+    *,
+    request_limit: int,
+) -> CostEstimate:
+    """Return the partition estimate of the probes automatic partitioning sends.
+
+    ``target_lanes`` probes, or as many as ``ANCHOR_PROBE_WAVES`` waves carry (no more than the
+    buffer retains beside one page) when the cost model prices those finer lanes cheaper and their
+    estimate fits what is left of the operation budget. Finer probes also measure the interior
+    finer: the plan chosen after them may well be another.
+    """
+    target = inputs.target_lanes
+    coarse = _uniform_partition(inputs, span, interior_rows, probes=target, request_limit=request_limit)
+    ceiling = min(inputs.batch_capacity * ANCHOR_PROBE_WAVES, inputs.available_rows - inputs.effective_page_cap)
+    if ceiling <= target:
+        return coarse
+    finer = _uniform_partition(inputs, span, interior_rows, probes=ceiling, request_limit=request_limit)
+    cheaper = finer.eligible and (not coarse.eligible or finer.requests < coarse.requests)
+    return finer if cheaper and inputs.fits(requests=finer.requests, pages=finer.pages) else coarse
+
+
 def selected_range_geometry(
     *,
     execution: RangeKeysetExecution | AutoKeysetExecution,
-    completion: KeysetPageCompletion,
     page_cap: int,
     density: BoundaryDensity,
 ) -> tuple[int, int]:
     """Return selected range width and count without materializing windows."""
     explicit = execution.window_width if isinstance(execution, RangeKeysetExecution) else execution.range_window_width
     width = range_window_width(
-        completion=completion,
         page_cap=page_cap,
         span=density.span,
         density_numerator=density.numerator,
@@ -128,77 +348,54 @@ def _geometry(inputs: SelectorInputs) -> tuple[int, int, int, int, int]:
 
 def estimates(
     inputs: SelectorInputs,
-    *,
-    finish_requests: int,
 ) -> tuple[CostEstimate, CostEstimate, CostEstimate, tuple[int, int, int, int, int]]:
-    """Compute every frozen candidate formula from integer observations."""
+    """Price sequential traversal, range windows and automatic partitioning from integer observations.
+
+    A fast plan that would spend more requests than sequential traversal is not priced further: it
+    stays ineligible.
+    """
     span, numerator, denominator, interior_rows, all_rows = _geometry(inputs)
-    cap, capacity = inputs.effective_page_cap, inputs.batch_capacity
-    admitted_head_rows = inputs.boundary.tail_rows if inputs.descending else inputs.boundary.head_rows
-    sequential = CostEstimate(
-        KeysetExecutionKind.SEQUENTIAL,
-        max(1, ceil_div(max(0, all_rows - admitted_head_rows), cap)) + finish_requests,
-        eligible=True,
-    )
-    if capacity < 1:
+    sequential = sequential_estimate(inputs, all_rows)
+    geometry = (span, numerator, denominator, interior_rows, all_rows)
+    if inputs.batch_capacity < 1:
         unavailable = CostEstimate(KeysetExecutionKind.RANGE, 0, eligible=False)
         partition = CostEstimate(KeysetExecutionKind.PARTITIONED, 0, eligible=False)
-        return sequential, unavailable, partition, (span, numerator, denominator, interior_rows, all_rows)
-    width = range_window_width(
-        completion=inputs.completion,
-        page_cap=cap,
-        span=span,
-        density_numerator=numerator,
-        density_denominator=denominator,
-        explicit=inputs.range_window_width,
+        return sequential, unavailable, partition, geometry
+    windows = range_estimate(
+        inputs,
+        BoundaryDensity(span, numerator, denominator),
+        (IdentityRun(span, Fraction(interior_rows, span)),) if span else (),
+        request_limit=sequential.requests,
     )
-    windows = (span + width - 2) // (width - 1) if span else 0
-    rows_per_window = ceil_div((width - 1) * numerator, denominator)
-    range_depth = max(1, ceil_div(rows_per_window, cap)) + int(
-        inputs.completion is KeysetPageCompletion.EMPTY_CONFIRMATION,
+    partition = anchor_probe_count(
+        inputs,
+        span,
+        interior_rows,
+        request_limit=sequential.requests,
     )
-    groups = ceil_div(windows, capacity) if windows else 0
-    range_estimate = CostEstimate(
-        KeysetExecutionKind.RANGE,
-        groups * range_depth + finish_requests,
-        groups * range_depth <= inputs.max_range_waves,
-        width,
-        windows,
-        None,
-        range_depth,
-        rows_per_window,
-        groups,
-        0,
-    )
-    lanes = min(inputs.target_lanes, max(1, ceil_div(interior_rows, cap)))
-    partition_depth = max(1, ceil_div(interior_rows, lanes * cap))
-    planning_waves = max(1, ceil_div(inputs.target_lanes, capacity))
-    partition = CostEstimate(
-        KeysetExecutionKind.PARTITIONED,
-        planning_waves + ceil_div(lanes, capacity) * partition_depth + finish_requests,
-        eligible=True,
-        lane_count=lanes,
-        depth=partition_depth,
-        groups=ceil_div(lanes, capacity),
-        planning_waves=planning_waves,
-    )
-    return sequential, range_estimate, partition, (span, numerator, denominator, interior_rows, all_rows)
+    return sequential, windows, partition, geometry
 
 
-def range_window_width(  # noqa: PLR0913
+def sequential_estimate(inputs: SelectorInputs, all_rows: int) -> CostEstimate:
+    """Estimate sequential traversal of ``all_rows`` rows past the boundary page already admitted."""
+    requests = max(1, ceil_div(max(0, all_rows - inputs.head_rows), inputs.effective_page_cap)) + FINISH_REQUESTS
+    return CostEstimate(KeysetExecutionKind.SEQUENTIAL, requests, eligible=True, pages=requests)
+
+
+def range_window_width(
     *,
-    completion: KeysetPageCompletion,
     page_cap: int,
     span: int,
     density_numerator: int,
     density_denominator: int,
     explicit: int | None,
 ) -> int:
-    """Return the frozen integer-only width formula used by range planning."""
+    """Return the integer-only window width: a page of rows at the measured density, unless explicit.
+
+    A window spans at least a page of identity values, so a dense window closes on its one page.
+    """
     if explicit is not None:
         return explicit
-    if completion is KeysetPageCompletion.EMPTY_CONFIRMATION:
-        return max(2, min(page_cap, span + 1))
     density_width = page_cap * density_denominator // max(1, density_numerator)
     return max(2, min(max(density_width, page_cap), span + 1))
 
@@ -257,7 +454,12 @@ def descending_closure_witness(
 
 
 def anchor_guesses(*, lo: int, upper_exclusive: int, target_lanes: int) -> tuple[int, ...]:
-    """Return the exact deduplicated integer-floor anchor guesses."""
+    """Return the exact deduplicated integer-floor anchor guesses.
+
+    ``target_lanes`` guesses split the interior into ``target_lanes`` equal identity ranges, the first
+    at ``lo``: its probe finds the first interior identity and samples the rows above it, and the
+    lane below that identity is known empty, so it costs no request.
+    """
     if any(not isinstance(value, int) or isinstance(value, bool) for value in (lo, upper_exclusive, target_lanes)):
         raise TypeError("anchor guess operands must be exact integers")
     if target_lanes < _MINIMUM_LANES:
@@ -279,9 +481,19 @@ def partition_lane_specs(
     upper_exclusive: int,
     anchors: tuple[int, ...],
     descending: bool,
+    empty_below: Mapping[int, int],
 ) -> tuple[LaneSpec, ...]:
-    """Plan partition lanes between the boundary fences in output order."""
-    specs = plan_lanes_from_anchors(lo=lo, upper_exclusive=upper_exclusive, anchors=anchors)
+    """Plan partition lanes between the boundary fences in output order.
+
+    ``empty_below`` maps a fence to the lowest guess of a probe that found it: a lane whose lower
+    fence is at or above that guess holds no identity and is ``known_empty``.
+    """
+    specs = tuple(
+        replace(spec, known_empty=empty_below.get(upper, upper) <= lower)
+        if (lower := spec.bounds.lower_exclusive) is not None and (upper := spec.bounds.upper_exclusive) is not None
+        else spec
+        for spec in plan_lanes_from_anchors(lo=lo, upper_exclusive=upper_exclusive, anchors=anchors)
+    )
     if not descending:
         return specs
     return tuple(
@@ -296,18 +508,23 @@ def partition_lane_specs(
 
 
 __all__ = [
+    "ANCHOR_PROBE_WAVES",
     "BoundaryDensity",
     "BoundaryFacts",
     "CostEstimate",
     "SelectorInputs",
     "anchor_guesses",
+    "anchor_probe_count",
     "boundary_density",
     "ceil_div",
     "closure_witness",
     "descending_closure_witness",
     "estimates",
     "normalize_anchors",
+    "partition_estimate",
     "partition_lane_specs",
+    "range_estimate",
     "range_window_width",
     "selected_range_geometry",
+    "sequential_estimate",
 ]

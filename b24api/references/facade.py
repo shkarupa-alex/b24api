@@ -29,7 +29,7 @@ from b24api.contracts.reference import (
 )
 from b24api.contracts.report import KeysetSelectionSummary, TraversalAssurance
 from b24api.contracts.request import (
-    IdentitySpec,
+    ReplaySafety,
     Request,
     RequestLike,
     ResultSelector,
@@ -47,14 +47,14 @@ from b24api.contracts.traversal import (
     TraversalSpec,
 )
 from b24api.errors import (
-    AmbiguousExecutionError,
-    B24ApiError,
     CapabilityError,
     IncompleteTraversalError,
     PageAdaptationError,
     PaginationError,
     ReferenceFailed,
 )
+from b24api.execution.facts import ambiguity_of
+from b24api.execution.failure import outcome_error
 from b24api.references.binding import BindingSource, _BindingContext, _BindingSourceError, binding_source
 from b24api.references.compatibility import source_incompatibility
 from b24api.references.dispatch import (
@@ -66,14 +66,12 @@ from b24api.references.outcome import KernelReferenceFailure, KernelReferenceIte
 from b24api.references.program import FastKeysetProgram
 from b24api.references.stream import iter_references as _iter_references
 from b24api.traversal.driver import PaginationDriver
-from b24api.traversal.facade_support import _collection_selector, _cursor_page_contract, declared_traversal_plan
+from b24api.traversal.facade_support import _collection_selector, cursor_traversal_plan, declared_traversal_plan
 from b24api.traversal.keyset_eligibility import _effective_cap, validate_fast_keyset
 from b24api.traversal.offset_rules import sequential_offset_plan
 from b24api.traversal.plans import (
     CountedOffsetMode,
     CountedOffsetPlan,
-    CursorTerminalRule,
-    ItemCursorPlan,
     KeysetPlan,
     KeysetTerminalRule,
     ListPlan,
@@ -86,6 +84,7 @@ if TYPE_CHECKING:
     from b24api.contracts.report import OperationReport, Violation
     from b24api.contracts.stream import OperationStream
     from b24api.execution import Executor
+    from b24api.execution.context import ExecutionContext
     from b24api.execution.snapshot import KernelReport
 
 type KernelReferenceEvent = KernelReferenceItem | KernelReferenceFailure | _KernelReferenceComplete
@@ -97,6 +96,17 @@ class ReferenceKernelStream(Protocol):
 
     report: KernelReport
     active_references_high_water: int
+    works_between_reads: bool
+
+    @property
+    def operation_context(self) -> ExecutionContext:
+        """Return the operation context."""
+        ...
+
+    @property
+    def cleanup_failure(self) -> BaseException | None:
+        """Return the cleanup failure the stream raised as its end."""
+        ...
 
     def __aiter__(self) -> Self:
         """Return this iterator."""
@@ -244,37 +254,7 @@ def preflight_fast_keyset(
 
 
 def _cursor_kernel_plan(traversal: CursorTraversal) -> tuple[ListPlan, TraversalIdentity | None]:
-    cursor_mechanics = traversal.cursor
-    direction = _direction(cursor_mechanics.direction)
-    page_order, order_semantics = _cursor_page_contract(cursor_mechanics)
-    identity = traversal.identity
-    if identity is None:
-        identity = IdentitySpec(
-            item_path=cursor_mechanics.item_path,
-            filter_key="cursor",
-            order_key="cursor",
-            coercion=cursor_mechanics.coercion,
-        )
-    return (
-        ItemCursorPlan(
-            cursor_request_path=cursor_mechanics.parameter_path,
-            cursor_item_path=cursor_mechanics.item_path,
-            cursor_coercion=cursor_mechanics.coercion,
-            direction=direction,
-            cursor_take=cursor_mechanics.take,
-            limit_path=cursor_mechanics.limit_path,
-            requested_page_size=traversal.page_size if cursor_mechanics.limit_path is not None else None,
-            terminal=CursorTerminalRule.EMPTY_CONFIRMATION,
-            allow_create_controls=cursor_mechanics.allow_create_controls,
-            domain=cursor_mechanics.domain,
-            identity_requirement=IdentityRequirement.REQUIRED,
-            order_semantics=order_semantics,
-            duplicate_policy=DuplicatePolicy.ERROR,
-            page_order=page_order,
-            response_terminal=cursor_mechanics.continuation,
-        ),
-        identity,
-    )
+    return cursor_traversal_plan(traversal.cursor, traversal.identity, page_size=traversal.page_size)
 
 
 def _reference_page_cap(traversal: TraversalSpec) -> int:
@@ -315,7 +295,21 @@ class _ReferenceEventMapper:
         self._item_indexes.pop(context.index, None)
         if event.not_executed_reason is not None:
             return ReferenceNotExecuted(context.index, context.correlation, event.not_executed_reason)
-        error = event.error if isinstance(event.error, B24ApiError) else CapabilityError("reference failed")
+        error = outcome_error(event.error, "reference failed")
+        # The variant follows the execution facts of the page that failed, as for a fan-out command.
+        ambiguity = ambiguity_of(
+            error,
+            request_summary=error.request_summary or event.request.summary,
+            declared_unsafe=event.replay_safety is ReplaySafety.UNSAFE,
+        )
+        if ambiguity is not None:
+            return ReferenceOutcomeUnknown(
+                context.index,
+                context.correlation,
+                ambiguity,
+                event.partial_rows,
+                event.replay_disposition,
+            )
         application_failure = isinstance(error, PageAdaptationError) and event.partial_rows == 0
         if isinstance(error, PaginationError) or (
             isinstance(error, CapabilityError) and event.page_state > 0 and not application_failure
@@ -328,14 +322,6 @@ class _ReferenceEventMapper:
                 replay_disposition=event.replay_disposition,
             )
             error.__cause__ = incomplete_cause
-        if isinstance(error, AmbiguousExecutionError):
-            return ReferenceOutcomeUnknown(
-                context.index,
-                context.correlation,
-                error,
-                event.partial_rows,
-                event.replay_disposition,
-            )
         return ReferenceFailure(
             context.index,
             context.correlation,
@@ -430,7 +416,7 @@ def kernel_reference_stream[C](
     fast, keyset_selection = _keyset_program(traversal, page_stop)
     if fast is not None:
         preflight_fast_keyset(executor, base, fast, policy)
-    dispatch_plan = kernel_dispatch(dispatch, policy)
+    dispatch_plan = kernel_dispatch(dispatch, client_concurrency=executor.coordinator.max_concurrency)
     stream = _iter_references(
         executor,
         binding_source(base, bindings, traversal, audit),

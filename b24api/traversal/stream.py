@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from b24api.contracts.identity_store import IdentityStore
     from b24api.contracts.request import Request, ResultSelector, TraversalIdentity
     from b24api.execution import Executor
+    from b24api.execution.context import ExecutionContext
     from b24api.traversal.identity import _Page
     from b24api.traversal.plans import (
         ListPlan,
@@ -59,6 +60,9 @@ _IDENTITY_PAGE_ADAPTER = IdentityPageAdapter()
 
 class ItemStream(AsyncIterator[JsonValue]):
     """Lazy item traversal stream with deterministic cleanup and final report."""
+
+    # Every page is read inside a read; nothing runs between reads.
+    works_between_reads = False
 
     def __init__(  # noqa: PLR0913
         self,
@@ -129,6 +133,16 @@ class ItemStream(AsyncIterator[JsonValue]):
     def __aiter__(self) -> Self:
         """Return this asynchronous iterator."""
         return self
+
+    @property
+    def operation_context(self) -> ExecutionContext:
+        """Return the operation context whose elapsed budget bounds the wrapper's cleanup."""
+        return self._context
+
+    @property
+    def cleanup_failure(self) -> BaseException | None:
+        """Return the cleanup failure this stream raised as its end (``OperationRunner.cleanup_failure``)."""
+        return self._runner.cleanup_failure
 
     @property
     def completion_gate(self) -> object:
@@ -268,7 +282,7 @@ class ItemStream(AsyncIterator[JsonValue]):
                 terminal_reason=self._driver.terminal_reason,
                 qualified_total=self._driver.expected_total,
             )
-        self.report = with_cleanup_attempt(self.report, cause, attempt, subject="pagination")
+        self.report = with_cleanup_attempt(self.report, cause, attempt)
         if self._completion is not None:
             failed = cleanup_failed(cause, attempt)
             self._completion.cleanup(CleanupState.FAILURE if failed else CleanupState.SUCCESS)
@@ -277,7 +291,7 @@ class ItemStream(AsyncIterator[JsonValue]):
     def _failure_report(self, cause: TerminalCause, reason: str, attempt: CleanupAttempt) -> KernelReport:
         # The finalizer raised: publish the fallback as this kernel's report and close its completion gate,
         # so a public adapter over it can still publish its one FAILED report.
-        self.report = failed_kernel_report(cause, reason, attempt, subject="pagination")
+        self.report = failed_kernel_report(cause, reason, attempt)
         if self._completion is not None:
             self._completion.gate.close_after_failure(
                 CleanupState.FAILURE if cleanup_failed(cause, attempt) else CleanupState.SUCCESS

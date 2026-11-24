@@ -1,12 +1,18 @@
 """Package import graph: runtime layers form a DAG, and type-only cycles only shrink.
 
 The runtime graph holds every import executed when its code runs, top-level and function-local
-alike, and leaves out ``if TYPE_CHECKING:`` blocks. The full graph adds those blocks back. Each
-failing assertion prints the offending edges or cycles.
+alike: absolute and relative ``import`` statements, imports from the root ``b24api`` facade, and
+``importlib.import_module`` with a literal name (a dynamic import with any other argument fails the
+suite, since the graph cannot follow it). It leaves out ``if TYPE_CHECKING:`` blocks (bare or as
+``typing.TYPE_CHECKING``); the full graph adds those blocks back. Importing a submodule is an edge to
+that submodule only: the implicit initialization of its parent packages is not an edge, because
+a package that re-exports its submodules is not a cycle. Each failing assertion prints the offending
+edges or cycles.
 """
 
 from __future__ import annotations
 import ast
+import importlib.util
 from functools import cache
 from pathlib import Path
 
@@ -27,6 +33,7 @@ LAYERS = (
     "references",
     "testing",
     "client",
+    "facade",
     "cli",
 )
 # Files directly under ``b24api/``; files inside a package inherit the package's layer.
@@ -35,6 +42,7 @@ _ROOT_FILE_LAYERS = {
     "encoding.py": "leaf",
     "migration.py": "leaf",
     "settings.py": "leaf",
+    "_webhook.py": "leaf",
     "redaction.py": "redaction",
     "_diagnostics.py": "redaction",
     "errors.py": "errors",
@@ -43,9 +51,9 @@ _ROOT_FILE_LAYERS = {
     "client.py": "client",
     "cli.py": "cli",
     "cli_contract.py": "cli",
+    # The root facade re-exports the public surface: only the CLI, above it, may import from it.
+    "__init__.py": "facade",
 }
-# The root ``b24api/__init__.py`` is the public aggregator, outside every layer.
-_AGGREGATOR = "b24api"
 
 # Only the client composes reference traversal; no lower layer reaches into it.
 _REFERENCES_IMPORTERS = {"b24api.client"}
@@ -70,27 +78,53 @@ def _layer(module: str) -> str:
     return _ROOT_FILE_LAYERS.get(relative.name, "unassigned")
 
 
-def _targets(tree: ast.AST, module: str, *, type_only: bool) -> frozenset[str]:
+def _is_type_checking(test: ast.expr) -> bool:
+    return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+        isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+    )
+
+
+def _dynamic_import(node: ast.AST) -> ast.Call | None:
+    """Return a call of ``importlib.import_module``, ``import_module`` or ``__import__``."""
+    if not isinstance(node, ast.Call):
+        return None
+    function = node.func
+    name = function.attr if isinstance(function, ast.Attribute) else getattr(function, "id", None)
+    return node if name in {"import_module", "__import__"} else None
+
+
+def _literal_name(call: ast.Call) -> str | None:
+    first = call.args[0] if call.args else None
+    return first.value if isinstance(first, ast.Constant) and isinstance(first.value, str) else None
+
+
+def _targets(tree: ast.AST, module: str, *, type_only: bool, package: bool = False) -> frozenset[str]:
     guarded = {
         id(child)
         for node in ast.walk(tree)
-        if isinstance(node, ast.If) and isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING"
+        if isinstance(node, ast.If) and _is_type_checking(node.test)
         for statement in node.body
         for child in ast.walk(statement)
     }
     modules = _modules()
+    anchor = module if package else module.rpartition(".")[0]
     found: set[str] = set()
     for node in ast.walk(tree):
         if (id(node) in guarded) is not type_only:
             continue
         if isinstance(node, ast.Import):
             found.update(alias.name for alias in node.names if alias.name in modules)
-        elif isinstance(node, ast.ImportFrom) and node.module is not None and node.module in modules:
+        elif isinstance(node, ast.ImportFrom):
+            source = importlib.util.resolve_name("." * node.level + (node.module or ""), anchor)
+            if source not in modules:
+                continue
             # ``from package import submodule`` depends on the submodule, not only on the package.
             for alias in node.names:
-                submodule = f"{node.module}.{alias.name}"
-                found.add(submodule if submodule in modules else node.module)
-    return frozenset(found - {module, _AGGREGATOR})
+                submodule = f"{source}.{alias.name}"
+                found.add(submodule if submodule in modules else source)
+        elif (call := _dynamic_import(node)) is not None and _literal_name(call) in modules:
+            found.add(str(_literal_name(call)))
+    return frozenset(found - {module})
 
 
 @cache
@@ -98,11 +132,10 @@ def _graphs() -> tuple[Graph, Graph]:
     runtime: Graph = {}
     full: Graph = {}
     for module, path in _modules().items():
-        if module == _AGGREGATOR:
-            continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        runtime[module] = _targets(tree, module, type_only=False)
-        full[module] = runtime[module] | _targets(tree, module, type_only=True)
+        package = path.name == "__init__.py"
+        runtime[module] = _targets(tree, module, type_only=False, package=package)
+        full[module] = runtime[module] | _targets(tree, module, type_only=True, package=package)
     return runtime, full
 
 
@@ -202,3 +235,70 @@ def test_graph_counts_function_local_imports_and_separates_type_only_ones() -> N
         ("a", "b"),
         ("b", "c"),
     }
+
+
+def _unfollowed_dynamic_imports(tree: ast.AST) -> list[int]:
+    """Return the lines of dynamic imports the graph cannot follow: a name that is not an absolute literal."""
+    return sorted(
+        call.lineno
+        for node in ast.walk(tree)
+        if (call := _dynamic_import(node)) is not None
+        and ((name := _literal_name(call)) is None or name.startswith(".") or len(call.args) > 1)
+    )
+
+
+def test_every_dynamic_import_names_its_module_literally() -> None:
+    unfollowed = [
+        f"{path.relative_to(ROOT)}:{line}"
+        for path in _modules().values()
+        for line in _unfollowed_dynamic_imports(ast.parse(path.read_text(encoding="utf-8")))
+    ]
+    assert not unfollowed, f"the import graph cannot follow these dynamic imports: {unfollowed}"
+
+
+def test_a_dynamic_import_the_graph_cannot_follow_is_flagged() -> None:
+    tree = ast.parse(
+        "import importlib\n"
+        "name = 'b24api.client'\n"
+        "importlib.import_module('b24api.migration')\n"
+        "importlib.import_module(name)\n"
+        "importlib.import_module('.client', 'b24api')\n"
+        "__import__(name)\n"
+    )
+
+    assert _unfollowed_dynamic_imports(tree) == [4, 5, 6]
+
+
+def test_graph_resolves_relative_facade_dynamic_and_qualified_type_checking_imports() -> None:
+    tree = ast.parse(
+        "import importlib\n"
+        "import typing\n"
+        "from b24api import Bitrix24\n"
+        "from . import stream\n"
+        "from .engine import run\n"
+        "from ..contracts import report\n"
+        "if typing.TYPE_CHECKING:\n"
+        "    from ..errors import B24ApiError\n"
+        "def load():\n"
+        "    return importlib.import_module('b24api.migration')\n",
+    )
+    module = "b24api.batch.logical"
+    assert _targets(tree, module, type_only=False) == {
+        "b24api",
+        "b24api.batch.stream",
+        "b24api.batch.engine",
+        "b24api.contracts.report",
+        "b24api.migration",
+    }
+    assert _targets(tree, module, type_only=True) == {"b24api.errors"}
+    # In a package's own ``__init__``, one leading dot names the package itself.
+    assert _targets(ast.parse("from .engine import run\n"), "b24api.batch", type_only=False, package=True) == {
+        "b24api.batch.engine"
+    }
+
+
+def test_a_lower_layer_importing_from_the_root_facade_is_an_upward_edge() -> None:
+    assert _layer("b24api") == "facade"
+    assert LAYERS.index("facade") > LAYERS.index("client")
+    assert LAYERS.index("facade") < LAYERS.index("cli")
+    assert "b24api" in _graphs()[0]["b24api.cli"]

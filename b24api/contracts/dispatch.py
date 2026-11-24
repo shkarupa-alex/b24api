@@ -7,6 +7,8 @@ from enum import StrEnum
 
 # The Bitrix portal accepts at most 50 commands in one physical batch; every layer reads this constant.
 PORTAL_BATCH_CAP = 50
+# The Bitrix portal answers one list page with at most 50 rows.
+PORTAL_PAGE_ROWS = 50
 
 
 class DeliveryOrder(StrEnum):
@@ -24,7 +26,12 @@ def _positive_plain_integer(value: object, name: str) -> int:
 
 @dataclass(frozen=True, slots=True)
 class DirectDispatch:
-    """Bounded independent direct requests."""
+    """Bounded independent direct requests.
+
+    ``concurrency`` is a ceiling of this operation alone: the requests in flight are also bounded by the
+    policy (``max_direct_concurrency`` and ``max_active_references``, for references and fan-out alike) and by
+    ``Settings.max_concurrent_requests``, which the client's operations share; the smallest applies.
+    """
 
     concurrency: int = 10
     output_order: DeliveryOrder = DeliveryOrder.READY
@@ -38,7 +45,22 @@ class DirectDispatch:
 
 @dataclass(frozen=True, slots=True)
 class BatchDispatch:
-    """Bounded independent physical Bitrix batch requests."""
+    """Bounded independent physical Bitrix batch requests.
+
+    ``concurrency`` is a ceiling of this operation alone: the batches in flight are also bounded by the policy's
+    ``max_active_references`` and by ``Settings.max_concurrent_requests``, which the client's operations share;
+    the smallest applies. ``ExecutionPolicy.max_direct_concurrency`` does not limit them. The commands a REST 3.0
+    isolation re-sends alone go one at a time, within the slot of the batch they were in. A batch holds at most
+    ``batch_size`` commands and at most the policy's ``max_buffered_commands``: the smaller applies. A fan-out divides
+    ``max_buffered_rows`` among the commands of every batch it may keep in flight (that batch size times the smallest
+    concurrency limit, at most ``max_active_references``), so a wider ``concurrency`` gives each command a smaller
+    result limit: 312 rows under ``batch_size=1, concurrency=8``. While the budget holds a full 50-row portal page per
+    command of one batch, the limit never drops below a page: the row budget then holds back the batches beyond it, so
+    the defaults, ``concurrency=2`` and ``batch_size=20, concurrency=4`` all keep 50 rows. ``coalesce_wait`` bounds
+    how long an underfilled batch waits for commands that fit; one whose commands fit only once a batch in flight
+    lands waits for that landing instead, which sends fewer, fuller batches at the cost of an idle slot.
+    ``coalesce_wait=0`` sends every batch at once.
+    """
 
     batch_size: int = PORTAL_BATCH_CAP
     concurrency: int = 1

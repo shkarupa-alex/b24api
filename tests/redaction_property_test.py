@@ -351,7 +351,7 @@ def test_settings_token_equal_to_a_known_code_is_redacted_through_the_cli(monkey
     body = {"error": {"code": METHOD_NOT_FOUND_ERROR_CODE, "message": "missing", "validation": []}}
     response = WireResponse(404, (("content-type", "application/json"),), json.dumps(body).encode())
     transport = ScriptedTransport((ScriptedExchange(request, response),))
-    monkeypatch.setattr(cli, "Bitrix24", lambda: Bitrix24(settings_value, transport=transport))
+    monkeypatch.setattr(cli, "_open_client", lambda: Bitrix24(settings_value, transport=transport))
     stderr = io.StringIO()
 
     code = cli.main(
@@ -378,7 +378,7 @@ def test_known_code_stays_diagnosable_through_client_and_cli(monkeypatch: pytest
 
     assert VALIDATION_ERROR_CODE in _error_channels(asyncio.run(run()))
     transport = ScriptedTransport((ScriptedExchange(request, response),))
-    monkeypatch.setattr(cli, "Bitrix24", lambda: Bitrix24(settings_value, transport=transport))
+    monkeypatch.setattr(cli, "_open_client", lambda: Bitrix24(settings_value, transport=transport))
     stderr = io.StringIO()
     assert cli.main(["call", "profile", "--route", "api_v3", "--replay-safety", "safe"], stderr=stderr) == _CORRECTNESS
     assert VALIDATION_ERROR_CODE in stderr.getvalue()

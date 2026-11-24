@@ -1,20 +1,28 @@
 """Credential-safe v2 settings behavior."""
 
 from __future__ import annotations
+import asyncio
+import copy
 import dataclasses
 import json
+import math
 import pickle
 from pathlib import Path
 
+import httpx
 import pytest
 from pydantic import ValidationError
 
-from b24api import Bitrix24, ExecutionPolicy, Request, RouteKind, Settings
+import b24api.client
+from b24api import Bitrix24, DirectDispatch, ExecutionPolicy, ReplaySafety, Request, RouteKind, Settings
+from b24api.contracts import Command
 from b24api.settings import api_settings
-from b24api.transport import WireResponse
+from b24api.transport import HttpxTransport, WireResponse
+from tests.scripting import ResponderTransport, on_loop, reached
 
 _WEBHOOK = "https://bitrix24.com/rest/0/test/"
 _TIMEOUT = 17.5
+_DEFAULT_TIMEOUT = 30.0
 
 
 def _assert_traceback_excludes(error: BaseException, value: str, *, test_file: Path) -> None:
@@ -28,7 +36,7 @@ def _assert_traceback_excludes(error: BaseException, value: str, *, test_file: P
 def test_settings_contains_only_credential_and_transport_configuration() -> None:
     settings = Settings(webhook_url=_WEBHOOK, http_timeout=_TIMEOUT)
 
-    assert set(type(settings).model_fields) == {"webhook_url", "http_timeout"}
+    assert set(type(settings).model_fields) == {"webhook_url", "http_timeout", "max_concurrent_requests"}
     assert settings.http_timeout == _TIMEOUT
     with pytest.raises(ValidationError, match="Unknown Settings field"):
         Settings(webhook_url=_WEBHOOK, batch_size=50)
@@ -45,12 +53,39 @@ def test_settings_redacts_webhook_from_all_public_representations() -> None:
         repr(list(settings)),
         repr(settings.model_dump()),
         settings.model_dump_json(),
-        repr(settings.__getstate__()),
-        repr(pickle.dumps(settings)),
     )
 
     assert all(credential not in surface for surface in surfaces)
     assert credential in str(settings.webhook_url)
+
+
+def test_settings_refuse_pickling_instead_of_yielding_a_copy_without_the_webhook() -> None:
+    credential = "n1x2y3z4q5w6e7r8"
+    settings = Settings(webhook_url=f"https://example.invalid/rest/1/{credential}/")
+
+    with pytest.raises(TypeError, match="cannot be pickled") as refused:
+        pickle.dumps(settings)
+
+    assert credential not in str(refused.value)
+    # A copy in this process keeps the credential, so it is still a working Settings.
+    assert copy.deepcopy(settings).webhook_url == settings.webhook_url
+
+
+def test_the_library_never_reads_a_dotenv_file_from_the_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credential = "n1x2y3z4q5w6e7r8"
+    webhook = f"https://dotenv.invalid/rest/1/{credential}/"
+    (tmp_path / ".env").write_text(
+        f"BITRIX24_API_WEBHOOK_URL={webhook}\nBITRIX24_API_HTTP_TIMEOUT=7\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("BITRIX24_API_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("BITRIX24_API_HTTP_TIMEOUT", raising=False)
+
+    with pytest.raises(ValidationError, match="webhook_url"):
+        Settings()
+    assert Settings(webhook_url=_WEBHOOK).http_timeout == 30.0  # noqa: PLR2004 - the documented default
 
 
 @pytest.mark.parametrize("entrypoint", ["constructor", "api", "mapping", "json", "strings"])
@@ -98,13 +133,27 @@ async def test_environment_loading_and_explicit_settings_select_the_expected_hos
 
 
 @pytest.mark.asyncio
-async def test_settings_timeout_becomes_the_default_per_request_elapsed_ceiling() -> None:
+async def test_settings_timeout_bounds_each_attempt_of_the_owned_transport_and_no_policy() -> None:
+    # The timeout bounds each attempt of the client's own HTTPX transport, and no policy
+    # (tests/internal/client_factories_test.py).
     client = Bitrix24(Settings(webhook_url=_WEBHOOK, http_timeout=_TIMEOUT))
 
     try:
-        assert client._default_policy.max_retry_elapsed_per_request == _TIMEOUT  # noqa: SLF001 - composition proof
+        owned = client._owned_transport  # noqa: SLF001 - composition proof
+        assert owned is not None
+        assert owned.timeout == _TIMEOUT
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_the_default_attempt_timeout_is_thirty_seconds_for_the_transport_and_the_settings() -> None:
+    transport = HttpxTransport(_WEBHOOK)
+    try:
+        assert transport.timeout == _DEFAULT_TIMEOUT
+    finally:
+        await transport.aclose()
+    assert Settings(webhook_url=_WEBHOOK).http_timeout == _DEFAULT_TIMEOUT
 
 
 class _RecordingTransport:
@@ -124,19 +173,13 @@ class _RecordingTransport:
         return None
 
 
-def test_policy_from_settings_is_the_library_default_with_the_settings_timeout() -> None:
-    policy = ExecutionPolicy.from_settings(Settings(webhook_url=_WEBHOOK, http_timeout=_TIMEOUT))
-
-    assert policy == dataclasses.replace(ExecutionPolicy(), max_retry_elapsed_per_request=_TIMEOUT)
-
-
 @pytest.mark.asyncio
 async def test_a_per_call_policy_replaces_the_client_default_without_merging() -> None:
     transport = _RecordingTransport()
-    settings = Settings(webhook_url=_WEBHOOK, http_timeout=_TIMEOUT)
-    small = dataclasses.replace(ExecutionPolicy.from_settings(settings), max_response_bytes=4096)
+    default = ExecutionPolicy(max_retry_elapsed_per_request=_TIMEOUT)
+    small = dataclasses.replace(default, max_response_bytes=4096)
 
-    async with Bitrix24(settings, transport=transport) as client:
+    async with Bitrix24(Settings(webhook_url=_WEBHOOK), transport=transport, policy=default) as client:
         await client.call(Request("server.time", route=RouteKind.BARE))
         await client.call(Request("server.time", route=RouteKind.BARE), policy=ExecutionPolicy())
         await client.call(Request("server.time", route=RouteKind.BARE), policy=small)
@@ -144,9 +187,132 @@ async def test_a_per_call_policy_replaces_the_client_default_without_merging() -
     (default_timeout, default_bytes), (replaced_timeout, replaced_bytes), (derived_timeout, derived_bytes) = (
         transport.ceilings
     )
-    # The client default carries the settings timeout; a bare per-call policy drops it (no hidden merge).
+    # The client default bounds each attempt by its window; a bare per-call policy drops it (no hidden merge).
     assert default_timeout <= _TIMEOUT < replaced_timeout
     assert default_bytes == replaced_bytes == ExecutionPolicy().max_response_bytes
-    # Deriving the per-call policy from the settings keeps the timeout and changes only what it names.
+    # Deriving the per-call policy from the client's keeps its window and changes only what it names.
     assert derived_timeout <= _TIMEOUT
     assert derived_bytes == small.max_response_bytes
+
+
+@pytest.mark.parametrize("timeout", [math.inf, -math.inf, math.nan, "inf", "nan"])
+def test_settings_refuse_a_non_finite_http_timeout(timeout: float | str) -> None:
+    # An infinite window used to pass Settings and fail only in the client, after it had opened its transport.
+    with pytest.raises(ValidationError, match="http_timeout"):
+        Settings(webhook_url=_WEBHOOK, http_timeout=timeout)
+    with pytest.raises(ValidationError, match="http_timeout"):
+        Bitrix24.from_webhook(_WEBHOOK, http_timeout=float(timeout))
+
+
+def test_a_refused_client_configuration_opens_no_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A Settings built without validation reaches the client's own checks, which all run before it opens one.
+    opened: list[str] = []
+    monkeypatch.setattr(b24api.client, "HttpxTransport", lambda url, **_options: opened.append(url))
+    settings = Settings.model_construct(webhook_url=_WEBHOOK).model_copy(update={"max_concurrent_requests": 0})
+
+    with pytest.raises(ValueError, match="max_concurrency must be positive"):
+        Bitrix24(settings)
+
+    assert opened == []
+
+
+@pytest.mark.parametrize("timeout", [math.inf, 0.0, -1.0])
+def test_the_owned_transport_refuses_an_attempt_timeout_before_it_opens_a_connection_pool(
+    monkeypatch: pytest.MonkeyPatch, timeout: float
+) -> None:
+    # A Settings built without validation passes its timeout to the transport, which refuses it first thing.
+    def opened(*_arguments: object, **_options: object) -> None:
+        pytest.fail("the transport opened a connection pool for a refused timeout")
+
+    monkeypatch.setattr(httpx, "AsyncClient", opened)
+    settings = Settings.model_construct(webhook_url=_WEBHOOK).model_copy(update={"http_timeout": timeout})
+
+    with pytest.raises(ValueError, match="timeout must be a finite positive number of seconds"):
+        Bitrix24(settings)
+
+
+def test_max_concurrent_requests_is_a_positive_setting_read_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert Settings(webhook_url=_WEBHOOK).max_concurrent_requests == _DEFAULT_CONCURRENT_REQUESTS
+    monkeypatch.setenv("BITRIX24_API_MAX_CONCURRENT_REQUESTS", "25")
+    assert Settings(webhook_url=_WEBHOOK).max_concurrent_requests == 25  # noqa: PLR2004
+    with pytest.raises(ValidationError, match="max_concurrent_requests"):
+        Settings(webhook_url=_WEBHOOK, max_concurrent_requests=0)
+    with pytest.raises(ValidationError, match="max_concurrent_requests"):
+        Bitrix24.from_webhook(_WEBHOOK, max_concurrent_requests=0)
+
+
+_DEFAULT_CONCURRENT_REQUESTS = 10
+_WIDE = 40
+
+
+async def _settled(transport: ResponderTransport, full: asyncio.Event) -> int:
+    """Return the sends in flight once the expected peak is reached and the loop has had room to exceed it.
+
+    Every send blocks until released and the input is fed on the loop, so after ``full`` no further send can
+    start except through a limit that admits more than the peak; the extra turns of the loop give it that room.
+    """
+    await reached(full)
+    for _ in range(50):
+        await asyncio.sleep(0)
+    return len(transport.requests)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("construction", ["settings", "from_webhook"])
+@pytest.mark.parametrize(
+    ("limit", "dispatch", "policy", "peak"),
+    [
+        (None, _WIDE, _WIDE, _DEFAULT_CONCURRENT_REQUESTS),
+        (_WIDE, _WIDE, _WIDE, _WIDE),
+        (_WIDE, 4, _WIDE, 4),
+        (_WIDE, _WIDE, 6, 6),
+        (3, _WIDE, _WIDE, 3),
+    ],
+)
+async def test_effective_concurrency_is_the_smallest_of_the_client_and_operation_limits(  # noqa: PLR0913
+    monkeypatch: pytest.MonkeyPatch,
+    construction: str,
+    limit: int | None,
+    dispatch: int,
+    policy: int,
+    peak: int,
+) -> None:
+    # The client's limit used to be a fixed 10 that no setting raised: DirectDispatch(concurrency=40) under
+    # max_direct_concurrency=40 still peaked at 10.
+    release = asyncio.Event()
+    full = asyncio.Event()
+
+    async def respond(_request: Request) -> object:
+        if len(transport.requests) >= peak:
+            full.set()
+        await release.wait()
+        return {"result": 1}
+
+    transport = ResponderTransport(respond, host="bitrix24.com")
+    limits = {} if limit is None else {"max_concurrent_requests": limit}
+    if construction == "settings":
+        client = Bitrix24(Settings(webhook_url=_WEBHOOK, **limits), transport=transport)
+    else:
+        monkeypatch.setattr(b24api.client, "HttpxTransport", lambda _url, **_options: transport)
+        client = Bitrix24.from_webhook(_WEBHOOK, max_concurrent_requests=limit)
+    commands = [Command(Request.bare("crm.deal.get", {"ID": index}, ReplaySafety.SAFE), index) for index in range(60)]
+
+    async with client:
+        stream = client.fan_out_outcomes(
+            on_loop(commands),
+            dispatch=DirectDispatch(concurrency=dispatch),
+            policy=ExecutionPolicy(max_direct_concurrency=policy),
+        )
+
+        async def drain() -> int:
+            async with stream:
+                return len([outcome async for outcome in stream])
+
+        drained = asyncio.create_task(drain())
+        in_flight = await _settled(transport, full)
+        release.set()
+        assert await drained == len(commands)
+
+    assert in_flight == peak

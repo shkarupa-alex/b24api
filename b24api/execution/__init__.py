@@ -11,7 +11,6 @@ from b24api.execution.context import (
 from b24api.execution.executor import Executor
 from b24api.execution.rate import (
     CoordinatorBudgetError,
-    CoordinatorClosedError,
     CoordinatorSnapshot,
     CoordinatorState,
     DeadlineBudget,
@@ -24,7 +23,6 @@ from b24api.transport import HttpxTransport, Transport, WireResponse
 __all__ = [
     "AsyncIteratorController",
     "CoordinatorBudgetError",
-    "CoordinatorClosedError",
     "CoordinatorSnapshot",
     "CoordinatorState",
     "DeadlineBudget",

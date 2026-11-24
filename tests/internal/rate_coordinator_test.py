@@ -4,14 +4,18 @@ from __future__ import annotations
 import asyncio
 import json
 
+import httpx
 import pytest
 
-from b24api import Bitrix24, ReplaySafety, Request, Settings
+from b24api import BatchDispatch, Bitrix24, ReplaySafety, Request, Settings
+from b24api.contracts import Command, CommandFailure, CommandSettlement
 from b24api.contracts.policy import ExecutionPolicy, RetryPolicy
 from b24api.contracts.request import RouteKind
-from b24api.errors import BudgetExceededError
+from b24api.errors import BudgetExceededError, ClientClosedError
 from b24api.execution import CoordinatorState, Executor, RateCoordinator, WireResponse, WorkClass
 from b24api.execution.cleanup import close_owned_resources
+from b24api.execution.facts import execution
+from b24api.transport import HttpxTransport
 
 HOST = "test.invalid"
 WAKE_TASK_NAME = "b24api-rate-wake"
@@ -88,14 +92,90 @@ async def test_client_over_injected_executor_leaves_the_coordinator_to_its_owner
     assert (await coordinator.snapshot()).state is CoordinatorState.CLOSED
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["batch fan-out", "logical batch"])
+async def test_a_closed_coordinator_stops_a_rest_v3_first_envelope_whose_commands_end_never_sent(how: str) -> None:
+    # The caller closed the coordinator of the executor it injected: the first envelope stops at its permit, so no
+    # request counts, no page was sent, and each command ends with the stop, settled not executed.
+    http = httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={"result": []})))
+    transport = HttpxTransport(f"https://{HOST}/rest/1/token/", client=http)
+    coordinator = RateCoordinator()
+    executor = Executor(transport, coordinator=coordinator)
+    await coordinator.close()
+    client = Bitrix24._from_executor(executor)  # noqa: SLF001 - caller-owned executor seam, to close its coordinator
+    commands = [
+        Command(Request("x.item.get", {"id": index}, ReplaySafety.SAFE, route=RouteKind.API_V3), index)
+        for index in range(2)
+    ]
+    stream = (
+        client.fan_out_outcomes(commands, dispatch=BatchDispatch(concurrency=1))
+        if how == "batch fan-out"
+        else client.batch_outcomes(commands)
+    )
+    try:
+        async with stream:
+            outcomes = [outcome async for outcome in stream]
+    finally:
+        await client.aclose()
+        await transport.aclose()
+        await http.aclose()
+
+    assert [type(outcome) for outcome in outcomes] == [CommandFailure, CommandFailure]
+    for outcome in outcomes:
+        assert isinstance(outcome, CommandFailure)
+        assert isinstance(outcome.error, ClientClosedError)
+        assert execution(outcome.error).settlement is CommandSettlement.NOT_EXECUTED
+    report = stream.report
+    assert report is not None
+    assert report.physical_requests == 0
+    assert report.page_trace == ()
+
+
+@pytest.mark.asyncio
+async def test_a_closed_coordinator_stops_a_flat_counted_head_which_is_not_traced() -> None:
+    # The caller closed the coordinator of the executor it injected: the direct head of a flat counted traversal stops
+    # at its permit. No request carried it, so it is not traced.
+    http = httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={"result": []})))
+    transport = HttpxTransport(f"https://{HOST}/rest/1/token/", client=http)
+    coordinator = RateCoordinator()
+    executor = Executor(transport, coordinator=coordinator)
+    await coordinator.close()
+    client = Bitrix24._from_executor(executor)  # noqa: SLF001 - caller-owned executor seam, to close its coordinator
+    stream = client.iter_list_counted(Request.bare("crm.item.list", {}, ReplaySafety.SAFE), page_size=50)
+
+    async def drain() -> None:
+        async with stream:
+            async for _ in stream:
+                pass
+
+    try:
+        # As in ``iter_list``, the stop leaves as raised, not wrapped as a broken pagination invariant.
+        with pytest.raises(ClientClosedError):
+            await drain()
+    finally:
+        await client.aclose()
+        await transport.aclose()
+        await http.aclose()
+
+    report = stream.report
+    assert report is not None
+    assert report.physical_requests == 0
+    assert report.page_trace == ()
+
+
 class _Resource:
-    def __init__(self, name: str, order: list[str], *, fail: bool = False) -> None:
+    def __init__(
+        self, name: str, order: list[str], *, fail: bool = False, interrupt: type[BaseException] | None = None
+    ) -> None:
         self.name = name
         self.order = order
         self.fail = fail
+        self.interrupt = interrupt
 
     async def aclose(self) -> None:
         self.order.append(self.name)
+        if self.interrupt is not None:
+            raise self.interrupt(f"{self.name} interrupted")
         if self.fail:
             raise RuntimeError(f"{self.name} cleanup failed")
 
@@ -114,6 +194,35 @@ async def test_owned_cleanup_closes_streams_then_coordinator_then_transport_keep
 
     assert order == ["stream", "failing-stream", "coordinator", "transport"]
     assert captured.value.__notes__ == ["coordinator cleanup failure: RuntimeError"]
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+@pytest.mark.asyncio
+async def test_owned_cleanup_raises_an_interrupt_ahead_of_an_earlier_failure(interrupt: type[BaseException]) -> None:
+    # An interrupt is never behind a failure: the first one latched is what leaves, as it is, every resource closed.
+    # A second interrupt (the coordinator's) is reported to the loop's exception handler, once, not raised.
+    order: list[str] = []
+    reported: list[BaseException] = []
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(lambda _loop, context: reported.append(context["exception"]))
+    streams = (
+        _Resource("failing-stream", order, fail=True),
+        _Resource("interrupted-stream", order, interrupt=interrupt),
+    )
+
+    try:
+        with pytest.raises(interrupt, match="interrupted-stream interrupted") as captured:
+            await close_owned_resources(
+                streams,
+                _Resource("transport", order, fail=True),
+                _Resource("coordinator", order, interrupt=KeyboardInterrupt),
+            )
+    finally:
+        loop.set_exception_handler(None)
+
+    assert order == ["failing-stream", "interrupted-stream", "coordinator", "transport"]
+    assert not hasattr(captured.value, "__notes__")
+    assert [(type(error), str(error)) for error in reported] == [(KeyboardInterrupt, "coordinator interrupted")]
 
 
 @pytest.mark.asyncio

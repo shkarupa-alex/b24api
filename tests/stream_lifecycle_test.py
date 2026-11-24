@@ -9,6 +9,7 @@ private carrier exception (A14).
 
 from __future__ import annotations
 import asyncio
+import contextlib
 import json
 from typing import TYPE_CHECKING, Any
 
@@ -37,6 +38,8 @@ if TYPE_CHECKING:
     from b24api.contracts.stream import OperationStream
 
 HOST = "fixture.invalid"
+# A bound on a wait the test expects to end at once, so a regression fails the test instead of hanging it.
+HANG_BOUND = 30.0
 COMMANDS = 6
 BATCH = 2
 FAILING_COMMAND = 3
@@ -88,11 +91,20 @@ class _SourceFailedError(Exception):
 class _Source:
     """An async command source whose ``aclose`` can fail, observable by tests."""
 
-    def __init__(self, *, fail_at: int | None = None, close_fails: bool = False, failing: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_at: int | None = None,
+        close_fails: bool = False,
+        failing: bool = False,
+        close_blocks: bool = False,
+    ) -> None:
         self.produced = 0
         self.fail_at = fail_at
         self.close_fails = close_fails
         self.failing = failing
+        self.close_blocks = close_blocks
+        self.closing = asyncio.Event()
         self.closes = 0
 
     def __aiter__(self) -> _Source:
@@ -109,6 +121,9 @@ class _Source:
 
     async def aclose(self) -> None:
         self.closes += 1
+        self.closing.set()
+        if self.close_blocks:
+            await asyncio.Event().wait()
         if self.close_fails:
             raise _CloseFailedError
 
@@ -138,6 +153,20 @@ def _published(error: BaseException) -> OperationReport:
     return report
 
 
+# A failed close is the source failing: it raises the family's source failure, chained to the caller's exception.
+CLOSE_FAILURE = (BatchFailed, InputSourceError)
+
+
+def _assert_close_failure(error: BaseException, family: str) -> None:
+    assert type(error) is (BatchFailed if family in {"batch", "fan_out"} else InputSourceError)
+    causes = []
+    cause: BaseException | None = error
+    while cause is not None:
+        causes.append(type(cause))
+        cause = cause.__cause__
+    assert causes[-2:] == [InputSourceError, _CloseFailedError]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("family", FAMILIES)
 async def test_early_close_with_failing_source_close_publishes_one_report(family: str) -> None:
@@ -145,8 +174,9 @@ async def test_early_close_with_failing_source_close_publishes_one_report(family
     async with _client(_Portal()) as client:
         stream = _stream(client, family, source)
         await anext(stream)
-        with pytest.raises(_CloseFailedError) as raised:
+        with pytest.raises(CLOSE_FAILURE) as raised:
             await stream.aclose()
+        _assert_close_failure(raised.value, family)
 
         report = stream.report
         assert report is not None
@@ -205,8 +235,9 @@ async def test_failing_source_close_before_the_first_pull_is_a_cleanup_failure(f
     source = _Source(close_fails=True)
     async with _client(_Portal()) as client:
         stream = _stream(client, family, source)
-        with pytest.raises(_CloseFailedError) as raised:
+        with pytest.raises(CLOSE_FAILURE) as raised:
             await stream.aclose()
+        _assert_close_failure(raised.value, family)
 
         report = stream.report
         assert report is not None
@@ -238,12 +269,13 @@ async def test_body_failure_survives_a_failing_source_close_on_context_exit(fami
         with pytest.raises(_BodyFailedError) as raised:
             await body()
 
-        # The body's own exception reaches the caller; the cleanup failure is a note and a report entry.
-        assert any("_CloseFailedError" in note for note in raised.value.__notes__)
+        # The body's own exception reaches the caller with one note: the report's record of the failed close.
         report = stream.report
         assert report is not None
         assert report.terminal_reason == "stream cleanup failed"
-        assert "cleanup_failure" in _codes(report)
+        failed_close = [violation.message for violation in report.violations if violation.code == "cleanup_failure"]
+        assert failed_close == ["stream cleanup failed (InputSourceError)"]
+        assert raised.value.__notes__ == failed_close
     assert source.closes == 1
 
 
@@ -258,8 +290,9 @@ async def test_context_exit_without_a_body_failure_still_raises_the_cleanup_fail
             async with stream:
                 await anext(stream)
 
-        with pytest.raises(_CloseFailedError):
+        with pytest.raises(CLOSE_FAILURE) as raised:
             await body()
+        _assert_close_failure(raised.value, family)
         assert stream.report is not None
     assert source.closes == 1
 
@@ -268,14 +301,16 @@ async def test_context_exit_without_a_body_failure_still_raises_the_cleanup_fail
 @pytest.mark.parametrize("family", FAMILIES)
 async def test_source_close_failure_after_exhaustion_is_a_cleanup_failure_not_a_source_failure(family: str) -> None:
     # The owned source is closed by its owner's cleanup, not inside the final pull (§3.2), so every
-    # command is still delivered and the close failure never masquerades as a failed input source.
+    # command is still delivered, and the close failure, raised as the source's failure, is reported as the
+    # cleanup failure it is, never as a failed read of the source.
     source = _Source(close_fails=True)
     async with _client(_Portal()) as client:
         stream = _stream(client, family, source)
         for _ in range(COMMANDS):
             await anext(stream)
-        with pytest.raises(_CloseFailedError) as raised:
+        with pytest.raises(CLOSE_FAILURE) as raised:
             await anext(stream)
+        _assert_close_failure(raised.value, family)
 
     report = _published(raised.value)
     assert report.state is TerminalState.FAILED
@@ -288,7 +323,8 @@ async def test_source_close_failure_after_exhaustion_is_a_cleanup_failure_not_a_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("family", FAMILIES)
-async def test_cancelled_pull_with_failing_source_close_raises_the_cleanup_failure(family: str) -> None:
+async def test_cancelled_pull_with_failing_source_close_raises_the_cancellation(family: str) -> None:
+    # The reader's cancellation came first: it is raised, and the failed close is recorded behind it.
     portal = _Portal(block=True)
     source = _Source(close_fails=True)
     async with _client(portal) as client:
@@ -296,31 +332,18 @@ async def test_cancelled_pull_with_failing_source_close_raises_the_cleanup_failu
         pull = asyncio.ensure_future(anext(stream))
         await portal.entered.wait()
         pull.cancel()
-        with pytest.raises(_CloseFailedError) as raised:
+        with pytest.raises(asyncio.CancelledError) as raised:
             await pull
 
         report = stream.report
         assert report is not None
         assert _published(raised.value) is report
-        assert report.state is TerminalState.FAILED
-        assert "cleanup_failure" in _codes(report)
+        assert report.state is TerminalState.CANCELLED
+        assert report.terminal_reason == "iteration cancelled"
+        failed_close = [violation.message for violation in report.violations if violation.code == "cleanup_failure"]
+        assert failed_close == ["stream cleanup also failed (InputSourceError)"]
         await stream.aclose()
         assert stream.report is report
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("family", LOGICAL)
-async def test_logical_batch_cancel_cleanup_failure_is_a_terminal_cleanup_failure(family: str) -> None:
-    portal = _Portal(block=True)
-    async with _client(portal) as client:
-        stream = _stream(client, family, _Source(close_fails=True))
-        pull = asyncio.ensure_future(anext(stream))
-        await portal.entered.wait()
-        pull.cancel()
-        with pytest.raises(_CloseFailedError):
-            await pull
-    assert stream.report is not None
-    assert stream.report.terminal_reason == "stream cleanup failed"
 
 
 @pytest.mark.asyncio
@@ -351,8 +374,25 @@ async def test_fail_fast_batch_reports_the_command_failure_not_its_carrier() -> 
     assert _codes(report) == ["batch_command_failure"]
 
 
+def _causes(error: BaseException) -> list[type[BaseException]]:
+    causes: list[type[BaseException]] = []
+    cause = error.__cause__
+    while cause is not None:
+        causes.append(type(cause))
+        cause = cause.__cause__
+    return causes
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("family", "error"), [("batch", BatchFailed), ("fan_out_outcomes", InputSourceError)])
+@pytest.mark.parametrize(
+    ("family", "error"),
+    [
+        ("batch", BatchFailed),
+        ("batch_outcomes", InputSourceError),
+        ("fan_out", BatchFailed),
+        ("fan_out_outcomes", InputSourceError),
+    ],
+)
 async def test_source_failure_is_reported_as_an_input_source_failure(
     family: str,
     error: type[B24ApiError],
@@ -366,6 +406,10 @@ async def test_source_failure_is_reported_as_an_input_source_failure(
     assert report.terminal_reason == "InputSourceError"
     assert "source_failure" in _codes(report)
     assert "internal_failure" not in _codes(report)
+    # The chain runs from the public error to the source's own, through public failures only.
+    causes = _causes(raised.value)
+    assert causes[-1] is _SourceFailedError
+    assert set(causes[:-1]) <= {InputSourceError}
 
 
 async def _failing_bindings() -> AsyncIterator[Binding[int]]:
@@ -388,3 +432,28 @@ async def test_reference_binding_source_failure_is_reported_as_an_input_source_f
     report = _published(raised.value)
     assert report.terminal_reason == "InputSourceError"
     assert "source_failure" in _codes(report)
+    assert _causes(raised.value) == [_SourceFailedError]
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_a_read_ended_as_the_event_loop_shuts_down_leaves_no_library_task_failed(family: str) -> None:
+    # ``asyncio.run`` cancels every task left when its coroutine returns, then reports each one that ended in an
+    # exception. It shuts down while the read that ends the stream closes its source: the consumer, the caller's own
+    # task, takes the stream's end, and no task of the library's own may end in it as well.
+    reports: list[dict[str, Any]] = []
+    source = _Source(failing=True, close_blocks=True)
+
+    async def consume(stream: OperationStream[Any]) -> None:
+        with contextlib.suppress(BaseException):
+            async for _item in stream:
+                pass
+
+    async def main() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reports.append(context))
+        consumer = asyncio.create_task(consume(_stream(_client(_Portal()), family, source)))
+        await asyncio.wait_for(source.closing.wait(), timeout=HANG_BOUND)
+        assert not consumer.done()
+
+    asyncio.run(main())
+
+    assert [(context["message"], context.get("task")) for context in reports] == []
