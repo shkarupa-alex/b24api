@@ -677,10 +677,14 @@ async def test_conformance_skips_the_query_string_cases_for_a_transport_that_doe
 
 
 class _HandWritten(httpx.AsyncBaseTransport):
-    """Writes each request HTTPX built by hand, its ``Host`` header joined to its value by ``separator``."""
+    """Writes each request HTTPX built by hand, its ``Host`` header joined to its value by ``separator``.
 
-    def __init__(self, separator: str) -> None:
+    With ``fails_on_answer`` it reads the answer and then fails, as a transport the responder's close surprised.
+    """
+
+    def __init__(self, separator: str, *, fails_on_answer: bool = False) -> None:
         self.separator = separator
+        self.fails_on_answer = fails_on_answer
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         lines = [f"{request.method} {request.url.raw_path.decode()} HTTP/1.1"]
@@ -695,7 +699,7 @@ class _HandWritten(httpx.AsyncBaseTransport):
         finally:
             writer.close()
         head, _, body = answer.partition(b"\r\n\r\n")
-        if not head:
+        if not head or self.fails_on_answer:
             raise httpx.RemoteProtocolError("no answer", request=request)
         fields = [line.partition(b": ")[::2] for line in head.split(b"\r\n")[1:]]
         return httpx.Response(int(head.split(b" ")[1]), headers=fields, content=body, request=request)
@@ -704,8 +708,8 @@ class _HandWritten(httpx.AsyncBaseTransport):
 class _HandWrittenTransport(HttpxTransport):
     """``HttpxTransport`` whose requests go out through :class:`_HandWritten`."""
 
-    def __init__(self, webhook_url: str, separator: str) -> None:
-        self.client = httpx.AsyncClient(transport=_HandWritten(separator))
+    def __init__(self, webhook_url: str, separator: str, *, fails_on_answer: bool = False) -> None:
+        self.client = httpx.AsyncClient(transport=_HandWritten(separator, fails_on_answer=fails_on_answer))
         super().__init__(webhook_url, client=self.client)
 
     async def aclose(self) -> None:
@@ -733,9 +737,14 @@ async def test_conformance_passes_every_case_when_the_hand_written_request_is_th
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fails_on_answer", [False, True], ids=["returns", "raises"])
 @pytest.mark.parametrize("separator", [" ", " : "], ids=["no_colon", "space_before_colon"])
-async def test_conformance_fails_every_case_sent_a_request_http_cannot_parse_with_its_detail(separator: str) -> None:
-    report = await run_transport_conformance(lambda url: _HandWrittenTransport(url, separator))
+async def test_conformance_fails_every_case_sent_a_request_http_cannot_parse_with_its_detail(
+    separator: str, *, fails_on_answer: bool
+) -> None:
+    report = await run_transport_conformance(
+        lambda url: _HandWrittenTransport(url, separator, fails_on_answer=fails_on_answer)
+    )
 
     assert report.outcomes == tuple(
         ConformanceOutcome(case, passed=True)

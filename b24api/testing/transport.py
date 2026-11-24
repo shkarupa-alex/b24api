@@ -211,8 +211,14 @@ async def _run_case_environment(
 
     server = await asyncio.start_server(handler, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
+    # A case sent a request HTTP/1.1 cannot parse fails with that detail, whether it then returned or raised (the
+    # responder answers and closes at once, so a transport still writing or reading may well fail).
     try:
         outcome = await _run_owned_case(case, factory, f"http://127.0.0.1:{port}/rest/1/token/", captures, controller)
+    except Exception:
+        if not unparseable.is_set():
+            raise
+        return ConformanceOutcome(case, passed=False, detail=_UNPARSEABLE_DETAIL)
     finally:
         server.close()
         await server.wait_closed()
