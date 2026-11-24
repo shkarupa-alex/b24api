@@ -70,8 +70,9 @@ _QUERY_PATH = "/rest/1/token/conformance.test"
 # Decoded as PHP decodes a query: ``+`` and ``%20`` alike are a space, a blank value or a bare key is a parameter
 # still, and the order of distinct keys is no matter. The pairs must be exactly the ones the client encodes.
 _QUERY_PAIRS = sorted([("plain", "a b"), ("outer[items][0]", "x")])
-# Not octet-stream, the type a transport might send by default: the case checks the declared one goes out.
-_RAW_CONTENT = RawContent(b"\x00chunk\xff", "image/svg+xml")
+# Not octet-stream, the type a transport might send by default, and with a parameter: the case checks the declared
+# type goes out whole.
+_RAW_CONTENT = RawContent(b"\x00chunk\xff", "image/svg+xml; charset=utf-8")
 
 
 @dataclass(frozen=True, slots=True)

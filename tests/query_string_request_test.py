@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 _WEBHOOK = "https://portal.invalid/rest/1/token/"
+_UNBOUNDED_ACCEPT_ENCODING = "gzip, deflate, br, zstd"
 _CHUNK = RawContent(b"\x00\x01chunk\xff", "application/octet-stream")
 _QUERY_CASES = frozenset({ConformanceCase.QUERY_STRING_GET, ConformanceCase.QUERY_STRING_RAW_CONTENT})
 
@@ -43,8 +44,12 @@ def _httpx(respond: Callable[[httpx.Request], httpx.Response], webhook: str = _W
 
 
 @pytest.mark.asyncio
-async def test_a_query_string_request_without_content_is_a_get_with_its_parameters_in_the_query() -> None:
+async def test_a_query_string_request_without_content_is_a_get_with_its_parameters_in_the_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     sent: list[httpx.Request] = []
+    # Stand in for brotli/zstandard being installed: HTTPX would then advertise them on its own.
+    monkeypatch.setattr("httpx._client.ACCEPT_ENCODING", _UNBOUNDED_ACCEPT_ENCODING)
 
     def respond(request: httpx.Request) -> httpx.Response:
         sent.append(request)
@@ -100,9 +105,10 @@ async def test_a_query_string_request_without_parameters_has_no_query() -> None:
     ids=["bytes", "empty", "declared_type"],
 )
 async def test_raw_content_is_posted_byte_for_byte_with_its_type_and_the_parameters_in_the_query(
-    chunk: RawContent,
+    chunk: RawContent, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     sent: list[httpx.Request] = []
+    monkeypatch.setattr("httpx._client.ACCEPT_ENCODING", _UNBOUNDED_ACCEPT_ENCODING)
 
     def respond(request: httpx.Request) -> httpx.Response:
         sent.append(request)
@@ -129,6 +135,7 @@ async def test_raw_content_is_posted_byte_for_byte_with_its_type_and_the_paramet
     assert wire.headers["content-type"] == chunk.content_type
     assert wire.headers["content-length"] == str(len(chunk.data))
     assert wire.headers["x-upload-content-name"] == "chunk.bin"
+    assert wire.headers["accept-encoding"] == BOUNDED_ACCEPT_ENCODING
 
 
 def test_raw_content_travels_only_with_query_string_encoding() -> None:
@@ -501,12 +508,21 @@ _URL_FLAWS: dict[str, Callable[[httpx.URL], httpx.URL]] = {
     "extra_blank_value": lambda url: url.copy_with(query=url.query + b"&plain_extra="),
     "extra_bare_key": lambda url: url.copy_with(query=url.query + b"&admin"),
     "extra_blank_item": lambda url: url.copy_with(query=url.query + b"&outer%5Bitems%5D%5B1%5D="),
+    # PHP reads the last of a repeated key and ignores an empty key, but each is a pair the client never encoded.
+    "repeated_pairs": lambda url: url.copy_with(query=url.query + b"&" + url.query),
+    "repeated_key_earlier_value": lambda url: url.copy_with(query=b"plain=other&" + url.query),
+    "empty_key": lambda url: url.copy_with(query=url.query + b"&=x"),
 }
 _BODY_FLAWS: dict[tuple[str, str], Callable[[str | None, bytes], tuple[str | None, bytes]]] = {
     ("get_with_body", "GET"): lambda _type, _body: ("application/x-www-form-urlencoded", b"plain=a+b"),
     ("bytes_as_text", "POST"): lambda content_type, body: (content_type, body.decode("utf-8", "replace").encode()),
     ("other_bytes", "POST"): lambda content_type, _body: (content_type, b'{"plain":"a b"}'),
     ("other_content_type", "POST"): lambda _type, body: ("application/json", body),
+    ("default_content_type", "POST"): lambda _type, body: ("application/octet-stream", body),
+    ("content_type_without_parameters", "POST"): lambda content_type, body: (
+        None if content_type is None else content_type.split(";")[0],
+        body,
+    ),
     # As long as the declared bytes, so only a byte-for-byte comparison tells them apart.
     ("same_length_bytes", "POST"): lambda content_type, body: (
         content_type,
@@ -561,6 +577,9 @@ class _Tampered(HttpxTransport):
         ("extra_blank_value", (False, False)),
         ("extra_bare_key", (False, False)),
         ("extra_blank_item", (False, False)),
+        ("repeated_pairs", (False, False)),
+        ("repeated_key_earlier_value", (False, False)),
+        ("empty_key", (False, False)),
         ("other_method", (False, False)),
         ("other_nested_key", (False, False)),
         ("other_value", (False, False)),
@@ -569,6 +588,8 @@ class _Tampered(HttpxTransport):
         ("bytes_as_text", (True, False)),
         ("same_length_bytes", (True, False)),
         ("other_content_type", (True, False)),
+        ("default_content_type", (True, False)),
+        ("content_type_without_parameters", (True, False)),
         ("other_status", (False, False)),
     ],
 )

@@ -16,10 +16,11 @@
   the bytes.
 - **Breaking: a transport that declares `QUERY_STRING` in `TransportCapabilities.encodings` must honor
   `content`.** `HttpxTransport` and `ScriptedTransport` declare it; a send-only transport, one that does not declare it and
-  a classic batch refuse such a request before any send. A scripted exchange matches raw content by its bytes
-  and type. A third-party transport that declares its encodings as `frozenset(BodyEncoding)` now declares
-  `QUERY_STRING` too, with no change of its own: the client sends it query-string requests, and
-  `run_transport_conformance` fails it. List the encodings it builds instead.
+  a classic batch refuse such a request before any send. The `CapabilityError` for an undeclared encoding now
+  reads "transport does not support <encoding> requests" (it said "request bodies").
+  A scripted exchange matches raw content by its bytes and type. A third-party transport that declares its
+  encodings as `frozenset(BodyEncoding)` now declares `QUERY_STRING` too, with no change of its own: the
+  client sends it query-string requests, and `run_transport_conformance` fails it. List the encodings it builds instead.
 - **Breaking for code that matches or enumerates `ConformanceCase`, or counts a report's outcomes: it gains
   `QUERY_STRING_GET` and `QUERY_STRING_RAW_CONTENT`.** Both are skipped for a transport that does not declare `QUERY_STRING`. They
   decode the query as PHP does (`+` and `%20` are both a space, the order of distinct keys does not matter,
