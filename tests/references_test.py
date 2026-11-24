@@ -1437,27 +1437,22 @@ async def test_late_direct_response_after_suppressed_cancellation_cannot_commit_
     release = asyncio.Event()
     returned = asyncio.Event()
 
-    class CancellationResistantTransport:
-        host = "fixture.invalid"
-
-        async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-            del request, attempt_timeout, max_response_bytes
-            started.set()
-            try:
-                await asyncio.Future[None]()
-            except asyncio.CancelledError:
-                while not release.is_set():
-                    try:
-                        await release.wait()
-                    except asyncio.CancelledError:
-                        continue
-            returned.set()
-            body = json.dumps({"result": {"ok": True}}).encode()
-            return WireResponse(200, (("content-type", "application/json"),), body)
+    async def resist_cancellation(_request: Request) -> object:
+        started.set()
+        try:
+            await asyncio.Future[None]()
+        except asyncio.CancelledError:
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+        returned.set()
+        return {"result": {"ok": True}}
 
     budget_started = deadline_started()
     stream = fan_out(
-        Executor(CancellationResistantTransport()),
+        Executor(ResponderTransport(resist_cancellation)),
         [_reference("a")],
         dispatch=KernelDirectDispatch(),
         policy=ExecutionPolicy(max_elapsed=DEADLINE_BUDGET),
@@ -1499,27 +1494,22 @@ async def test_primary_reference_failure_survives_secondary_cleanup_budget_failu
     slow_returned = asyncio.Event()
     release = asyncio.Event()
 
-    class CancellationResistantTransport:
-        host = "fixture.invalid"
-
-        async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
-            del attempt_timeout, max_response_bytes
-            if request.method == "bad":
-                await slow_started.wait()
-                return WireResponse(200, (), b"{")
-            slow_started.set()
-            while not release.is_set():
-                try:
-                    await release.wait()
-                except asyncio.CancelledError:
-                    continue
-            slow_returned.set()
-            body = json.dumps({"result": {"ok": True}}).encode()
-            return WireResponse(200, (("content-type", "application/json"),), body)
+    async def resist_cancellation(request: Request) -> object:
+        if request.method == "bad":
+            await slow_started.wait()
+            return WireResponse(200, (), b"{")
+        slow_started.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+        slow_returned.set()
+        return {"result": {"ok": True}}
 
     budget_started = deadline_started()
     stream = fan_out(
-        Executor(CancellationResistantTransport()),
+        Executor(ResponderTransport(resist_cancellation)),
         [
             # A SAFE read: its malformed answer is its failure itself, not an ambiguity around it.
             ReferenceRequest(Request("bad", replay_safety=ReplaySafety.SAFE, route=RouteKind.BARE), "bad"),

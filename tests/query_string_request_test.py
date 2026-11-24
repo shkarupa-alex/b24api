@@ -754,36 +754,33 @@ async def test_conformance_fails_every_case_sent_a_request_http_cannot_parse_wit
     )
 
 
-class _EndsAtOnce(HttpxTransport):
-    """Writes its JSON request itself and ends as ``ending`` says, never reading the answer.
+class _EndsAtOnce:
+    """A send-only transport: it writes its JSON request itself and ends as ``ending`` says, never reading the answer.
 
-    Neither the end of ``send_wire`` nor ``aclose`` yields, so the case ends before the responder reads what was sent.
+    It has no ``aclose`` (the protocol needs none) and never yields after writing, so the case ends before the
+    responder has read what was sent.
     """
 
     def __init__(self, webhook_url: str, *, host_line: bool, ending: str) -> None:
-        super().__init__(webhook_url)
         self.url = httpx.URL(webhook_url)
+        self.host = self.url.host
         self.host_line = host_line
         self.ending = ending
 
-    async def send_wire(self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+    async def send(self, request: Request, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
         del attempt_timeout, max_response_bytes
         body = b'{"plain":"a b"}'
-        head = f"POST {self.url.path}{request.method} HTTP/1.1\r\n"
+        head = f"POST {self.url.path}{request.method}.json HTTP/1.1\r\n"
         head += f"Host: {self.url.host}\r\n" if self.host_line else ""
         head += f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n"
         _, writer = await asyncio.open_connection(self.url.host, self.url.port)
-        # Nothing below yields: the case ends before the responder has even read what was sent.
         writer.write(head.encode() + body)
         writer.close()
         if self.ending == "raises":
             raise ConnectionResetError
         if self.ending == "cancelled":
             raise asyncio.CancelledError
-        return WireResponse(200, (), b'{"result":true}')
-
-    async def aclose(self) -> None:
-        """Hold no connection of HTTPX's own, so there is nothing to close."""
+        return json_response({"result": True})
 
 
 _JSON_CASES = (ConformanceCase.LEGACY_JSON_BODY, ConformanceCase.JSON_CONTENT_TYPE)
