@@ -67,8 +67,8 @@ _ROUTE_PATHS = MappingProxyType(
 _QUERY_CASES = frozenset({ConformanceCase.QUERY_STRING_GET, ConformanceCase.QUERY_STRING_RAW_CONTENT})
 _QUERY_PARAMETERS = MappingProxyType({"plain": "a b", "outer": {"items": ["x"]}})
 _QUERY_PATH = "/rest/1/token/conformance.test"
-# Decoded as PHP reads a query: ``+`` and ``%20`` alike are a space, a blank value or a bare key is a parameter
-# still, and the order of distinct keys is no matter.
+# Decoded as PHP decodes a query: ``+`` and ``%20`` alike are a space, a blank value or a bare key is a parameter
+# still, and the order of distinct keys is no matter. The pairs must be exactly the ones the client encodes.
 _QUERY_PAIRS = sorted([("plain", "a b"), ("outer[items][0]", "x")])
 # Not octet-stream, the type a transport might send by default: the case checks the declared one goes out.
 _RAW_CONTENT = RawContent(b"\x00chunk\xff", "image/svg+xml")

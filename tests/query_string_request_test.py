@@ -1,6 +1,7 @@
 """A ``QUERY_STRING`` request: a GET with its parameters in the query, or a POST of its raw content."""
 
 from __future__ import annotations
+import dataclasses
 import io
 import logging
 import string
@@ -314,6 +315,22 @@ async def test_the_repository_transport_refuses_forged_raw_content_before_it_rea
 
     assert sent == []
     assert credential_reads == []
+
+
+def test_a_request_with_raw_content_is_an_immutable_hashable_value() -> None:
+    first = Request.bare("x.upload", {"a": 1}, encoding=BodyEncoding.QUERY_STRING, content=_CHUNK)
+    second = Request.bare(
+        "x.upload", {"a": 1}, encoding=BodyEncoding.QUERY_STRING, content=RawContent(_CHUNK.data, _CHUNK.content_type)
+    )
+
+    assert first == second
+    assert hash(first) == hash(second)
+    assert {first: "sent"}[second] == "sent"
+    for target, name in [(_CHUNK, "data"), (_CHUNK, "content_type"), (first, "content")]:
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(target, name, b"evil")
+    assert first.content is _CHUNK
+    assert _CHUNK.data == b"\x00\x01chunk\xff"
 
 
 @pytest.mark.parametrize("match_args", [Request.__match_args__, WireRequest.__match_args__], ids=["request", "wire"])
