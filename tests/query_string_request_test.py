@@ -502,6 +502,11 @@ async def test_conformance_fails_a_transport_that_declares_query_strings_but_pos
     ]
 
 
+def _upper_media_type(content_type: str) -> str:
+    media_type, separator, parameters = content_type.partition(";")
+    return media_type.upper() + separator + parameters
+
+
 # Each flaw of a query-string request's URL, and of its body or content type, as (method, URL, type, body).
 _URL_FLAWS: dict[str, Callable[[httpx.URL], httpx.URL]] = {
     "no_query": lambda url: url.copy_with(query=None),
@@ -520,7 +525,8 @@ _URL_FLAWS: dict[str, Callable[[httpx.URL], httpx.URL]] = {
     "empty_key": lambda url: url.copy_with(query=url.query + b"&=x"),
 }
 _BODY_FLAWS: dict[tuple[str, str], Callable[[str | None, bytes], tuple[str | None, bytes]]] = {
-    ("get_with_body", "GET"): lambda _type, _body: ("application/x-www-form-urlencoded", b"plain=a+b"),
+    # Each flaw changes exactly one aspect of the request, so each check is shown to fail on its own.
+    ("get_with_body", "GET"): lambda content_type, _body: (content_type, b"plain=a+b"),
     ("get_with_type", "GET"): lambda _type, body: ("application/octet-stream", body),
     ("bytes_as_text", "POST"): lambda content_type, body: (content_type, body.decode("utf-8", "replace").encode()),
     ("other_bytes", "POST"): lambda content_type, _body: (content_type, b'{"plain":"a b"}'),
@@ -532,6 +538,19 @@ _BODY_FLAWS: dict[tuple[str, str], Callable[[str | None, bytes], tuple[str | Non
     ),
     ("content_type_without_parameters", "POST"): lambda content_type, body: (
         None if content_type is None else content_type.split(";")[0],
+        body,
+    ),
+    # Each an equivalent form of the declared type, which the conformance cases still refuse.
+    ("content_type_ows_removed", "POST"): lambda content_type, body: (
+        None if content_type is None else content_type.replace("; ", ";"),
+        body,
+    ),
+    ("content_type_type_upper", "POST"): lambda content_type, body: (
+        None if content_type is None else _upper_media_type(content_type),
+        body,
+    ),
+    ("content_type_whitespace_collapsed", "POST"): lambda content_type, body: (
+        None if content_type is None else " ".join(content_type.split()),
         body,
     ),
     # As long as the declared bytes, so only a byte-for-byte comparison tells them apart.
@@ -603,6 +622,9 @@ class _Tampered(HttpxTransport):
         ("other_content_type", (True, False)),
         ("default_content_type", (True, False)),
         ("content_type_without_parameters", (True, False)),
+        ("content_type_ows_removed", (True, False)),
+        ("content_type_type_upper", (True, False)),
+        ("content_type_whitespace_collapsed", (True, False)),
         ("other_status", (False, False)),
     ],
 )

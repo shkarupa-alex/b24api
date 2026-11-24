@@ -351,7 +351,7 @@ class Request:
     def has_empty_container(self) -> bool:
         """Return whether a nested empty array or object would vanish from PHP bracket encoding.
 
-        Bracket syntax, used by form bodies and classic batch commands, names leaves only, so
+        Bracket syntax, used by form bodies, query strings and classic batch commands, names leaves only, so
         ``{"fields": {"UF_MULTI": []}}`` encodes exactly as ``{}``. Positional requests have no
         named parameters and answer ``False``.
         """
