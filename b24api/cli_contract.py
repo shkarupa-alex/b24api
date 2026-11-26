@@ -12,6 +12,7 @@ from b24api import (
     CursorSpec,
     IdentitySpec,
     KeysetSpec,
+    OffsetContinuation,
     OffsetSpec,
     ParameterPath,
     PartitionedKeysetExecution,
@@ -204,16 +205,31 @@ def _control_options(raw: Mapping[str, object], *, label: str) -> tuple[Paramete
 
 
 def _offset(raw: object, *, counted: bool) -> OffsetSpec:
-    # A counted traversal ends at the server's exact total, which it requires; a sequential one ends at an empty page.
+    # A counted traversal ends at the server's exact total, which it requires; a sequential one ends where its
+    # continuation says: at the page without ``next`` by default, or at an empty page.
     termination = TotalTermination.EXACT_QUALIFIED if counted else TotalTermination.DISABLED
     if raw is None:
         return OffsetSpec(total_termination=termination)
     if not isinstance(raw, dict):
         raise CliUsageError("offset must be an object")
-    _closed(raw, {"parameter_path", "limit_path", "allow_create_controls"}, label="offset")
+    _closed(raw, {"parameter_path", "limit_path", "allow_create_controls", "continuation", "step"}, label="offset")
     path = _path(raw.get("parameter_path"), label="offset.parameter_path")
     limit_path, allow_create = _control_options(raw, label="offset")
-    return OffsetSpec(cast("ParameterPath", path), limit_path, allow_create, total_termination=termination)
+    try:
+        continuation = OffsetContinuation(raw.get("continuation", OffsetContinuation.SERVER_NEXT.value))
+    except ValueError as error:
+        raise CliUsageError("offset.continuation is invalid") from error
+    try:
+        return OffsetSpec(
+            cast("ParameterPath", path),
+            limit_path,
+            allow_create,
+            continuation=continuation,
+            step=cast("int | None", raw.get("step")),
+            total_termination=termination,
+        )
+    except (TypeError, ValueError) as error:
+        raise CliUsageError("offset contract is invalid") from error
 
 
 def _keyset(raw: object) -> KeysetSpec:

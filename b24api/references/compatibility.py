@@ -38,20 +38,32 @@ def source_incompatibility(
 
     ``v3_batch`` is the operation transport's declared support for native REST v3 batch envelopes.
     """
+    # What the route's answers cannot carry rules out the traversal whatever the dispatch, so it is reported first.
+    unreadable = _route_incompatibility(request, traversal)
+    if unreadable is not None:
+        return unreadable
     if not isinstance(dispatch, DirectDispatch):
         unbatchable = _batch_incompatibility(request, v3_batch=v3_batch)
         if unbatchable is not None:
             return unbatchable
-    if isinstance(traversal, SequentialTraversal | CountedTraversal):
-        unreadable = offset_route_incompatibility(traversal.offset, request.route)
-        if unreadable is not None:
-            return unreadable
     if isinstance(traversal, CountedTraversal) and isinstance(dispatch, DirectDispatch):
         return CapabilityError("counted reference traversal requires BatchDispatch")
     if isinstance(traversal, CountedTraversal) and page_stop is not None:
         return CapabilityError("counted physical batch tail does not support page stop")
     if isinstance(traversal, KeysetTraversal) and not isinstance(traversal.execution, SequentialKeysetExecution):
         return _fast_keyset_incompatibility(traversal, dispatch, page_stop)
+    return None
+
+
+def _route_incompatibility(request: Request, traversal: TraversalSpec) -> CapabilityError | None:
+    """Return why the request's route cannot end the traversal truthfully, or None when it can."""
+    if isinstance(traversal, CountedTraversal) and request.route is RouteKind.API_V3:
+        return CapabilityError(
+            "counted traversal needs an exact total, which REST v3 list answers never carry; "
+            "use SequentialTraversal with OffsetContinuation.OBSERVED_COUNT"
+        )
+    if isinstance(traversal, SequentialTraversal):
+        return offset_route_incompatibility(traversal.offset, request.route)
     return None
 
 

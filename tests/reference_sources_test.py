@@ -30,6 +30,7 @@ from b24api import (
     SequentialTraversal,
     Settings,
     TerminalState,
+    TotalTermination,
 )
 from b24api.contracts import (
     BoundedIdentityRange,
@@ -620,7 +621,10 @@ async def test_a28_matrix_the_homogeneous_facade_rejects_v3_without_native_batch
     async with _client(portal) as api:
         with pytest.raises(CapabilityError, match="native REST v3 batch"):
             api.iter_references(
-                Request.v3("beta.list", {}, ReplaySafety.SAFE), [_binding(5)], traversal=BETA, dispatch=BatchDispatch()
+                Request.v3("beta.list", {}, ReplaySafety.SAFE),
+                [_binding(5)],
+                traversal=V3_BETA,
+                dispatch=BatchDispatch(),
             )
     assert portal.queries == []
     assert portal.v3_envelopes == 0
@@ -656,12 +660,31 @@ async def test_a28_matrix_a_v3_source_following_next_is_not_executed() -> None:
     assert report.not_executed == 1
 
 
+_OBSERVED_COUNT_COUNTED = CountedTraversal(
+    offset=OffsetSpec(
+        continuation=OffsetContinuation.OBSERVED_COUNT, total_termination=TotalTermination.EXACT_QUALIFIED
+    )
+)
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("traversal", [BETA, CountedTraversal()], ids=["sequential", "counted"])
-async def test_a_homogeneous_v3_reference_following_next_is_refused_when_composed(traversal: TraversalSpec) -> None:
-    portal = _WirePortal(_answer, v3_batch=True)
+@pytest.mark.parametrize(
+    ("traversal", "reason"),
+    [
+        (BETA, "carry no next"),
+        (CountedTraversal(), "exact total"),
+        (_OBSERVED_COUNT_COUNTED, "exact total"),
+    ],
+    ids=["sequential", "counted", "counted-observed-count"],
+)
+@pytest.mark.parametrize("v3_batch", [True, False], ids=["v3-batch", "no-v3-batch"])
+async def test_a_homogeneous_v3_reference_the_route_cannot_serve_is_refused_when_composed(
+    traversal: TraversalSpec, reason: str, *, v3_batch: bool
+) -> None:
+    """The route rules the traversal out whatever the dispatch, so its refusal comes before the batch one."""
+    portal = _WirePortal(_answer, v3_batch=v3_batch)
     async with _client(portal) as api:
-        with pytest.raises(CapabilityError, match="OBSERVED_COUNT"):
+        with pytest.raises(CapabilityError, match=reason):
             api.iter_references(
                 Request.v3("beta.list", {}, ReplaySafety.SAFE),
                 [_binding(1)],

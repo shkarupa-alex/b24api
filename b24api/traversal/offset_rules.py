@@ -36,7 +36,8 @@ def offset_route_incompatibility(offset: OffsetSpec, route: RouteKind) -> Capabi
     if route is RouteKind.API_V3 and reads_server_next(offset):
         return CapabilityError(
             "REST v3 list answers carry no next, so SERVER_NEXT would end at the first page; "
-            "declare OffsetContinuation.OBSERVED_COUNT, or FIXED_STEP for an endpoint with a fixed page window"
+            "declare OffsetContinuation.OBSERVED_COUNT, or FIXED_STEP with a declared short-page closure "
+            "for an endpoint with a fixed page window"
         )
     return None
 

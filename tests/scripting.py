@@ -430,7 +430,8 @@ class BatchPortal:
 class RoutePortal(BatchPortal):
     """A ``BatchPortal`` that declares every route, so ``.json`` and REST v3 requests reach ``answer`` too.
 
-    It serves named parameters only; a subclass that declares ``json_array_body`` also answers array bodies.
+    It serves named parameters only: a subclass that declares ``json_array_body`` must override ``send_wire``
+    to answer array bodies too.
     """
 
     @property

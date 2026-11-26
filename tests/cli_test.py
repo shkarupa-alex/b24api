@@ -22,6 +22,7 @@ from b24api import (
     IdentitySpec,
     KeysetCapabilityError,
     KeysetSpec,
+    OffsetContinuation,
     OffsetSpec,
     OperationReport,
     ParameterPath,
@@ -505,6 +506,23 @@ def test_sequential_default_is_mechanics_only_and_reports_once(monkeypatch: pyte
             ),
         ),
         (
+            "sequential",
+            # A REST v3 list carries no ``next``: its contract declares the observed-count progression.
+            {"version": 1, "offset": {"parameter_path": ["pagination", "offset"], "continuation": "observed_count"}},
+            "iter_list",
+            OffsetSpec(ParameterPath(("pagination", "offset")), continuation=OffsetContinuation.OBSERVED_COUNT),
+        ),
+        (
+            "sequential",
+            {
+                "version": 1,
+                "page_size": 25,
+                "offset": {"parameter_path": ["start"], "continuation": "fixed_step", "step": 25},
+            },
+            "iter_list",
+            OffsetSpec(ParameterPath(("start",)), continuation=OffsetContinuation.FIXED_STEP, step=25),
+        ),
+        (
             "counted",
             {
                 "version": 1,
@@ -625,6 +643,34 @@ def test_contract_rejects_orphan_and_unknown_fields(
     assert code == _USAGE
     assert stdout == ""
     assert json.loads(stderr)["kind"] == "usage_error"
+
+
+@pytest.mark.parametrize(
+    "offset",
+    [
+        {"parameter_path": ["start"], "continuation": "server_next_or_observed_count"},
+        {"parameter_path": ["start"], "continuation": 1},
+        {"parameter_path": ["start"], "continuation": "fixed_step"},
+        {"parameter_path": ["start"], "step": 50},
+        {"parameter_path": ["start"], "continuation": "fixed_step", "step": True},
+    ],
+    ids=["unknown", "not-a-string", "fixed-step-without-step", "step-without-fixed-step", "boolean-step"],
+)
+def test_an_invalid_offset_continuation_is_a_usage_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    offset: dict[str, object],
+) -> None:
+    client = _Client()
+    contract = _contract(tmp_path, {"version": 1, "offset": offset})
+    code, stdout, stderr = _run(
+        monkeypatch, client, ["list", "test.list", "--strategy", "sequential", "--contract", contract]
+    )
+
+    assert code == _USAGE
+    assert stdout == ""
+    assert json.loads(stderr)["kind"] == "usage_error"
+    assert client.calls == []
 
 
 def test_invalid_contract_is_rejected_before_client_construction(
