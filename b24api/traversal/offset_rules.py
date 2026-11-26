@@ -28,12 +28,19 @@ def reads_server_next(offset: OffsetSpec) -> bool:
 
 
 def offset_route_incompatibility(offset: OffsetSpec, route: RouteKind) -> CapabilityError | None:
-    """Return why the offset progression cannot run on the request's route, or None when it can.
+    """Return why the offset traversal cannot end truthfully on the request's route, or None when it can.
 
-    A REST v3 list answer carries neither ``next`` nor ``total``, so under ``SERVER_NEXT`` its first
-    page would end the traversal as complete with every later row unread.
+    A REST v3 list answer carries neither ``next`` nor ``total``: under ``SERVER_NEXT`` its first page would
+    end the traversal as complete with every later row unread, and an exact total could never be reached.
     """
-    if route is RouteKind.API_V3 and reads_server_next(offset):
+    if route is not RouteKind.API_V3:
+        return None
+    if offset.total_termination is TotalTermination.EXACT_QUALIFIED:
+        return CapabilityError(
+            "REST v3 list answers carry no total, so an exact-total traversal cannot complete; "
+            "traverse sequentially without TotalTermination.EXACT_QUALIFIED, with OffsetContinuation.OBSERVED_COUNT"
+        )
+    if reads_server_next(offset):
         return CapabilityError(
             "REST v3 list answers carry no next, so SERVER_NEXT would end at the first page; "
             "declare OffsetContinuation.OBSERVED_COUNT, or FIXED_STEP with a declared short-page closure "

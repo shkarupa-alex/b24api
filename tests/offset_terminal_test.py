@@ -664,16 +664,23 @@ def _v3_request() -> Request:
     return Request.v3("main.userfieldconfig.type.list", {"moduleId": "crm"}, ReplaySafety.SAFE)
 
 
+_V3_EXACT = replace(V3_OFFSET, total_termination=TotalTermination.EXACT_QUALIFIED)
+
+
 @pytest.mark.parametrize(
-    "offset",
-    [V3_OFFSET, replace(V3_OFFSET, total_termination=TotalTermination.EXACT_QUALIFIED)],
-    ids=["default", "exact-total"],
+    ("offset", "reason"),
+    [
+        (V3_OFFSET, "carry no next"),
+        (_V3_EXACT, "carry no total"),
+        (replace(_V3_EXACT, continuation=OffsetContinuation.OBSERVED_COUNT), "carry no total"),
+    ],
+    ids=["server-next", "exact-total", "observed-count-exact-total"],
 )
-def test_server_next_over_a_v3_list_is_refused_when_composed(offset: OffsetSpec) -> None:
-    """The first v3 page has no ``next``, so it would end the traversal as complete with the rest unread."""
+def test_a_v3_list_traversal_its_answers_cannot_end_is_refused_when_composed(offset: OffsetSpec, reason: str) -> None:
+    """A v3 page has no ``next`` and no ``total``: the first page would end the traversal, or none ever could."""
     portal = RoutePortal(_v3_list(17))
 
-    with pytest.raises(CapabilityError, match="OBSERVED_COUNT"):
+    with pytest.raises(CapabilityError, match=reason):
         _client(portal).iter_list(_v3_request(), selector=V3_ITEMS, page_size=2, offset=offset)
 
     assert portal.queries == []

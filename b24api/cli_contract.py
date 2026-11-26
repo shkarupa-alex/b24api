@@ -204,32 +204,33 @@ def _control_options(raw: Mapping[str, object], *, label: str) -> tuple[Paramete
     return limit_path, allow_create
 
 
+# A fixed step would need a page_size check and a short-page closure the contract cannot state, so it stays Python-only.
+_CLI_CONTINUATIONS = {
+    OffsetContinuation.SERVER_NEXT.value: OffsetContinuation.SERVER_NEXT,
+    OffsetContinuation.OBSERVED_COUNT.value: OffsetContinuation.OBSERVED_COUNT,
+}
+
+
 def _offset(raw: object, *, counted: bool) -> OffsetSpec:
-    # A counted traversal ends at the server's exact total, which it requires; a sequential one ends where its
-    # continuation says: at the page without ``next`` by default, or at an empty page.
+    # A counted traversal ends at the server's exact total, which it requires. A sequential one ends at the page
+    # without ``next`` by default; ``observed_count`` ends it at an empty page, for an endpoint that sends no
+    # ``next``, as REST v3 lists do.
     termination = TotalTermination.EXACT_QUALIFIED if counted else TotalTermination.DISABLED
     if raw is None:
         return OffsetSpec(total_termination=termination)
     if not isinstance(raw, dict):
         raise CliUsageError("offset must be an object")
-    _closed(raw, {"parameter_path", "limit_path", "allow_create_controls", "continuation", "step"}, label="offset")
+    fields = {"parameter_path", "limit_path", "allow_create_controls"}
+    _closed(raw, fields if counted else fields | {"continuation"}, label="offset")
     path = _path(raw.get("parameter_path"), label="offset.parameter_path")
     limit_path, allow_create = _control_options(raw, label="offset")
-    try:
-        continuation = OffsetContinuation(raw.get("continuation", OffsetContinuation.SERVER_NEXT.value))
-    except ValueError as error:
-        raise CliUsageError("offset.continuation is invalid") from error
-    try:
-        return OffsetSpec(
-            cast("ParameterPath", path),
-            limit_path,
-            allow_create,
-            continuation=continuation,
-            step=cast("int | None", raw.get("step")),
-            total_termination=termination,
-        )
-    except (TypeError, ValueError) as error:
-        raise CliUsageError("offset contract is invalid") from error
+    value = raw.get("continuation", OffsetContinuation.SERVER_NEXT.value)
+    continuation = _CLI_CONTINUATIONS.get(value) if isinstance(value, str) else None
+    if continuation is None:
+        raise CliUsageError("offset.continuation must be server_next or observed_count")
+    return OffsetSpec(
+        cast("ParameterPath", path), limit_path, allow_create, continuation=continuation, total_termination=termination
+    )
 
 
 def _keyset(raw: object) -> KeysetSpec:

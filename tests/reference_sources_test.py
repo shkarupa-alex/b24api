@@ -672,8 +672,8 @@ _OBSERVED_COUNT_COUNTED = CountedTraversal(
     ("traversal", "reason"),
     [
         (BETA, "carry no next"),
-        (CountedTraversal(), "exact total"),
-        (_OBSERVED_COUNT_COUNTED, "exact total"),
+        (CountedTraversal(), "carry no total"),
+        (_OBSERVED_COUNT_COUNTED, "carry no total"),
     ],
     ids=["sequential", "counted", "counted-observed-count"],
 )

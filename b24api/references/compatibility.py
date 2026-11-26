@@ -56,13 +56,8 @@ def source_incompatibility(
 
 
 def _route_incompatibility(request: Request, traversal: TraversalSpec) -> CapabilityError | None:
-    """Return why the request's route cannot end the traversal truthfully, or None when it can."""
-    if isinstance(traversal, CountedTraversal) and request.route is RouteKind.API_V3:
-        return CapabilityError(
-            "counted traversal needs an exact total, which REST v3 list answers never carry; "
-            "use SequentialTraversal with OffsetContinuation.OBSERVED_COUNT"
-        )
-    if isinstance(traversal, SequentialTraversal):
+    """Return why the request's route cannot end the offset traversal truthfully, or None when it can."""
+    if isinstance(traversal, SequentialTraversal | CountedTraversal):
         return offset_route_incompatibility(traversal.offset, request.route)
     return None
 

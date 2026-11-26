@@ -513,16 +513,6 @@ def test_sequential_default_is_mechanics_only_and_reports_once(monkeypatch: pyte
             OffsetSpec(ParameterPath(("pagination", "offset")), continuation=OffsetContinuation.OBSERVED_COUNT),
         ),
         (
-            "sequential",
-            {
-                "version": 1,
-                "page_size": 25,
-                "offset": {"parameter_path": ["start"], "continuation": "fixed_step", "step": 25},
-            },
-            "iter_list",
-            OffsetSpec(ParameterPath(("start",)), continuation=OffsetContinuation.FIXED_STEP, step=25),
-        ),
-        (
             "counted",
             {
                 "version": 1,
@@ -646,25 +636,29 @@ def test_contract_rejects_orphan_and_unknown_fields(
 
 
 @pytest.mark.parametrize(
-    "offset",
+    ("strategy", "offset"),
     [
-        {"parameter_path": ["start"], "continuation": "server_next_or_observed_count"},
-        {"parameter_path": ["start"], "continuation": 1},
-        {"parameter_path": ["start"], "continuation": "fixed_step"},
-        {"parameter_path": ["start"], "step": 50},
-        {"parameter_path": ["start"], "continuation": "fixed_step", "step": True},
+        ("sequential", {"parameter_path": ["start"], "continuation": "server_next_or_observed_count"}),
+        ("sequential", {"parameter_path": ["start"], "continuation": 1}),
+        ("sequential", {"parameter_path": ["start"], "continuation": ["observed_count"]}),
+        # A fixed step needs a page_size check and a short-page closure the contract cannot state.
+        ("sequential", {"parameter_path": ["start"], "continuation": "fixed_step"}),
+        ("sequential", {"parameter_path": ["start"], "continuation": "fixed_step", "step": 50}),
+        # A counted traversal ends at its exact total; its progression is not the contract's to choose.
+        ("counted", {"parameter_path": ["start"], "continuation": "observed_count"}),
     ],
-    ids=["unknown", "not-a-string", "fixed-step-without-step", "step-without-fixed-step", "boolean-step"],
+    ids=["unknown", "not-a-string", "unhashable", "fixed-step", "step", "counted"],
 )
 def test_an_invalid_offset_continuation_is_a_usage_error(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    strategy: str,
     offset: dict[str, object],
 ) -> None:
     client = _Client()
     contract = _contract(tmp_path, {"version": 1, "offset": offset})
     code, stdout, stderr = _run(
-        monkeypatch, client, ["list", "test.list", "--strategy", "sequential", "--contract", contract]
+        monkeypatch, client, ["list", "test.list", "--strategy", strategy, "--contract", contract]
     )
 
     assert code == _USAGE
