@@ -54,7 +54,7 @@ from b24api.traversal.keyset_fast_stream import KeysetFastStream
 from b24api.traversal.keyset_observation import FastTraceRecorder
 from b24api.traversal.keyset_runtime import KeysetRuntime
 from b24api.traversal.keyset_step import sequential_keyset_plan
-from b24api.traversal.offset_rules import sequential_offset_plan
+from b24api.traversal.offset_rules import offset_route_incompatibility, sequential_offset_plan
 from b24api.traversal.plans import (
     CountedOffsetMode,
     CountedOffsetPlan,
@@ -121,6 +121,9 @@ def sequential_stream(  # noqa: PLR0913
 ) -> OperationStream[JsonValue]:
     """Compose conservative sequential offset/server-next traversal."""
     ledger = _checked_identity_store(identity_store, identity)
+    unreadable = offset_route_incompatibility(offset, canonical_request(request).route)
+    if unreadable is not None:
+        raise unreadable
     # The plan's duplicate policy is the most lenient one it admits: the stronger of it and the caller's
     # ``ConsistencyPolicy.duplicate_policy`` applies, so duplicates fail the traversal unless the caller
     # asks to report them.

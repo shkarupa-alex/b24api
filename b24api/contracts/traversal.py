@@ -22,6 +22,7 @@ from b24api.contracts.request import (
     IdentitySpec,
     ParameterPath,
     ResultSelector,
+    RouteKind,
     TraversalIdentity,
     _MappingValuesResultSelector,
 )
@@ -262,6 +263,29 @@ class OffsetSpec:
 
 
 _COUNTED_OFFSET = OffsetSpec(total_termination=TotalTermination.EXACT_QUALIFIED)
+
+
+def reads_server_next(offset: OffsetSpec) -> bool:
+    """Return whether the traversal advances by the server's ``next`` and ends at the page without one.
+
+    A page index owns progression: its continuation stays at the default and is never read.
+    """
+    return offset.continuation is OffsetContinuation.SERVER_NEXT and offset.page_index is None
+
+
+def unreadable_list_field(offset: OffsetSpec, route: RouteKind) -> Literal["next", "total"] | None:
+    """Return the list-answer field the offset traversal must read but answers on the route never carry.
+
+    A REST v3 list answer holds its items alone: under ``SERVER_NEXT`` its first page would end the traversal
+    as complete with every later row unread, and an exact total could never be reached.
+    """
+    if route is not RouteKind.API_V3:
+        return None
+    if offset.total_termination is TotalTermination.EXACT_QUALIFIED:
+        return "total"
+    if reads_server_next(offset):
+        return "next"
+    return None
 
 
 @dataclass(frozen=True, slots=True)

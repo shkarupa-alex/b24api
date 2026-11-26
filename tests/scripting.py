@@ -18,10 +18,11 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import parse_qsl, urlsplit
 
-from b24api import Bitrix24, ExecutionPolicy, Settings
+from b24api import Bitrix24, ExecutionPolicy, Request, Settings
+from b24api.contracts.request import RouteKind
 from b24api.encoding import encode_php_query
 from b24api.references import dispatch as dispatch_module
-from b24api.transport import WireResponse
+from b24api.transport import TransportCapabilities, WireResponse
 from b24api.traversal import keyset_plan
 
 if TYPE_CHECKING:
@@ -29,8 +30,9 @@ if TYPE_CHECKING:
 
     import pytest
 
-    from b24api import Request, Transport
+    from b24api import Transport
     from b24api.contracts import UnknownRequestAudit
+    from b24api.transport import WireRequest
 
 HOST = "fixture.invalid"
 _JSON = (("content-type", "application/json"),)
@@ -422,3 +424,22 @@ class BatchPortal:
 
     async def aclose(self) -> None:
         """Nothing to release."""
+
+
+@dataclass
+class RoutePortal(BatchPortal):
+    """A ``BatchPortal`` that declares every route, so ``.json`` and REST v3 requests reach ``answer`` too.
+
+    It serves named parameters only: a subclass that declares ``json_array_body`` must override ``send_wire``
+    to answer array bodies too.
+    """
+
+    @property
+    def capabilities(self) -> TransportCapabilities:
+        """Declare every route and no other advanced feature."""
+        return TransportCapabilities(routes=frozenset(RouteKind))
+
+    async def send_wire(self, request: WireRequest, *, attempt_timeout: float, max_response_bytes: int) -> WireResponse:
+        """Answer the request as the classic portal would, whatever its route."""
+        canonical = Request(request.method, request.copy_parameters(), request.replay_safety, route=request.route)
+        return await self.send(canonical, attempt_timeout=attempt_timeout, max_response_bytes=max_response_bytes)

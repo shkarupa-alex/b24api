@@ -12,6 +12,7 @@ from b24api import (
     CursorSpec,
     IdentitySpec,
     KeysetSpec,
+    OffsetContinuation,
     OffsetSpec,
     ParameterPath,
     PartitionedKeysetExecution,
@@ -35,6 +36,7 @@ from b24api.contracts import (
 )
 from b24api.contracts.dispatch import PORTAL_BATCH_CAP
 from b24api.contracts.keyset_execution import KeysetExecutionJson
+from b24api.contracts.traversal import unreadable_list_field
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -204,16 +206,29 @@ def _control_options(raw: Mapping[str, object], *, label: str) -> tuple[Paramete
 
 
 def _offset(raw: object, *, counted: bool) -> OffsetSpec:
-    # A counted traversal ends at the server's exact total, which it requires; a sequential one ends at an empty page.
+    # A counted traversal ends at the server's exact total, which it requires. A sequential one ends at the page
+    # without ``next`` by default; ``observed_count`` ends it at an empty page, for an endpoint that sends no
+    # ``next``, as REST v3 lists do.
     termination = TotalTermination.EXACT_QUALIFIED if counted else TotalTermination.DISABLED
     if raw is None:
         return OffsetSpec(total_termination=termination)
     if not isinstance(raw, dict):
         raise CliUsageError("offset must be an object")
-    _closed(raw, {"parameter_path", "limit_path", "allow_create_controls"}, label="offset")
+    fields = {"parameter_path", "limit_path", "allow_create_controls"}
+    _closed(raw, fields if counted else fields | {"continuation"}, label="offset")
     path = _path(raw.get("parameter_path"), label="offset.parameter_path")
     limit_path, allow_create = _control_options(raw, label="offset")
-    return OffsetSpec(cast("ParameterPath", path), limit_path, allow_create, total_termination=termination)
+    # A fixed step would need a page_size check and a short-page closure the contract cannot state: Python-only.
+    continuation = raw.get("continuation", OffsetContinuation.SERVER_NEXT.value)
+    if continuation not in (OffsetContinuation.SERVER_NEXT.value, OffsetContinuation.OBSERVED_COUNT.value):
+        raise CliUsageError("offset.continuation must be server_next or observed_count")
+    return OffsetSpec(
+        cast("ParameterPath", path),
+        limit_path,
+        allow_create,
+        continuation=OffsetContinuation(cast("str", continuation)),
+        total_termination=termination,
+    )
 
 
 def _keyset(raw: object) -> KeysetSpec:
@@ -403,6 +418,23 @@ def parse_list_contract(strategy: str, contract: dict[str, object]) -> ListContr
     )
 
 
+def require_list_route(route: ListContractRoute, request: Request) -> None:
+    """Refuse, as a usage error before any client exists, an offset contract the request's route cannot end."""
+    if not isinstance(route.mechanics, OffsetSpec):
+        return
+    match unreadable_list_field(route.mechanics, request.route):
+        case "total":
+            raise CliUsageError(
+                'REST v3 list answers carry no total: use --strategy sequential with "continuation": "observed_count"'
+            )
+        case "next":
+            raise CliUsageError(
+                'REST v3 list answers carry no next: declare "continuation": "observed_count" in the offset contract'
+            )
+        case None:
+            return
+
+
 def list_stream(
     client: Bitrix24,
     *,
@@ -457,4 +489,5 @@ __all__ = [
     "parse_list_contract",
     "parse_verify_keyset_contract",
     "read_json_source",
+    "require_list_route",
 ]

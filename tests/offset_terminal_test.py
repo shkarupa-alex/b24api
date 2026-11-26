@@ -9,6 +9,7 @@ portal): ``crm.lead.list``, ``crm.deal.list``, ``crm.activity.list`` and ``tasks
 """
 
 from __future__ import annotations
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -34,6 +35,7 @@ from b24api import (
 from b24api.contracts import (
     ConsistencyPolicy,
     ContinuationTraversal,
+    PageIndex,
     PageOutcome,
     PageRejectionCode,
     ResponseCursorRule,
@@ -41,8 +43,9 @@ from b24api.contracts import (
 )
 from b24api.contracts.completion import EMPTY_SOURCE_WITNESS
 from b24api.contracts.policy import ConfirmationPolicy, TotalSemantics
+from b24api.contracts.request import RouteKind
 from b24api.errors import ApiResponseError, ContinuationError, ContinuationReason, ResultShapeError
-from tests.scripting import BatchPortal, client_for
+from tests.scripting import BatchPortal, RoutePortal, client_for
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -622,3 +625,116 @@ async def test_a_failed_identity_store_is_traced_as_such() -> None:
 
     assert isinstance(error, IncompleteTraversalError)
     assert _report(stream).page_trace[-1].rejection_code is PageRejectionCode.IDENTITY_STORE
+
+
+# --- a REST v3 list carries no ``next`` (#80) -----------------------------------------------------
+
+V3_OFFSET = OffsetSpec(
+    parameter_path=ParameterPath(("pagination", "offset")), limit_path=ParameterPath(("pagination", "limit"))
+)
+V3_ITEMS = ResultSelector(("items",))
+# Whole pages of two: a fixed step without a declared short-page closure refuses a short page.
+V3_ROWS = 6
+
+
+def _v3_list(count: int) -> Callable[[str, Query], Envelope]:
+    """``main.userfieldconfig.type.list``: the offset is honored exactly and the answer holds its items alone."""
+    rows = _rows(count)
+
+    def answer(_method: str, query: Query) -> Envelope:
+        start, limit = int(query.get("pagination[offset]", "0")), int(query["pagination[limit]"])
+        return {"result": {"items": rows[start : start + limit]}}
+
+    return answer
+
+
+def _v3_pages(count: int) -> Callable[[str, Query], Envelope]:
+    """A REST v3 list paged by number from 1, as ``{"limit": n, "page": n}``."""
+    rows = _rows(count)
+
+    def answer(_method: str, query: Query) -> Envelope:
+        limit = int(query["pagination[limit]"])
+        start = (int(query["pagination[page]"]) - 1) * limit
+        return {"result": {"items": rows[start : start + limit]}}
+
+    return answer
+
+
+def _v3_request() -> Request:
+    return Request.v3("main.userfieldconfig.type.list", {"moduleId": "crm"}, ReplaySafety.SAFE)
+
+
+_V3_EXACT = replace(V3_OFFSET, total_termination=TotalTermination.EXACT_QUALIFIED)
+
+
+@pytest.mark.parametrize(
+    ("offset", "reason"),
+    [
+        (V3_OFFSET, "carry no next"),
+        (_V3_EXACT, "carry no total"),
+        (replace(_V3_EXACT, continuation=OffsetContinuation.OBSERVED_COUNT), "carry no total"),
+    ],
+    ids=["server-next", "exact-total", "observed-count-exact-total"],
+)
+def test_a_v3_list_traversal_its_answers_cannot_end_is_refused_when_composed(offset: OffsetSpec, reason: str) -> None:
+    """A v3 page has no ``next`` and no ``total``: the first page would end the traversal, or none ever could."""
+    portal = RoutePortal(_v3_list(17))
+
+    with pytest.raises(CapabilityError, match=reason):
+        _client(portal).iter_list(_v3_request(), selector=V3_ITEMS, page_size=2, offset=offset)
+
+    assert portal.queries == []
+
+
+@pytest.mark.asyncio
+async def test_a_classic_list_on_the_json_route_still_follows_next() -> None:
+    """The ``.json`` route answers the classic list envelope, with ``next``: only REST v3 refuses ``SERVER_NEXT``."""
+    portal = RoutePortal(_rounding(120))
+    request = Request("crm.lead.list", {}, ReplaySafety.SAFE, route=RouteKind.JSON)
+    stream = _client(portal).iter_list(request, identity=ID)
+
+    rows, error = await _drain(stream)
+
+    assert error is None
+    assert len(rows) == len(_rows(120))
+    assert _report(stream).terminal_reason == NO_CONTINUATION
+
+
+@pytest.mark.asyncio
+async def test_an_observed_count_v3_list_reads_a_short_last_page() -> None:
+    """The shape measured live: 17 rows at a page of 2 end with a short page and then an empty one."""
+    portal = RoutePortal(_v3_list(17))
+    offset = replace(V3_OFFSET, continuation=OffsetContinuation.OBSERVED_COUNT)
+    stream = _client(portal).iter_list(_v3_request(), selector=V3_ITEMS, page_size=2, offset=offset)
+
+    rows, error = await _drain(stream)
+
+    assert error is None
+    assert rows == _rows(17)
+    assert [int(query["pagination[offset]"]) for query in portal.queries] == [*range(0, 17, 2), 17]
+    assert _report(stream).terminal_reason == "empty page confirmed terminal"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "offset",
+    [
+        replace(V3_OFFSET, continuation=OffsetContinuation.OBSERVED_COUNT),
+        replace(V3_OFFSET, continuation=OffsetContinuation.FIXED_STEP, step=2),
+        OffsetSpec(
+            parameter_path=ParameterPath(("pagination", "page")),
+            limit_path=ParameterPath(("pagination", "limit")),
+            page_index=PageIndex(ParameterPath(("pagination", "page")), initial=1, increment=1, max_rows=2),
+        ),
+    ],
+    ids=["observed-count", "fixed-step", "page-index"],
+)
+async def test_a_v3_list_declaring_its_progression_reads_every_row(offset: OffsetSpec) -> None:
+    portal = RoutePortal(_v3_list(V3_ROWS) if offset.page_index is None else _v3_pages(V3_ROWS))
+    stream = _client(portal).iter_list(_v3_request(), selector=V3_ITEMS, page_size=2, offset=offset)
+
+    rows, error = await _drain(stream)
+
+    assert error is None
+    assert len(rows) == V3_ROWS
+    assert _report(stream).terminal_reason == "empty page confirmed terminal"
