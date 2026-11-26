@@ -20,6 +20,8 @@ from b24api import (
     IdentitySpec,
     KeysetSpec,
     KeysetTraversal,
+    OffsetContinuation,
+    OffsetSpec,
     ParameterPath,
     ParameterUpdate,
     ReplaySafety,
@@ -28,6 +30,7 @@ from b24api import (
     SequentialTraversal,
     Settings,
     TerminalState,
+    TotalTermination,
 )
 from b24api.contracts import (
     BoundedIdentityRange,
@@ -52,6 +55,7 @@ from tests.scripting import (
     BatchPortal,
     Envelope,
     Query,
+    RoutePortal,
     VirtualClock,
     assert_fired_near_deadline,
     deadline_started,
@@ -69,6 +73,10 @@ CURSOR = CursorSpec(ParameterPath(("BEFORE",)), ("ID",), IdentityCoercion.EXACT_
 ALPHA = CursorTraversal(selector=ResultSelector(), cursor=CURSOR, page_size=2)
 _LIMIT = ParameterPath(("limit",))
 BETA = SequentialTraversal(identity=ID, page_size=10)
+# A REST v3 list carries no ``next``: its source declares the observed-count progression.
+V3_BETA = SequentialTraversal(
+    identity=ID, page_size=10, offset=OffsetSpec(continuation=OffsetContinuation.OBSERVED_COUNT)
+)
 ALPHA_PAGES = {None: [4, 3], 3: [2, 1], 1: []}
 
 
@@ -567,8 +575,8 @@ async def test_a28_matrix_the_homogeneous_facade_keeps_its_preflight_rejection()
 
 
 @dataclass
-class _WirePortal(BatchPortal):
-    """A wire transport serving every route; ``json_array_body`` decides native v3 batch support."""
+class _WirePortal(RoutePortal):
+    """A portal serving every route; ``json_array_body`` decides native v3 batch support."""
 
     v3_batch: bool = False
     v3_envelopes: int = 0
@@ -581,12 +589,11 @@ class _WirePortal(BatchPortal):
         if request.array_body is not None:
             self.v3_envelopes += 1
             return WireResponse(200, (("content-type", "application/json"),), b'{"result":[{"error":"scripted"}]}')
-        canonical = Request(request.method, request.copy_parameters(), request.replay_safety, route=request.route)
-        return await self.send(canonical, attempt_timeout=attempt_timeout, max_response_bytes=max_response_bytes)
+        return await super().send_wire(request, attempt_timeout=attempt_timeout, max_response_bytes=max_response_bytes)
 
 
 def _v3_beta(parent: int) -> ReferenceSource[int]:
-    return ReferenceSource(Request.v3("beta.list", {}, ReplaySafety.SAFE), BETA, _binding(parent))
+    return ReferenceSource(Request.v3("beta.list", {}, ReplaySafety.SAFE), V3_BETA, _binding(parent))
 
 
 @pytest.mark.asyncio
@@ -614,7 +621,10 @@ async def test_a28_matrix_the_homogeneous_facade_rejects_v3_without_native_batch
     async with _client(portal) as api:
         with pytest.raises(CapabilityError, match="native REST v3 batch"):
             api.iter_references(
-                Request.v3("beta.list", {}, ReplaySafety.SAFE), [_binding(5)], traversal=BETA, dispatch=BatchDispatch()
+                Request.v3("beta.list", {}, ReplaySafety.SAFE),
+                [_binding(5)],
+                traversal=V3_BETA,
+                dispatch=BatchDispatch(),
             )
     assert portal.queries == []
     assert portal.v3_envelopes == 0
@@ -631,6 +641,60 @@ async def test_a28_matrix_a_v3_source_with_native_batch_support_is_admitted() ->
     assert _rows(events, 1) == [4]
     # A wave mixing the classic and the v3 dialect sends one envelope per dialect, and each one counts.
     assert report.batch_requests == report.physical_requests == portal.v3_envelopes + len(portal.waves)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch", [BatchDispatch(), DirectDispatch()], ids=["batch", "direct"])
+async def test_a28_matrix_a_v3_source_following_next_is_not_executed(dispatch: BatchDispatch | DirectDispatch) -> None:
+    """#80: a REST v3 list carries no ``next``, so a server-next source would end at its first page as complete."""
+    portal = _WirePortal(_answer, v3_batch=True)
+    source = ReferenceSource(Request.v3("beta.list", {}, ReplaySafety.SAFE), BETA, _binding(5))
+    async with _client(portal) as api:
+        events, report = await _collect(api, [source, _beta(9)], dispatch=dispatch)
+
+    not_executed = [event for event in events if isinstance(event, ReferenceNotExecuted)]
+    assert [(event.binding_index, event.correlation, event.reason) for event in not_executed] == [
+        (0, 5, NotExecutedReason.LOCAL_VALIDATION_FAILED)
+    ]
+    assert _rows(events, 1) == [4]
+    assert portal.v3_envelopes == 0
+    assert report.not_executed == 1
+
+
+_OBSERVED_COUNT_COUNTED = CountedTraversal(
+    offset=OffsetSpec(
+        continuation=OffsetContinuation.OBSERVED_COUNT, total_termination=TotalTermination.EXACT_QUALIFIED
+    )
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("traversal", "reason"),
+    [
+        (BETA, "carry no next"),
+        (CountedTraversal(), "carry no total"),
+        (_OBSERVED_COUNT_COUNTED, "carry no total"),
+    ],
+    ids=["sequential", "counted", "counted-observed-count"],
+)
+@pytest.mark.parametrize("v3_batch", [True, False], ids=["v3-batch", "no-v3-batch"])
+@pytest.mark.parametrize("dispatch", [BatchDispatch(), DirectDispatch()], ids=["batch", "direct"])
+async def test_a_homogeneous_v3_reference_the_route_cannot_serve_is_refused_when_composed(
+    traversal: TraversalSpec, reason: str, dispatch: BatchDispatch | DirectDispatch, *, v3_batch: bool
+) -> None:
+    """The route rules the traversal out whatever the dispatch, so its refusal comes before the batch one."""
+    portal = _WirePortal(_answer, v3_batch=v3_batch)
+    async with _client(portal) as api:
+        with pytest.raises(CapabilityError, match=reason):
+            api.iter_references(
+                Request.v3("beta.list", {}, ReplaySafety.SAFE),
+                [_binding(1)],
+                traversal=traversal,
+                dispatch=dispatch,
+            )
+    assert portal.queries == []
+    assert portal.v3_envelopes == 0
 
 
 @pytest.mark.asyncio

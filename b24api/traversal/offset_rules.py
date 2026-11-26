@@ -6,16 +6,41 @@ from typing import TYPE_CHECKING
 from b24api.completion.closure import DECLARED_SHORT_PAGE_REACHED, NO_CONTINUATION_REACHED, QUALIFIED_TOTAL_REACHED
 from b24api.contracts.policy import ConfirmationPolicy, DuplicatePolicy, IdentityRequirement, TotalSemantics
 from b24api.contracts.report import PageRejectionCode
-from b24api.contracts.traversal import OffsetContinuation, OffsetSpec, ShortPageTermination, TotalTermination
+from b24api.contracts.traversal import (
+    OffsetContinuation,
+    OffsetSpec,
+    ShortPageTermination,
+    TotalTermination,
+    reads_server_next,
+    unreadable_list_field,
+)
 from b24api.errors import CapabilityError, PaginationError
 from b24api.traversal.plans import OffsetSequentialPlan, OffsetTerminalRule
 
 _EMPTY_PAGE_TERMINAL = "empty page confirmed terminal"
 
 if TYPE_CHECKING:
-    from b24api.contracts.request import ParameterPath, Request
+    from b24api.contracts.request import ParameterPath, Request, RouteKind
     from b24api.contracts.response import Response
     from b24api.traversal.plans import CountedOffsetPlan
+
+
+def offset_route_incompatibility(offset: OffsetSpec, route: RouteKind) -> CapabilityError | None:
+    """Return why the offset traversal cannot end truthfully on the request's route, or None when it can."""
+    match unreadable_list_field(offset, route):
+        case "total":
+            return CapabilityError(
+                "REST v3 list answers carry no total, so TotalTermination.EXACT_QUALIFIED can never be reached; "
+                "drop it, in a sequential traversal that ends at an empty page (OffsetContinuation.OBSERVED_COUNT)"
+            )
+        case "next":
+            return CapabilityError(
+                "REST v3 list answers carry no next, so SERVER_NEXT would end at the first page; "
+                "declare OffsetContinuation.OBSERVED_COUNT (or FIXED_STEP with a declared short-page closure, "
+                "or a page_index, for an endpoint with a fixed page window)"
+            )
+        case None:
+            return None
 
 
 def offset_terminal_rules(offset: OffsetSpec) -> frozenset[OffsetTerminalRule]:
@@ -28,11 +53,7 @@ def offset_terminal_rules(offset: OffsetSpec) -> frozenset[OffsetTerminalRule]:
         return frozenset({OffsetTerminalRule.SPARSE_RAW_BOUND})
     if offset.short_page_termination is ShortPageTermination.DECLARED_TERMINAL:
         return frozenset({OffsetTerminalRule.EMPTY_PAGE, OffsetTerminalRule.DECLARED_SHORT_PAGE})
-    end = (
-        OffsetTerminalRule.NO_CONTINUATION
-        if offset.continuation is OffsetContinuation.SERVER_NEXT and offset.page_index is None
-        else OffsetTerminalRule.EMPTY_PAGE
-    )
+    end = OffsetTerminalRule.NO_CONTINUATION if reads_server_next(offset) else OffsetTerminalRule.EMPTY_PAGE
     if offset.total_termination is TotalTermination.DISABLED:
         return frozenset({end})
     return frozenset({end, OffsetTerminalRule.QUALIFIED_TOTAL})
