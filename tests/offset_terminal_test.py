@@ -43,6 +43,7 @@ from b24api.contracts import (
 )
 from b24api.contracts.completion import EMPTY_SOURCE_WITNESS
 from b24api.contracts.policy import ConfirmationPolicy, TotalSemantics
+from b24api.contracts.request import RouteKind
 from b24api.errors import ApiResponseError, ContinuationError, ContinuationReason, ResultShapeError
 from tests.scripting import BatchPortal, RoutePortal, client_for
 
@@ -676,6 +677,20 @@ def test_server_next_over_a_v3_list_is_refused_when_composed(offset: OffsetSpec)
         _client(portal).iter_list(_v3_request(), selector=V3_ITEMS, page_size=2, offset=offset)
 
     assert portal.queries == []
+
+
+@pytest.mark.asyncio
+async def test_a_classic_list_on_the_json_route_still_follows_next() -> None:
+    """The ``.json`` route answers the classic list envelope, with ``next``: only REST v3 refuses ``SERVER_NEXT``."""
+    portal = RoutePortal(_rounding(120))
+    request = Request("crm.lead.list", {}, ReplaySafety.SAFE, route=RouteKind.JSON)
+    stream = _client(portal).iter_list(request, identity=ID)
+
+    rows, error = await _drain(stream)
+
+    assert error is None
+    assert len(rows) == len(_rows(120))
+    assert _report(stream).terminal_reason == NO_CONTINUATION
 
 
 @pytest.mark.asyncio
