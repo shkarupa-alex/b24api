@@ -31,7 +31,7 @@ def offset_route_incompatibility(offset: OffsetSpec, route: RouteKind) -> Capabi
         case "total":
             return CapabilityError(
                 "REST v3 list answers carry no total, so TotalTermination.EXACT_QUALIFIED can never be reached; "
-                "drop it and declare OffsetContinuation.OBSERVED_COUNT in a sequential traversal"
+                "drop it, in a sequential traversal that ends at an empty page (OffsetContinuation.OBSERVED_COUNT)"
             )
         case "next":
             return CapabilityError(

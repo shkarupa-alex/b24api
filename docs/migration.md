@@ -286,19 +286,19 @@
   requires `TotalTermination.EXACT_QUALIFIED`. For hand-built plans, `OffsetTerminalRule` gains
   `NO_CONTINUATION`, the default end of an `OffsetSequentialPlan`, and a server-next plan must close
   with it and not with `EMPTY_PAGE`.
-- **Breaking: a REST v3 request refuses a traversal that follows `next` or needs an exact total.** A
-  REST v3 list answer (`RouteKind.API_V3`) holds the items alone, with no `next` and no `total`, so
-  under the default `SERVER_NEXT` its first page ended the traversal as complete and every later row
-  went unread; 2.6 read them, because the removed default fell back to the rows read. `iter_list()` and
-  sequential or counted reference traversals now raise `CapabilityError` when they are composed over
-  such a request with an `OffsetSpec` that follows `next` or ends at
-  `TotalTermination.EXACT_QUALIFIED`, which a counted traversal always does; a heterogeneous source is
-  not executed. `iter_list_counted()` already refused every route but the classic one. Declare
+- **Breaking: a REST 3.0 request refuses a traversal that follows `next` or needs an exact total.**
+  A REST 3.0 list answer (`RouteKind.API_V3`) holds the items alone, with no `next` and no `total`,
+  so under the default `SERVER_NEXT` its first page ended the traversal as complete and every later
+  row went unread; 2.6 read them, because the removed default fell back to the rows read.
+  `iter_list()` and sequential or counted reference traversals now raise `CapabilityError` when they
+  are composed over such a request with an `OffsetSpec` that follows `next` or ends at
+  `TotalTermination.EXACT_QUALIFIED`, which a counted traversal always does; a heterogeneous source
+  is not executed. `iter_list_counted()` already refused every route but the classic one. Declare
   `OffsetContinuation.OBSERVED_COUNT`; `FIXED_STEP` also works, but without a declared short-page
-  closure it refuses a short last page. A `page_index` declares its own progression and is unaffected.
-  The CLI's sequential `offset` contract accepts `continuation` (`server_next` or `observed_count`), so
-  `b24api list` can read such a list, and refuses with a usage error, before any client is built, an
-  `--route api_v3` contract that would follow `next` or need a total.
+  closure it refuses a short last page. A `page_index` declares its own progression and never reads
+  `next`. The CLI's sequential `offset` contract accepts `continuation` (`server_next` or
+  `observed_count`), so `b24api list` can read such a list, and refuses with a usage error, before
+  any client is built, a contract that would follow `next` or need a total under `--route api_v3`.
 - **Breaking: rows that do not reach the reported total never complete.** A traversal under
   `SERVER_NEXT` that started at the first page compares the `total` of its last page (or of the latest
   page that had one) with the rows it read; when they differ it raises `IncompleteTraversalError`
