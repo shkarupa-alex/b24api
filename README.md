@@ -567,7 +567,9 @@ without a leading zero, with a minus only before a non-zero value (`"0"`, `"12"`
 
 `OffsetContinuation.SERVER_NEXT` is the default. An endpoint that honors `start` exactly but sends no
 `next` declares `OffsetContinuation.OBSERVED_COUNT`: the next offset is the current one plus the rows
-read, and an empty page ends the traversal. Such an endpoint has no Bitrix list envelope, so its
+read, and an empty page ends the traversal. A REST v3 list (`RouteKind.API_V3`) is such an endpoint: its
+answer holds the items alone, with no `next` and no `total`, so `SERVER_NEXT` on that route is refused
+with `CapabilityError` when the traversal is composed. Such an endpoint has no Bitrix list envelope, so its
 `total` is not read unless the caller qualifies it (`EXACT_QUALIFIED`, or an `ADVISORY` comparison);
 the same holds for `FIXED_STEP`. An empty page that still carries `next` is refused only where `next`
 is followed, under `SERVER_NEXT`; cursor, continuation and window traversals, an observed count and a

@@ -13,10 +13,11 @@ from typing import TYPE_CHECKING
 from b24api.contracts.dispatch import BatchDispatch, DirectDispatch
 from b24api.contracts.keyset_execution import AutoKeysetExecution, SequentialKeysetExecution
 from b24api.contracts.request import RouteKind
-from b24api.contracts.traversal import CountedTraversal, KeysetTraversal
+from b24api.contracts.traversal import CountedTraversal, KeysetTraversal, SequentialTraversal
 from b24api.contracts.wire import BodyEncoding
 from b24api.errors import CapabilityError
 from b24api.traversal.keyset_eligibility import BOUNDARY_WAVE_COMMANDS
+from b24api.traversal.offset_rules import offset_route_incompatibility
 
 if TYPE_CHECKING:
     from b24api.contracts.dispatch import DispatchSpec
@@ -33,7 +34,7 @@ def source_incompatibility(
     *,
     v3_batch: bool,
 ) -> CapabilityError | None:
-    """Return why one source cannot run under the operation's dispatch, or None when it can.
+    """Return why one source cannot run under the operation's dispatch or on its route, or None when it can.
 
     ``v3_batch`` is the operation transport's declared support for native REST v3 batch envelopes.
     """
@@ -41,6 +42,10 @@ def source_incompatibility(
         unbatchable = _batch_incompatibility(request, v3_batch=v3_batch)
         if unbatchable is not None:
             return unbatchable
+    if isinstance(traversal, SequentialTraversal | CountedTraversal):
+        unreadable = offset_route_incompatibility(traversal.offset, request.route)
+        if unreadable is not None:
+            return unreadable
     if isinstance(traversal, CountedTraversal) and isinstance(dispatch, DirectDispatch):
         return CapabilityError("counted reference traversal requires BatchDispatch")
     if isinstance(traversal, CountedTraversal) and page_stop is not None:

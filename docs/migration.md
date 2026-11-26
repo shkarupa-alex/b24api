@@ -286,6 +286,14 @@
   requires `TotalTermination.EXACT_QUALIFIED`. For hand-built plans, `OffsetTerminalRule` gains
   `NO_CONTINUATION`, the default end of an `OffsetSequentialPlan`, and a server-next plan must close
   with it and not with `EMPTY_PAGE`.
+- **Breaking: a REST v3 request refuses `SERVER_NEXT`.** A REST v3 list answer (`RouteKind.API_V3`)
+  holds the items alone, with no `next` and no `total`, so under the default `SERVER_NEXT` its first
+  page ended the traversal as complete and every later row went unread; 2.6 read them, because the
+  removed default fell back to the rows read. `iter_list()` and sequential or counted reference
+  traversals now raise `CapabilityError` when they are composed over such a request with an
+  `OffsetSpec` that follows `next`; a heterogeneous source is not executed. Declare
+  `OffsetContinuation.OBSERVED_COUNT`, or `FIXED_STEP` for an endpoint with a fixed page window; a
+  `page_index` declares its own progression and is unaffected.
 - **Breaking: rows that do not reach the reported total never complete.** A traversal under
   `SERVER_NEXT` that started at the first page compares the `total` of its last page (or of the latest
   page that had one) with the rows it read; when they differ it raises `IncompleteTraversalError`

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 from b24api.completion.closure import DECLARED_SHORT_PAGE_REACHED, NO_CONTINUATION_REACHED, QUALIFIED_TOTAL_REACHED
 from b24api.contracts.policy import ConfirmationPolicy, DuplicatePolicy, IdentityRequirement, TotalSemantics
 from b24api.contracts.report import PageRejectionCode
+from b24api.contracts.request_summary import RouteKind
 from b24api.contracts.traversal import OffsetContinuation, OffsetSpec, ShortPageTermination, TotalTermination
 from b24api.errors import CapabilityError, PaginationError
 from b24api.traversal.plans import OffsetSequentialPlan, OffsetTerminalRule
@@ -18,6 +19,28 @@ if TYPE_CHECKING:
     from b24api.traversal.plans import CountedOffsetPlan
 
 
+def reads_server_next(offset: OffsetSpec) -> bool:
+    """Return whether the traversal advances by the server's ``next`` and ends at the page without one.
+
+    A page index owns progression: its continuation stays at the default and is never read.
+    """
+    return offset.continuation is OffsetContinuation.SERVER_NEXT and offset.page_index is None
+
+
+def offset_route_incompatibility(offset: OffsetSpec, route: RouteKind) -> CapabilityError | None:
+    """Return why the offset progression cannot run on the request's route, or None when it can.
+
+    A REST v3 list answer carries neither ``next`` nor ``total``, so under ``SERVER_NEXT`` its first
+    page would end the traversal as complete with every later row unread.
+    """
+    if route is RouteKind.API_V3 and reads_server_next(offset):
+        return CapabilityError(
+            "REST v3 list answers carry no next, so SERVER_NEXT would end at the first page; "
+            "declare OffsetContinuation.OBSERVED_COUNT, or FIXED_STEP for an endpoint with a fixed page window"
+        )
+    return None
+
+
 def offset_terminal_rules(offset: OffsetSpec) -> frozenset[OffsetTerminalRule]:
     """Return the evidence that ends an offset traversal: the server's end, an empty page, or a declared rule.
 
@@ -28,11 +51,7 @@ def offset_terminal_rules(offset: OffsetSpec) -> frozenset[OffsetTerminalRule]:
         return frozenset({OffsetTerminalRule.SPARSE_RAW_BOUND})
     if offset.short_page_termination is ShortPageTermination.DECLARED_TERMINAL:
         return frozenset({OffsetTerminalRule.EMPTY_PAGE, OffsetTerminalRule.DECLARED_SHORT_PAGE})
-    end = (
-        OffsetTerminalRule.NO_CONTINUATION
-        if offset.continuation is OffsetContinuation.SERVER_NEXT and offset.page_index is None
-        else OffsetTerminalRule.EMPTY_PAGE
-    )
+    end = OffsetTerminalRule.NO_CONTINUATION if reads_server_next(offset) else OffsetTerminalRule.EMPTY_PAGE
     if offset.total_termination is TotalTermination.DISABLED:
         return frozenset({end})
     return frozenset({end, OffsetTerminalRule.QUALIFIED_TOTAL})
