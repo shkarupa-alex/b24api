@@ -6,47 +6,41 @@ from typing import TYPE_CHECKING
 from b24api.completion.closure import DECLARED_SHORT_PAGE_REACHED, NO_CONTINUATION_REACHED, QUALIFIED_TOTAL_REACHED
 from b24api.contracts.policy import ConfirmationPolicy, DuplicatePolicy, IdentityRequirement, TotalSemantics
 from b24api.contracts.report import PageRejectionCode
-from b24api.contracts.request_summary import RouteKind
-from b24api.contracts.traversal import OffsetContinuation, OffsetSpec, ShortPageTermination, TotalTermination
+from b24api.contracts.traversal import (
+    OffsetContinuation,
+    OffsetSpec,
+    ShortPageTermination,
+    TotalTermination,
+    reads_server_next,
+    unreadable_list_field,
+)
 from b24api.errors import CapabilityError, PaginationError
 from b24api.traversal.plans import OffsetSequentialPlan, OffsetTerminalRule
 
 _EMPTY_PAGE_TERMINAL = "empty page confirmed terminal"
 
 if TYPE_CHECKING:
-    from b24api.contracts.request import ParameterPath, Request
+    from b24api.contracts.request import ParameterPath, Request, RouteKind
     from b24api.contracts.response import Response
     from b24api.traversal.plans import CountedOffsetPlan
 
 
-def reads_server_next(offset: OffsetSpec) -> bool:
-    """Return whether the traversal advances by the server's ``next`` and ends at the page without one.
-
-    A page index owns progression: its continuation stays at the default and is never read.
-    """
-    return offset.continuation is OffsetContinuation.SERVER_NEXT and offset.page_index is None
-
-
 def offset_route_incompatibility(offset: OffsetSpec, route: RouteKind) -> CapabilityError | None:
-    """Return why the offset traversal cannot end truthfully on the request's route, or None when it can.
-
-    A REST v3 list answer carries neither ``next`` nor ``total``: under ``SERVER_NEXT`` its first page would
-    end the traversal as complete with every later row unread, and an exact total could never be reached.
-    """
-    if route is not RouteKind.API_V3:
-        return None
-    if offset.total_termination is TotalTermination.EXACT_QUALIFIED:
-        return CapabilityError(
-            "REST v3 list answers carry no total, so an exact-total traversal cannot complete; "
-            "traverse sequentially without TotalTermination.EXACT_QUALIFIED, with OffsetContinuation.OBSERVED_COUNT"
-        )
-    if reads_server_next(offset):
-        return CapabilityError(
-            "REST v3 list answers carry no next, so SERVER_NEXT would end at the first page; "
-            "declare OffsetContinuation.OBSERVED_COUNT, or FIXED_STEP with a declared short-page closure "
-            "for an endpoint with a fixed page window"
-        )
-    return None
+    """Return why the offset traversal cannot end truthfully on the request's route, or None when it can."""
+    match unreadable_list_field(offset, route):
+        case "total":
+            return CapabilityError(
+                "REST v3 list answers carry no total, so TotalTermination.EXACT_QUALIFIED can never be reached; "
+                "drop it and declare OffsetContinuation.OBSERVED_COUNT in a sequential traversal"
+            )
+        case "next":
+            return CapabilityError(
+                "REST v3 list answers carry no next, so SERVER_NEXT would end at the first page; "
+                "declare OffsetContinuation.OBSERVED_COUNT (or FIXED_STEP with a declared short-page closure, "
+                "or a page_index, for an endpoint with a fixed page window)"
+            )
+        case None:
+            return None
 
 
 def offset_terminal_rules(offset: OffsetSpec) -> frozenset[OffsetTerminalRule]:

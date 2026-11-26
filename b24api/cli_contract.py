@@ -36,6 +36,7 @@ from b24api.contracts import (
 )
 from b24api.contracts.dispatch import PORTAL_BATCH_CAP
 from b24api.contracts.keyset_execution import KeysetExecutionJson
+from b24api.contracts.traversal import unreadable_list_field
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -417,6 +418,23 @@ def parse_list_contract(strategy: str, contract: dict[str, object]) -> ListContr
     )
 
 
+def require_list_route(route: ListContractRoute, request: Request) -> None:
+    """Refuse, as a usage error before any client exists, an offset contract the request's route cannot end."""
+    if not isinstance(route.mechanics, OffsetSpec):
+        return
+    match unreadable_list_field(route.mechanics, request.route):
+        case "total":
+            raise CliUsageError(
+                'REST v3 list answers carry no total: use --strategy sequential with "continuation": "observed_count"'
+            )
+        case "next":
+            raise CliUsageError(
+                'REST v3 list answers carry no next: declare "continuation": "observed_count" in the offset contract'
+            )
+        case None:
+            return
+
+
 def list_stream(
     client: Bitrix24,
     *,
@@ -471,4 +489,5 @@ __all__ = [
     "parse_list_contract",
     "parse_verify_keyset_contract",
     "read_json_source",
+    "require_list_route",
 ]

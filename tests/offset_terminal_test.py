@@ -701,6 +701,21 @@ async def test_a_classic_list_on_the_json_route_still_follows_next() -> None:
 
 
 @pytest.mark.asyncio
+async def test_an_observed_count_v3_list_reads_a_short_last_page() -> None:
+    """The shape measured live: 17 rows at a page of 2 end with a short page and then an empty one."""
+    portal = RoutePortal(_v3_list(17))
+    offset = replace(V3_OFFSET, continuation=OffsetContinuation.OBSERVED_COUNT)
+    stream = _client(portal).iter_list(_v3_request(), selector=V3_ITEMS, page_size=2, offset=offset)
+
+    rows, error = await _drain(stream)
+
+    assert error is None
+    assert rows == _rows(17)
+    assert [int(query["pagination[offset]"]) for query in portal.queries] == [*range(0, 17, 2), 17]
+    assert _report(stream).terminal_reason == "empty page confirmed terminal"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "offset",
     [

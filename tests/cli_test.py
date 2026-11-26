@@ -636,27 +636,26 @@ def test_contract_rejects_orphan_and_unknown_fields(
 
 
 @pytest.mark.parametrize(
-    ("strategy", "offset"),
+    "offset",
     [
-        ("sequential", {"parameter_path": ["start"], "continuation": "server_next_or_observed_count"}),
-        ("sequential", {"parameter_path": ["start"], "continuation": 1}),
-        ("sequential", {"parameter_path": ["start"], "continuation": ["observed_count"]}),
+        {"parameter_path": ["start"], "continuation": "server_next_or_observed_count"},
+        {"parameter_path": ["start"], "continuation": 1},
+        {"parameter_path": ["start"], "continuation": ["observed_count"]},
         # A fixed step needs a page_size check and a short-page closure the contract cannot state.
-        ("sequential", {"parameter_path": ["start"], "continuation": "fixed_step"}),
-        ("sequential", {"parameter_path": ["start"], "continuation": "fixed_step", "step": 50}),
+        {"parameter_path": ["start"], "continuation": "fixed_step"},
+        {"parameter_path": ["start"], "continuation": "fixed_step", "step": 50},
     ],
     ids=["unknown", "not-a-string", "unhashable", "fixed-step", "step"],
 )
 def test_an_invalid_offset_continuation_is_a_usage_error(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    strategy: str,
     offset: dict[str, object],
 ) -> None:
     client = _Client()
     contract = _contract(tmp_path, {"version": 1, "offset": offset})
     code, stdout, stderr = _run(
-        monkeypatch, client, ["list", "test.list", "--strategy", strategy, "--contract", contract]
+        monkeypatch, client, ["list", "test.list", "--strategy", "sequential", "--contract", contract]
     )
 
     assert code == _USAGE
@@ -713,6 +712,70 @@ def test_invalid_contract_is_rejected_before_client_construction(
     assert code == _USAGE
     assert json.loads(stderr.getvalue())["kind"] == "usage_error"
     assert constructed is False
+
+
+@pytest.mark.parametrize(
+    ("strategy", "contract_value", "reason"),
+    [
+        ("sequential", None, "carry no next"),
+        ("sequential", {"version": 1, "offset": {"parameter_path": ["pagination", "offset"]}}, "carry no next"),
+        (
+            "counted",
+            {
+                "version": 1,
+                "identity": {"item_path": ["ID"], "filter_key": "ID", "order_key": "ID", "coercion": "exact_integer"},
+            },
+            "carry no total",
+        ),
+    ],
+    ids=["default", "server-next-contract", "counted"],
+)
+def test_an_offset_contract_a_v3_list_cannot_end_is_rejected_before_client_construction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    strategy: str,
+    contract_value: dict[str, object] | None,
+    reason: str,
+) -> None:
+    constructed = False
+
+    def unused_client() -> _Client:
+        nonlocal constructed
+        constructed = True
+        return _Client()
+
+    monkeypatch.setattr(cli, "_open_client", unused_client)
+    contract = [] if contract_value is None else ["--contract", _contract(tmp_path, contract_value)]
+    stderr = io.StringIO()
+    code = cli.main(
+        ["list", "main.userfieldconfig.type.list", "--route", "api_v3", "--strategy", strategy, *contract],
+        stdin=io.StringIO(),
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    error = json.loads(stderr.getvalue())
+    assert code == _USAGE
+    assert error["kind"] == "usage_error"
+    assert reason in error["message"]
+    assert '"continuation": "observed_count"' in error["message"]
+    assert constructed is False
+
+
+def test_a_v3_list_declaring_observed_count_reaches_iter_list(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    client = _Client()
+    contract = {"version": 1, "offset": {"parameter_path": ["pagination", "offset"], "continuation": "observed_count"}}
+    code, _, _ = _run(
+        monkeypatch,
+        client,
+        ["list", "main.userfieldconfig.type.list", "--route", "api_v3", "--contract", _contract(tmp_path, contract)],
+    )
+
+    assert code == 0
+    assert client.calls[0].request.route is RouteKind.API_V3
+    assert client.calls[0].kwargs["offset"] == OffsetSpec(
+        ParameterPath(("pagination", "offset")), continuation=OffsetContinuation.OBSERVED_COUNT
+    )
 
 
 def test_advanced_strategy_requires_contract_file(monkeypatch: pytest.MonkeyPatch) -> None:

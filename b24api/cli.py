@@ -36,6 +36,7 @@ from b24api.cli_contract import (
     parse_list_contract,
     parse_verify_keyset_contract,
     read_json_source,
+    require_list_route,
 )
 from b24api.contracts import Response
 
@@ -460,6 +461,7 @@ def _run(  # noqa: C901, PLR0911 - stable process-code boundary
             contract = default_contract(args.strategy, args.contract, input_stream, params=args.params)
             route = parse_list_contract(args.strategy, contract)
             request = cli_request(args.method, params, ReplaySafety.UNKNOWN, RouteKind(args.route))
+            require_list_route(route, request)
             _run_operation(_list(request, route, output_stream, error_stream))
         else:
             contract = default_contract("verify-keyset", args.contract, input_stream, params=args.params)

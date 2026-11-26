@@ -567,14 +567,14 @@ without a leading zero, with a minus only before a non-zero value (`"0"`, `"12"`
 
 `OffsetContinuation.SERVER_NEXT` is the default. An endpoint that honors `start` exactly but sends no
 `next` declares `OffsetContinuation.OBSERVED_COUNT`: the next offset is the current one plus the rows
-read, and an empty page ends the traversal. A REST v3 list (`RouteKind.API_V3`) is such an endpoint: its
-answer holds the items alone, with no `next` and no `total`, so on that route `SERVER_NEXT` and an exact
-total (`EXACT_QUALIFIED`, which counted traversal requires) are refused with `CapabilityError` when the
-traversal is composed. Such an endpoint has no Bitrix list envelope, so its
+read, and an empty page ends the traversal. Such an endpoint has no Bitrix list envelope, so its
 `total` is not read unless the caller qualifies it (`EXACT_QUALIFIED`, or an `ADVISORY` comparison);
-the same holds for `FIXED_STEP`. An empty page that still carries `next` is refused only where `next`
-is followed, under `SERVER_NEXT`; cursor, continuation and window traversals, an observed count and a
-fixed step do not read it. `ConsistencyPolicy(confirmation_policy=EMPTY_AFTER_BOUNDARY)`
+the same holds for `FIXED_STEP`. A REST v3 list (`RouteKind.API_V3`) answers with its items alone, with
+no `next` and no `total`: on that route a traversal that follows `next` (`SERVER_NEXT` without a
+`page_index`) or ends at an exact total (`EXACT_QUALIFIED`, which counted traversal requires) is
+refused with `CapabilityError` when it is composed. An empty page that still carries `next` is refused
+only where `next` is followed, under `SERVER_NEXT`; cursor, continuation and window traversals, an
+observed count and a fixed step do not read it. `ConsistencyPolicy(confirmation_policy=EMPTY_AFTER_BOUNDARY)`
 asks for such an empty page, so it is refused with `CapabilityError` before any request under
 `SERVER_NEXT`, whose end is the page without `next`.
 `TotalTermination.EXACT_QUALIFIED` requires every page to carry the same exact `total` and the rows
@@ -1225,7 +1225,7 @@ b24api list example.item.list --route bare --strategy counted --contract @counte
 The `--raw` CLI option selects the response envelope; it does not alter the Python API. Advanced
 list strategies use closed JSON `version: 1` contracts. A sequential `offset` contract may declare
 `continuation`: `server_next` (the default) or `observed_count`, which a REST v3 list needs. The
-entire contract is validated before client construction. `--params -` and `--contract -` read stdin (not both in one run); input that is
+entire contract, and its fit with `--route`, is validated before client construction. `--params -` and `--contract -` read stdin (not both in one run); input that is
 not UTF-8 or not valid JSON is a usage error. Output to a terminal or pipe that cannot write Unicode
 gets JSON with `\u` escapes instead of failing. Run `b24api --help` and `b24api list --help` for the compact option surface.
 
