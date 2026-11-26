@@ -644,12 +644,13 @@ async def test_a28_matrix_a_v3_source_with_native_batch_support_is_admitted() ->
 
 
 @pytest.mark.asyncio
-async def test_a28_matrix_a_v3_source_following_next_is_not_executed() -> None:
+@pytest.mark.parametrize("dispatch", [BatchDispatch(), DirectDispatch()], ids=["batch", "direct"])
+async def test_a28_matrix_a_v3_source_following_next_is_not_executed(dispatch: BatchDispatch | DirectDispatch) -> None:
     """#80: a REST v3 list carries no ``next``, so a server-next source would end at its first page as complete."""
     portal = _WirePortal(_answer, v3_batch=True)
     source = ReferenceSource(Request.v3("beta.list", {}, ReplaySafety.SAFE), BETA, _binding(5))
     async with _client(portal) as api:
-        events, report = await _collect(api, [source, _beta(9)], dispatch=BatchDispatch())
+        events, report = await _collect(api, [source, _beta(9)], dispatch=dispatch)
 
     not_executed = [event for event in events if isinstance(event, ReferenceNotExecuted)]
     assert [(event.binding_index, event.correlation, event.reason) for event in not_executed] == [
@@ -678,8 +679,9 @@ _OBSERVED_COUNT_COUNTED = CountedTraversal(
     ids=["sequential", "counted", "counted-observed-count"],
 )
 @pytest.mark.parametrize("v3_batch", [True, False], ids=["v3-batch", "no-v3-batch"])
+@pytest.mark.parametrize("dispatch", [BatchDispatch(), DirectDispatch()], ids=["batch", "direct"])
 async def test_a_homogeneous_v3_reference_the_route_cannot_serve_is_refused_when_composed(
-    traversal: TraversalSpec, reason: str, *, v3_batch: bool
+    traversal: TraversalSpec, reason: str, dispatch: BatchDispatch | DirectDispatch, *, v3_batch: bool
 ) -> None:
     """The route rules the traversal out whatever the dispatch, so its refusal comes before the batch one."""
     portal = _WirePortal(_answer, v3_batch=v3_batch)
@@ -689,7 +691,7 @@ async def test_a_homogeneous_v3_reference_the_route_cannot_serve_is_refused_when
                 Request.v3("beta.list", {}, ReplaySafety.SAFE),
                 [_binding(1)],
                 traversal=traversal,
-                dispatch=BatchDispatch(),
+                dispatch=dispatch,
             )
     assert portal.queries == []
     assert portal.v3_envelopes == 0
