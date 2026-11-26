@@ -204,13 +204,6 @@ def _control_options(raw: Mapping[str, object], *, label: str) -> tuple[Paramete
     return limit_path, allow_create
 
 
-# A fixed step would need a page_size check and a short-page closure the contract cannot state, so it stays Python-only.
-_CLI_CONTINUATIONS = {
-    OffsetContinuation.SERVER_NEXT.value: OffsetContinuation.SERVER_NEXT,
-    OffsetContinuation.OBSERVED_COUNT.value: OffsetContinuation.OBSERVED_COUNT,
-}
-
-
 def _offset(raw: object, *, counted: bool) -> OffsetSpec:
     # A counted traversal ends at the server's exact total, which it requires. A sequential one ends at the page
     # without ``next`` by default; ``observed_count`` ends it at an empty page, for an endpoint that sends no
@@ -224,12 +217,16 @@ def _offset(raw: object, *, counted: bool) -> OffsetSpec:
     _closed(raw, fields if counted else fields | {"continuation"}, label="offset")
     path = _path(raw.get("parameter_path"), label="offset.parameter_path")
     limit_path, allow_create = _control_options(raw, label="offset")
-    value = raw.get("continuation", OffsetContinuation.SERVER_NEXT.value)
-    continuation = _CLI_CONTINUATIONS.get(value) if isinstance(value, str) else None
-    if continuation is None:
+    # A fixed step would need a page_size check and a short-page closure the contract cannot state: Python-only.
+    continuation = raw.get("continuation", OffsetContinuation.SERVER_NEXT.value)
+    if continuation not in (OffsetContinuation.SERVER_NEXT.value, OffsetContinuation.OBSERVED_COUNT.value):
         raise CliUsageError("offset.continuation must be server_next or observed_count")
     return OffsetSpec(
-        cast("ParameterPath", path), limit_path, allow_create, continuation=continuation, total_termination=termination
+        cast("ParameterPath", path),
+        limit_path,
+        allow_create,
+        continuation=OffsetContinuation(cast("str", continuation)),
+        total_termination=termination,
     )
 
 

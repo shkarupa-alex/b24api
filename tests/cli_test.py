@@ -644,10 +644,8 @@ def test_contract_rejects_orphan_and_unknown_fields(
         # A fixed step needs a page_size check and a short-page closure the contract cannot state.
         ("sequential", {"parameter_path": ["start"], "continuation": "fixed_step"}),
         ("sequential", {"parameter_path": ["start"], "continuation": "fixed_step", "step": 50}),
-        # A counted traversal ends at its exact total; its progression is not the contract's to choose.
-        ("counted", {"parameter_path": ["start"], "continuation": "observed_count"}),
     ],
-    ids=["unknown", "not-a-string", "unhashable", "fixed-step", "step", "counted"],
+    ids=["unknown", "not-a-string", "unhashable", "fixed-step", "step"],
 )
 def test_an_invalid_offset_continuation_is_a_usage_error(
     monkeypatch: pytest.MonkeyPatch,
@@ -665,6 +663,31 @@ def test_an_invalid_offset_continuation_is_a_usage_error(
     assert stdout == ""
     assert json.loads(stderr)["kind"] == "usage_error"
     assert client.calls == []
+
+
+def test_a_counted_offset_contract_declares_no_continuation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A counted traversal ends at its exact total; its progression is not the contract's to choose."""
+    client = _Client()
+    identity = {"item_path": ["ID"], "filter_key": "ID", "order_key": "ID", "coercion": "exact_integer"}
+    valid = {"version": 1, "identity": identity, "offset": {"parameter_path": ["start"]}}
+    invalid = {
+        "version": 1,
+        "identity": identity,
+        "offset": {"parameter_path": ["start"], "continuation": "observed_count"},
+    }
+
+    accepted, _, _ = _run(
+        monkeypatch, client, ["list", "t.list", "--strategy", "counted", "--contract", _contract(tmp_path, valid)]
+    )
+    code, stdout, stderr = _run(
+        monkeypatch, client, ["list", "t.list", "--strategy", "counted", "--contract", _contract(tmp_path, invalid)]
+    )
+
+    assert accepted == 0
+    assert code == _USAGE
+    assert stdout == ""
+    assert json.loads(stderr)["kind"] == "usage_error"
+    assert len(client.calls) == 1
 
 
 def test_invalid_contract_is_rejected_before_client_construction(
