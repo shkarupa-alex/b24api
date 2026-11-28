@@ -1,5 +1,36 @@
 # Migration guide
 
+## Field names in error text, in any letter case
+
+- **A field name of the request is aliased in any letter case, in every text of an error.** Bitrix
+  field names ignore letter case and the server echoes them in its own, so `title` declared in
+  `select` now renders as `field#1` wherever `TITLE`, `title` or `Title` stands as a whole word: in
+  the code, `wire_code`, `code`, `normalized_code`, the description, `validation` and the body
+  preview. Before, only the request's exact spelling was aliased, so one error could show `field#1`
+  next to the name behind it. Letters fold one for one, so `ß` does not match `SS`.
+- **Breaking for code that matches error text: spellings that differ only in letter case share one
+  alias.** A request that declares both `TITLE` and `title` gets one `field#N` for both, and the
+  fields declared after the second spelling are renumbered without a gap. A short name now also
+  replaces an ordinary word in another letter case: with `ID` declared, `Invalid id` reads `Invalid
+  field#1`.
+- **A REST 3.0 code that is a field name in another letter case shows its alias.** It was
+  `[REDACTED]`; it is now the same `field#N` as the description shows.
+- **The `(normalized: …)` suffix of an `ApiResponseError` message is gone when the two codes differ
+  only in letter case.** `API error [ACCESS_DENIED] (normalized: access_denied): Access denied` now
+  reads `API error [ACCESS_DENIED]: Access denied`; the suffix stays for a code the normalized form
+  stripped of surrounding whitespace. The `normalized_code` attribute is unchanged.
+- **A code's safe `code` and `normalized_code` follow its wire code.** They are its lower-cased and
+  normalized spellings when the wire code is shown as it came and neither spelling names a request
+  field, and the rendered wire code otherwise: with `strasse` declared, the code `STRAßE` folds to
+  `strasse`, so every form shows `STRAßE` as sent. Before, each spelling of a classic code was
+  rendered on its own, so lower-casing could make one of them `[REDACTED]` or a different text than
+  the code shown beside it.
+- **The `[REDACTED]` mark is never taken for a field name.** With a field named `redacted`
+  declared, a hidden webhook URL in an error text reads `[REDACTED]`; it read `[field#1]` before
+  when the field was spelled `REDACTED`. A REST 3.0 code over 256 characters is also rendered only
+  once now: the codec renders it before the cut, and the error no longer renders the cut text again.
+- **An error with neither a code nor a description reads `API error`.** It read `API error: None`.
+
 ## Actions outside a JSON or form POST
 
 - **Breaking for code that matches or enumerates `BodyEncoding`: it gains `QUERY_STRING`.** Such a request sends its
@@ -1904,7 +1935,9 @@ reference queue spends physical requests and how it reports a failed or lost com
   `to_safe_dict()`. Before, all but two such codes of 16 or more characters with a digit in them
   (such as `BITRIX_REST_V3_EXCEPTION_ACCESSDENIEDEXCEPTION`) rendered as `[REDACTED]`. Code that matched
   `[REDACTED]` to detect a REST 3.0 failure should match the code instead. A structured code that
-  contains a registered or request secret in any letter case is now `[REDACTED]` as a whole.
+  contains a registered or request secret in any letter case is now `[REDACTED]` as a whole; a secret
+  shorter than six characters counts only where it stands as a whole word, with no ASCII letter,
+  digit, `_` or `-` beside it.
 - **Two REST 3.0 load limits are retried.** `RetryPolicy.transient_api_codes` now also lists
   `BITRIX_REST_V3_EXCEPTION_RATELIMITEXCEPTION` and
   `BITRIX_REST_V3_EXCEPTION_LIMITER_QUERYTIMELIMITEXCEPTION`, and
@@ -2013,9 +2046,9 @@ details.
    `AmbiguityPolicy.refusal_http_statuses` and `AmbiguityPolicy.refusal_api_codes`. A code or status
    you add to `RetryPolicy` alone retries `SAFE` work only; add it to the refusal sets too if it
    proves that Bitrix did not run the method. A fail-fast `batch()` is not split.
-10. **Error text.** Error descriptions show field names from your request as `field#N`, known V3
-    codes verbatim, and distinct hidden mapping keys as `[REDACTED#1]`, `[REDACTED#2]`, … Code that
-    parses error strings must accept these forms.
+10. **Error text.** Error descriptions show field names from your request, in any letter case, as
+    `field#N`, known V3 codes verbatim, and distinct hidden mapping keys as `[REDACTED#1]`,
+    `[REDACTED#2]`, … Code that parses error strings must accept these forms.
 11. **Mid-collection start with an exact total.** An offset traversal whose initial `start` differs
     from the plan's first offset raises `CapabilityError` before any request when
     `TotalTermination.EXACT_QUALIFIED` closes it. Start from the beginning, or use
@@ -2460,7 +2493,7 @@ latency-oriented workloads. The dispatcher shutdown remains cancellation-based; 
 - Unstructured status 408 and 5xx responses are ambiguous for `UNSAFE` and `UNKNOWN` requests;
   they are never replayed automatically. Structured Bitrix errors remain conclusive.
 - API error text preserves the portal's wire spelling and shows the normalized spelling only when
-  it differs. Match `.normalized_code`, not rendered text.
+  it differs other than in letter case. Match `.normalized_code`, not rendered text.
 - Boolean values in form and physical-batch bracket encoding are now `1` and `0`; the old `False`
   text was truthy to PHP.
 - `None` values were omitted from form and physical-batch bracket encoding; JSON encoding sends them as

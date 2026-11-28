@@ -333,7 +333,24 @@ async def test_embedded_error_contract_is_opt_in_and_preserves_wire_code() -> No
 
     assert captured.value.wire_code == "ACCESS_DENIED"
     assert captured.value.normalized_code == "access_denied"
-    assert "[ACCESS_DENIED] (normalized: access_denied)" in str(captured.value)
+    # The normalized spelling differs only in letter case, so the message does not repeat it.
+    assert str(captured.value) == "API error [ACCESS_DENIED]: Denied"
+
+
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [
+        ("ACCESS_DENIED", "API error [ACCESS_DENIED]: Denied"),
+        ("access_denied", "API error [access_denied]: Denied"),
+        (" ACCESS_DENIED ", "API error [ ACCESS_DENIED ] (normalized: access_denied): Denied"),
+        (400, "API error [400]: Denied"),
+    ],
+)
+def test_the_normalized_suffix_appears_only_when_it_differs_beyond_letter_case(code: str | int, message: str) -> None:
+    error = ApiResponseError(code=code, description="Denied")
+
+    assert str(error) == message
+    assert error.normalized_code == str(code).strip().casefold()
 
 
 @pytest.mark.asyncio
