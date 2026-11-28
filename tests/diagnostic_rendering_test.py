@@ -353,8 +353,56 @@ def test_a_field_name_is_aliased_in_any_ascii_letter_case_and_its_spellings_shar
     assert context.alias_text("TITLE title Title id ID TITLES SUBTITLE") == (
         "field#1 field#1 field#1 field#2 field#2 TITLES SUBTITLE"
     )
-    # Only ASCII letters fold: the other characters of a name must match as declared.
+    # Letters fold one for one, as ``re`` folds them: ``ß`` does not match ``SS``.
     assert context.alias_text("STRAßE straße STRASSE strasse") == "field#3 field#3 STRASSE strasse"
+
+
+@pytest.mark.parametrize(
+    ("declared", "echo"),
+    [
+        ("id", "bad \u0131d"),  # dotless i
+        ("status", "bad \u017ftatus"),  # long s
+        ("kind", "bad \u212aind"),  # Kelvin sign
+        ("\u0131d_x", "bad ID_X"),
+        ("Straße", "bad STRAẞE"),  # capital sharp s
+    ],
+)
+def test_a_field_name_is_aliased_in_any_unicode_letter_case(declared: str, echo: str) -> None:
+    context = diagnostic_context(Request("x.list", {"select": [declared]}, route=RouteKind.BARE))
+
+    assert context.alias_text(echo) == "bad field#1"
+
+
+@pytest.mark.parametrize(("declared", "code"), [("\u0131d_x", "ID_X"), ("kind", "\u212aIND"), ("Straße", "STRAẞE")])
+@pytest.mark.parametrize("v3", [True, False], ids=["v3", "classic"])
+def test_every_form_of_a_code_shows_the_alias_of_a_field_name_in_another_unicode_case(
+    declared: str,
+    code: str,
+    *,
+    v3: bool,
+) -> None:
+    request = Request("x.list", {"select": [declared]}, route=RouteKind.API_V3 if v3 else RouteKind.BARE)
+    body = {"error": {"code": code, "message": "bad"}} if v3 else {"error": code, "error_description": "bad"}
+    error = ProtocolCodec().error_from_http(status_code=400, body=body, diagnostics=diagnostic_context(request))
+
+    assert isinstance(error, ApiResponseError)
+    safe = error.to_safe_dict()
+    assert str(error) == "API error [field#1]: bad"
+    assert error.wire_code == safe["original_code"] == safe["code"] == safe["normalized_code"] == "field#1"
+
+
+def test_a_shown_classic_code_shows_its_derived_forms_even_when_lower_casing_changes_their_words() -> None:
+    # As sent, ``ß`` ends no word run; lower-cased and folded, ``ss`` would extend it to a heuristic credential.
+    error = ProtocolCodec().error_from_http(status_code=400, body={"error": "ABCDEFGHIJKLMNO1ß"})
+
+    assert isinstance(error, ApiResponseError)
+    safe = error.to_safe_dict()
+    assert str(error) == "API error [ABCDEFGHIJKLMNO1ß]"
+    assert (safe["code"], safe["normalized_code"]) == ("abcdefghijklmno1ß", "abcdefghijklmno1ss")
+
+
+def test_an_error_with_neither_code_nor_description_says_so() -> None:
+    assert str(ApiResponseError(code="", description=None)) == "API error"
 
 
 @pytest.mark.parametrize("declared", ["TITLE", "title"])

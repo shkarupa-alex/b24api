@@ -7,18 +7,23 @@
   `select` now renders as `field#1` wherever `TITLE`, `title` or `Title` stands as a whole word: in
   the code, `wire_code`, `code`, `normalized_code`, the description, `validation` and the body
   preview. Before, only the request's exact spelling was aliased, so one error could show `field#1`
-  next to the name behind it. Only ASCII letters fold; other characters must match as declared.
+  next to the name behind it. Letters fold one for one, so `ß` does not match `SS`.
 - **Breaking for code that matches error text: spellings that differ only in letter case share one
-  alias.** A request that declares both `TITLE` and `title` gets one `field#N` for both, and every
-  field first declared after the second spelling is numbered one lower than before. A short name now
-  also replaces an ordinary word in another letter case: with `ID` declared, `Invalid id` reads
-  `Invalid field#1`.
+  alias.** A request that declares both `TITLE` and `title` gets one `field#N` for both, and the
+  fields declared after the second spelling are renumbered without a gap. A short name now also
+  replaces an ordinary word in another letter case: with `ID` declared, `Invalid id` reads `Invalid
+  field#1`.
 - **A REST 3.0 code that is a field name in another letter case shows its alias.** It was
   `[REDACTED]`; it is now the same `field#N` as the description shows.
 - **The `(normalized: …)` suffix of an `ApiResponseError` message is gone when the two codes differ
   only in letter case.** `API error [ACCESS_DENIED] (normalized: access_denied): Access denied` now
   reads `API error [ACCESS_DENIED]: Access denied`; the suffix stays for a code the normalized form
-  stripped of surrounding whitespace. `normalized_code` and `to_safe_dict()` are unchanged.
+  stripped of surrounding whitespace. The `normalized_code` attribute is unchanged.
+- **A classic code's safe `code` and `normalized_code` follow its wire code.** They are its lower-cased
+  and normalized spellings when the wire code is shown as it came, and the rendered wire code
+  otherwise, as for a REST 3.0 code. Before, each spelling was rendered on its own, so lower-casing
+  could make one of them `[REDACTED]` or a different text than the code shown beside it.
+- **An error with neither a code nor a description reads `API error`.** It read `API error: None`.
 
 ## Actions outside a JSON or form POST
 

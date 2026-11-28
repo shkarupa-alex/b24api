@@ -6,7 +6,7 @@ credential can occupy the same slot. The context therefore replaces every name f
 request-local alias ``field#1``, ``field#2`` ... in first-appearance order, and never exposes the raw
 names: it has no serialization, its representation carries only a count, and pickling is refused.
 Bitrix field names ignore letter case and the server echoes them in its own, so a name is aliased in
-any ASCII letter case, and spellings that differ only in case share one alias.
+any letter case, and spellings that differ only in case share one alias.
 It is derived from one canonical request, is used only while rendering that request's errors and is
 never retained by an error, a report or a shared execution context.
 """
@@ -14,7 +14,7 @@ never retained by an error, a report or a shared execution context.
 from __future__ import annotations
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from typing import NoReturn
+from typing import NoReturn, cast
 
 from b24api.redaction import DEFAULT_SENSITIVE_KEYS, contains_secret, is_secret, replace_secrets, secret_values
 
@@ -48,7 +48,7 @@ class DiagnosticContext:
 
     def __repr__(self) -> str:
         """Return a representation that never contains a field name or a secret."""
-        return f"DiagnosticContext(fields={len(self._resolved())})"
+        return f"DiagnosticContext(fields={len(set(self._resolved().values()))})"
 
     def __reduce__(self) -> NoReturn:
         """Refuse serialization: the context holds raw caller field names."""
@@ -59,7 +59,8 @@ class DiagnosticContext:
         aliases = self._resolved()
         if self._pattern is None:
             return text
-        return self._pattern.sub(lambda match: aliases[match.group(0).casefold()], text)
+        # Every alternative of the pattern is one declared spelling's named group.
+        return self._pattern.sub(lambda match: aliases[cast("str", match.lastgroup)], text)
 
     def is_known_secret(self, value: str, *, ignore_case: bool = False) -> bool:
         """Report whether a whole value equals one of the request's own exact secrets."""
@@ -83,21 +84,23 @@ class DiagnosticContext:
         secrets = [value for name, value in self._headers if name.casefold().replace("-", "_") in _SENSITIVE_NAMES]
         secrets.extend(_sensitive_values(self._parameters or {}, depth=0))
         self._secrets = secret_values(secrets)
-        # Keyed by the folded name. The pattern holds every declared spelling and folds ASCII letters only,
-        # so a match differs from the spelling it matched at most in ASCII letter case and folds to its key.
-        aliases: dict[str, str] = {}
-        spellings: set[str] = set()
-        for name in _field_names(self._parameters or {}):
-            # An exact secret stays an exact secret: it is redacted, never merely aliased.
-            if name in self._secrets:
-                continue
-            spellings.add(name)
-            aliases.setdefault(name.casefold(), f"field#{len(aliases) + 1}")
+        # An exact secret stays an exact secret: it is redacted, never merely aliased.
+        spellings = list(
+            dict.fromkeys(name for name in _field_names(self._parameters or {}) if name not in self._secrets)
+        )
+        # Spellings that fold alike share one alias. The pattern ignores letter case as ``re`` does, letter for
+        # letter, so the alias of an echo comes from the group of the spelling it matched, never from folding it.
+        numbers: dict[str, str] = {}
+        for name in spellings:
+            numbers.setdefault(name.casefold(), f"field#{len(numbers) + 1}")
+        aliases = {f"s{index}": numbers[name.casefold()] for index, name in enumerate(spellings)}
         if aliases:
-            names = "|".join(re.escape(name) for name in sorted(spellings, key=lambda name: (-len(name), name)))
+            # Longest first, so a longer spelling wins over its own prefix at the same position.
+            groups = sorted(range(len(spellings)), key=lambda index: (-len(spellings[index]), spellings[index]))
+            names = "|".join(f"(?P<s{index}>{re.escape(spellings[index])})" for index in groups)
             self._pattern = re.compile(
                 rf"(?<![{_RUN_CHARACTERS}])(?:{names})(?![{_RUN_CHARACTERS}])",
-                re.IGNORECASE | re.ASCII,
+                re.IGNORECASE,
             )
         self._aliases = aliases
         return aliases
