@@ -116,7 +116,11 @@ def replace_secrets(text: str, secrets: frozenset[str]) -> str:
 
 
 def contains_secret(text: str, secrets: frozenset[str]) -> bool:
-    """Report whether ``replace_secrets`` would hide any part of ``text`` once letter case is ignored."""
+    """Report whether ``replace_secrets`` would hide any part of ``text`` once letter case is ignored.
+
+    A short secret must stand as a whole token either in the text as written or in its folded form: folding
+    can turn a neighbour such as ``ß`` into word characters (``ss``) that would hide the token boundary.
+    """
     folded = text.casefold()
     for secret in secrets:
         needle = secret.casefold()
@@ -124,7 +128,8 @@ def contains_secret(text: str, secrets: frozenset[str]) -> bool:
             continue
         if len(secret) >= MINIMUM_SECRET_LENGTH:
             return True
-        if re.search(rf"(?<![{_WORD_RUN}]){re.escape(needle)}(?![{_WORD_RUN}])", folded):
+        token = rf"(?<![{_WORD_RUN}])(?i:{re.escape(secret)})(?![{_WORD_RUN}])"
+        if re.search(token, text) or re.search(rf"(?<![{_WORD_RUN}]){re.escape(needle)}(?![{_WORD_RUN}])", folded):
             return True
     return False
 

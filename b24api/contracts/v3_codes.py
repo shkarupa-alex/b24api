@@ -11,9 +11,12 @@ REST 3.0 envelope is recognized by shape: an ASCII snake-case identifier of at l
 case with each word starting with a letter, or lower case of letters only. That shape is applied to
 nothing else: free text, a classic ``{"error": ...}`` code and every other channel keep the conservative
 bare-credential redaction, which hides any 16+ character run of letters and digits. Recognition never
-overrides a registered exact secret, the request's own secrets or its field names: a code holding a
-secret in any letter case is redacted whole, and one holding a request field name is aliased, or
-redacted when only its letter case differs from the request's spelling.
+overrides a registered exact secret, the request's own secrets or its field names. A code holding a
+secret in any letter case is redacted whole: a secret of ``MINIMUM_SECRET_LENGTH`` (6) characters or
+more wherever it stands, a shorter one only as a whole token, with no ``[A-Za-z0-9_-]`` beside it. With
+a five-character secret ``abcde``, ``ERROR.ABCDE`` is redacted and ``ERROR_ABCDE`` is shown. A code that is
+a request field name in any letter case is shown as its ``field#N`` alias; a name is aliased only as a
+whole token too, so a field name inside a longer code (``TITLE_EMPTY_VALUE``) is not aliased.
 
 Retry is decided by the policy, not by recognition. ``RetryPolicy.transient_api_codes`` and
 ``AmbiguityPolicy.refusal_api_codes`` include the server's load limiter codes by default; every other
@@ -77,12 +80,13 @@ def render_code(
 ) -> str:
     """Render one structured error code: exact secret, then known literal, then V3 shape, then free text.
 
-    Recognition never overrides an exact secret: a code that equals or contains a registered or request
-    secret, in any letter case, is redacted whole. A known literal is recognized up to letter case, so the
-    lower-cased public ``code`` attribute stays diagnosable. With ``v3_envelope``, the code came from
-    ``error.code`` of a REST 3.0 envelope, and a code of the V3 shape is shown unless it holds a request
-    field name in any letter case, which is aliased, or redacted when only its case differs. Anything
-    else is free text.
+    Recognition never overrides an exact secret: a code that holds a registered or request secret, in any
+    letter case, is redacted whole. A secret of ``MINIMUM_SECRET_LENGTH`` (6) characters or more counts
+    wherever it stands, a shorter one only as a whole token, with no ``[A-Za-z0-9_-]`` beside it. A known
+    literal is recognized up to letter case, so the lower-cased public ``code`` attribute stays
+    diagnosable. With ``v3_envelope``, the code came from ``error.code`` of a REST 3.0 envelope, and a
+    code of the V3 shape is shown, or as its ``field#N`` alias when it is a request field name in any
+    letter case. Anything else is free text, rendered as ``Redactor.render_text`` renders a description.
     """
     text = str(code)
     # Free-text replacement is case-sensitive, and a code is also shown lower-cased: a code that holds a
@@ -92,11 +96,8 @@ def render_code(
     if is_known_v3_code(text):
         return text
     if v3_envelope and is_v3_code_shape(text):
-        if context is None or not context.aliases_text(text):
-            return text
-        # A request field name, possibly in another letter case than the request spelled it, is never shown.
-        rendered = redactor.render_text(text, context=context)
-        return rendered if rendered != text else REDACTED
+        # The shape is one run of word characters: a request field name can only be the whole code.
+        return text if context is None else context.alias_text(text)
     return redactor.render_text(text, context=context)
 
 

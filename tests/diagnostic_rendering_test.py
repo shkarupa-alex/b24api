@@ -260,8 +260,8 @@ def test_physical_batch_renders_each_command_through_its_own_request() -> None:
         return [str(item.error) for item in outcomes if isinstance(item, CommandFailure)]
 
     assert asyncio.run(run()) == [
-        "API error [ERROR_FIELD] (normalized: error_field): field#2 denied",
-        "API error [ERROR_FIELD] (normalized: error_field): field#1 denied",
+        "API error [ERROR_FIELD]: field#2 denied",
+        "API error [ERROR_FIELD]: field#1 denied",
     ]
 
 
@@ -340,6 +340,172 @@ def test_v3_list_filters_and_operator_prefixes_share_one_alias_map() -> None:
     assert classic.alias_text("STATUS !=STATUS >=ID") == "field#1 !=field#1 >=field#2"
 
 
+def test_a_field_name_is_aliased_in_any_ascii_letter_case_and_its_spellings_share_one_alias() -> None:
+    context = diagnostic_context(
+        Request(
+            "crm.item.list",
+            {"select": ["title", "ID", "TITLE", "Straße"], "order": {"id": "asc"}},
+            route=RouteKind.BARE,
+        ),
+    )
+
+    assert repr(context) == "DiagnosticContext(fields=3)"
+    assert context.alias_text("TITLE title Title id ID TITLES SUBTITLE") == (
+        "field#1 field#1 field#1 field#2 field#2 TITLES SUBTITLE"
+    )
+    # Letters fold one for one, as ``re`` folds them: ``ß`` does not match ``SS``.
+    assert context.alias_text("STRAßE straße STRASSE strasse") == "field#3 field#3 STRASSE strasse"
+
+
+@pytest.mark.parametrize(
+    ("declared", "echo"),
+    [
+        ("id", "bad \u0131d"),  # dotless i
+        ("status", "bad \u017ftatus"),  # long s
+        ("kind", "bad \u212aind"),  # Kelvin sign
+        ("\u0131d_x", "bad ID_X"),
+        ("Straße", "bad STRAẞE"),  # capital sharp s
+    ],
+)
+def test_a_field_name_is_aliased_in_any_unicode_letter_case(declared: str, echo: str) -> None:
+    context = diagnostic_context(Request("x.list", {"select": [declared]}, route=RouteKind.BARE))
+
+    assert context.alias_text(echo) == "bad field#1"
+
+
+@pytest.mark.parametrize("neighbour", ["\u0131", "\u0130", "\u017f", "\u212a", "é", "."])
+def test_a_letter_outside_ascii_beside_a_field_name_leaves_it_a_whole_token(neighbour: str) -> None:
+    request = Request("x.list", {"select": ["title"]}, route=RouteKind.API_V3)
+    body = _v3_body("NOTE_REFUSED", f"{neighbour}title bad, TITLE{neighbour}", f"title{neighbour}")
+    error = ProtocolCodec().error_from_http(status_code=400, body=body, diagnostics=diagnostic_context(request))
+
+    assert isinstance(error, ApiResponseError)
+    assert error.description == f"{neighbour}field#1 bad, field#1{neighbour}"
+    assert error.validation[0].field == f"filter.field#1{neighbour}"
+    assert "title" not in _channels(error).casefold()
+
+
+@pytest.mark.parametrize(("declared", "code"), [("\u0131d_x", "ID_X"), ("kind", "\u212aIND"), ("Straße", "STRAẞE")])
+@pytest.mark.parametrize("v3", [True, False], ids=["v3", "classic"])
+def test_every_form_of_a_code_shows_the_alias_of_a_field_name_in_another_unicode_case(
+    declared: str,
+    code: str,
+    *,
+    v3: bool,
+) -> None:
+    request = Request("x.list", {"select": [declared]}, route=RouteKind.API_V3 if v3 else RouteKind.BARE)
+    body = {"error": {"code": code, "message": "bad"}} if v3 else {"error": code, "error_description": "bad"}
+    error = ProtocolCodec().error_from_http(status_code=400, body=body, diagnostics=diagnostic_context(request))
+
+    assert isinstance(error, ApiResponseError)
+    safe = error.to_safe_dict()
+    assert str(error) == "API error [field#1]: bad"
+    assert error.wire_code == safe["original_code"] == safe["code"] == safe["normalized_code"] == "field#1"
+
+
+def test_a_shown_classic_code_shows_its_derived_forms_even_when_lower_casing_changes_their_words() -> None:
+    # As sent, ``ß`` ends no word run; lower-cased and folded, ``ss`` would extend it to a heuristic credential.
+    error = ProtocolCodec().error_from_http(status_code=400, body={"error": "ABCDEFGHIJKLMNO1ß"})
+
+    assert isinstance(error, ApiResponseError)
+    safe = error.to_safe_dict()
+    assert str(error) == "API error [ABCDEFGHIJKLMNO1ß]"
+    assert (safe["code"], safe["normalized_code"]) == ("abcdefghijklmno1ß", "abcdefghijklmno1ss")
+
+
+@pytest.mark.parametrize(("declared", "code"), [("k3yss", "K3Yß"), ("strasse", "STRAßE"), ("file", "\ufb01LE")])
+def test_a_code_whose_folded_form_spells_a_field_name_shows_only_its_wire_spelling(declared: str, code: str) -> None:
+    request = Request("x.list", {"select": [declared]}, route=RouteKind.BARE)
+    error = ProtocolCodec().error_from_http(
+        status_code=400,
+        body={"error": code, "error_description": "bad"},
+        diagnostics=diagnostic_context(request),
+    )
+
+    assert isinstance(error, ApiResponseError)
+    safe = error.to_safe_dict()
+    assert error.wire_code == safe["code"] == safe["normalized_code"] == code
+    assert str(error) == f"API error [{code}]: bad"
+    assert declared not in _channels(error)
+
+
+def test_spellings_share_an_alias_exactly_when_the_pattern_matches_one_as_the_other() -> None:
+    context = diagnostic_context(
+        Request("x.list", {"select": ["\u0131d", "id", "Straße", "STRASSE"]}, route=RouteKind.BARE),
+    )
+
+    assert repr(context) == "DiagnosticContext(fields=3)"
+    assert context.alias_text("\u0131d ID id") == "field#1 field#1 field#1"
+    assert context.alias_text("Straße STRASSE") == "field#2 field#3"
+
+
+@pytest.mark.parametrize(
+    ("declared", "code", "start"),
+    [
+        ("redacted", f"https://a.bitrix24.ru/rest/1/{WEBHOOK_CREDENTIAL}/ ", "[REDACTED] x x"),
+        ("FIELD", "field ", "field#1 x x"),
+    ],
+)
+def test_an_overlong_v3_code_is_rendered_once(declared: str, code: str, start: str) -> None:
+    request = Request("x.list", {"select": [declared]}, route=RouteKind.API_V3)
+    body = _v3_body(code + "x " * 140, "bad")
+    error = ProtocolCodec().error_from_http(status_code=400, body=body, diagnostics=diagnostic_context(request))
+
+    assert isinstance(error, ApiResponseError)
+    assert error.truncated
+    assert error.wire_code.startswith(start)
+    assert error.to_safe_dict()["code"] == error.to_safe_dict()["normalized_code"] == error.wire_code
+
+
+def test_a_mark_of_hidden_text_is_never_taken_for_a_field_name() -> None:
+    request = Request("x.list", {"select": ["redacted", "TRUNCATED"]}, route=RouteKind.BARE)
+    description = f"see https://a.bitrix24.ru/rest/1/{WEBHOOK_CREDENTIAL}/ for redacted and truncated"
+    error = ProtocolCodec().error_from_http(
+        status_code=400,
+        body={"error": "BAD", "error_description": description, "echo": {USER_FIELD: 1, OTHER_USER_FIELD: 2}},
+        diagnostics=diagnostic_context(request),
+    )
+
+    assert isinstance(error, ApiResponseError)
+    assert error.description == "see [REDACTED] for field#1 and field#2"
+    assert error.evidence.body_preview is not None
+    assert '"echo":{"[REDACTED#1]":1,"[REDACTED#2]":2}' in error.evidence.body_preview
+
+
+def test_an_error_with_neither_code_nor_description_says_so() -> None:
+    assert str(ApiResponseError(code="", description=None)) == "API error"
+
+
+@pytest.mark.parametrize("declared", ["TITLE", "title"])
+def test_a_classic_code_and_its_derived_forms_alias_a_field_name_alike(declared: str) -> None:
+    request = Request("crm.deal.list", {"select": [declared]}, route=RouteKind.BARE)
+    error = ProtocolCodec().error_from_http(
+        status_code=400,
+        body={"error": "TITLE", "error_description": "TITLE bad, title bad"},
+        diagnostics=diagnostic_context(request),
+    )
+
+    assert isinstance(error, ApiResponseError)
+    safe = error.to_safe_dict()
+    assert str(error) == "API error [field#1]: field#1 bad, field#1 bad"
+    assert error.wire_code == safe["original_code"] == safe["code"] == safe["normalized_code"] == "field#1"
+    assert "title" not in _channels(error).casefold()
+
+
+def test_a_v3_description_and_validation_alias_a_field_name_in_any_letter_case() -> None:
+    request = Request("crm.item.list", {"entityTypeId": 2, "select": ["title"]}, route=RouteKind.API_V3)
+    body = _v3_body(VALIDATION_ERROR_CODE, "Field TITLE is required, field title is required", "TITLE", "title")
+    error = ProtocolCodec().error_from_http(status_code=400, body=body, diagnostics=diagnostic_context(request))
+
+    assert isinstance(error, ApiResponseError)
+    assert error.description == "Field field#1 is required, field field#1 is required"
+    assert [(issue.field, issue.message) for issue in error.validation] == [
+        ("filter.field#1", "field#1 is invalid"),
+        ("filter.field#1", "field#1 is invalid"),
+    ]
+    assert "title" not in _channels(error).casefold()
+
+
 def test_diagnostic_context_never_serializes_raw_names() -> None:
     context = diagnostic_context(Request("x.list", {"select": [UNREGISTERED_CREDENTIAL]}, route=RouteKind.BARE))
 
@@ -366,8 +532,9 @@ def test_c11_foreign_response_token_is_covered_only_by_the_heuristic() -> None:
     assert foreign not in _channels(error)
 
 
-def test_alias_words_as_field_names_are_aliased_exactly_once() -> None:
-    request = Request("x.list", {"select": ["field", "REDACTED"]}, route=RouteKind.BARE)
+@pytest.mark.parametrize("names", [("field", "REDACTED"), ("FIELD", "redacted")])
+def test_alias_words_as_field_names_are_aliased_exactly_once(names: tuple[str, str]) -> None:
+    request = Request("x.list", {"select": list(names)}, route=RouteKind.BARE)
     error = ProtocolCodec().error_from_http(
         status_code=400,
         body={"error": "BAD", "error_description": "field and REDACTED", "echo": {"field": 1, USER_FIELD: 2}},

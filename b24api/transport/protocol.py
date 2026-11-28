@@ -136,7 +136,7 @@ class ProtocolCodec:
             )
             if code_is_exact:
                 return self._bounded_v3_error(
-                    code=str(original_code),
+                    code=original_code,
                     description=description,
                     validation=validation,
                     truncated=truncated,
@@ -229,7 +229,7 @@ class ProtocolCodec:
     def _bounded_v3_error(  # noqa: PLR0913
         self,
         *,
-        code: str,
+        code: str | int,
         description: str | None,
         validation: tuple[ValidationIssue, ...],
         truncated: bool,
@@ -309,10 +309,10 @@ class ProtocolCodec:
             bounded.append(ValidationIssue(None if field is None else render(field), render(detail)))
         if len(code) > _MAX_VALIDATION_TEXT:
             # A code is cut only after redaction, like the texts above: cutting first would turn a known secret
-            # into a prefix that exact-secret redaction no longer recognizes.
-            code = render_code(code, redactor=self._redactor, context=diagnostics, v3_envelope=True)[
-                :_MAX_VALIDATION_TEXT
-            ]
+            # into a prefix that exact-secret redaction no longer recognizes. The cut code is already rendered.
+            code = SafeText(
+                render_code(code, redactor=self._redactor, context=diagnostics, v3_envelope=True)[:_MAX_VALIDATION_TEXT]
+            )
         return code, SafeText(render(message)), tuple(bounded), truncated
 
     @staticmethod
