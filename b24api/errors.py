@@ -141,10 +141,9 @@ class ApiResponseError(B24ApiError):
     wire code otherwise. The description is free text, rendered by ``Redactor.render_text``: exact secrets
     (one shorter than six characters only as a whole token) and credential-bearing forms such as webhook
     URLs and bearer tokens become ``[REDACTED]``; a request field name standing as a whole token, in any
-    letter case, becomes its ``field#N`` alias; and a token of 16 or more characters holding both a letter
-    and a digit, other than a 40- or 64-digit hexadecimal hash, becomes ``[REDACTED]`` unless a word
-    character outside ASCII touches it. ``validation`` is stored as given: the protocol codec renders its
-    texts the same way.
+    letter case, becomes its ``field#N`` alias; and the bare-credential heuristic of ``render_text`` hides a
+    long run of letters and digits holding both. ``validation`` is stored as given: the protocol codec
+    renders its texts the same way.
     """
 
     def __init__(  # noqa: PLR0913

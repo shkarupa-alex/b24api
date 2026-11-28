@@ -348,6 +348,12 @@ def test_a_short_secret_hides_a_code_only_as_a_whole_token(code: str, *, shown: 
     assert render_code(f"{code}F", redactor=longer, v3_envelope=True) == REDACTED
 
 
+@pytest.mark.parametrize("code", ["ABCDEß", "ßABCDE", "\u212aABCDE", "ABCDE\ufb01"])
+def test_a_short_secret_beside_a_letter_that_folds_into_word_characters_is_still_whole(code: str) -> None:
+    # Folded, ``ß`` becomes ``ss``, the Kelvin sign ``k`` and the ligature ``fi``; as written, none is ASCII.
+    assert render_code(code, redactor=Redactor(known_secrets=frozenset({"abcde"})), v3_envelope=True) == REDACTED
+
+
 def test_registered_and_request_secrets_beat_the_shape() -> None:
     webhook = secret_values((AUTH_VALUE,))
     codec = ProtocolCodec(redactor=Redactor(known_secrets=webhook))

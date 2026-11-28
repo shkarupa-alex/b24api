@@ -327,7 +327,8 @@ as `BITRIX_REST_V3_EXCEPTION_INVALIDSELECTEXCEPTION` or `FEATURE_NOT_AVAILABLE_O
 lower case of letters only, such as `invalid_select_field`; the server's set is open, so no list is
 kept. Error texts, classic
 `{"error": ...}` codes and response previews keep the conservative redaction, so a long run of
-letters and digits there still renders as `[REDACTED]`. A code that equals or contains your
+letters and digits there still renders as `[REDACTED]`; a code shown as it came keeps its
+lower-cased and normalized forms in `code` and `normalized_code`. A code that equals or contains your
 webhook token or a credential of the request, in any letter case, is always `[REDACTED]`; a secret
 shorter than six characters counts only where it stands as a whole word, with no ASCII letter,
 digit, `_` or `-` beside it. A field name of your request is shown as its `field#N` alias in every
