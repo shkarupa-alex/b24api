@@ -373,6 +373,18 @@ def test_a_field_name_is_aliased_in_any_unicode_letter_case(declared: str, echo:
     assert context.alias_text(echo) == "bad field#1"
 
 
+@pytest.mark.parametrize("neighbour", ["\u0131", "\u0130", "\u017f", "\u212a", "é", "."])
+def test_a_letter_outside_ascii_beside_a_field_name_leaves_it_a_whole_token(neighbour: str) -> None:
+    request = Request("x.list", {"select": ["title"]}, route=RouteKind.API_V3)
+    body = _v3_body("NOTE_REFUSED", f"{neighbour}title bad, TITLE{neighbour}", f"title{neighbour}")
+    error = ProtocolCodec().error_from_http(status_code=400, body=body, diagnostics=diagnostic_context(request))
+
+    assert isinstance(error, ApiResponseError)
+    assert error.description == f"{neighbour}field#1 bad, field#1{neighbour}"
+    assert error.validation[0].field == f"filter.field#1{neighbour}"
+    assert "title" not in _channels(error).casefold()
+
+
 @pytest.mark.parametrize(("declared", "code"), [("\u0131d_x", "ID_X"), ("kind", "\u212aIND"), ("Straße", "STRAẞE")])
 @pytest.mark.parametrize("v3", [True, False], ids=["v3", "classic"])
 def test_every_form_of_a_code_shows_the_alias_of_a_field_name_in_another_unicode_case(

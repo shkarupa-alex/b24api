@@ -331,8 +331,9 @@ letters and digits there still renders as `[REDACTED]`. A code that equals or co
 webhook token or a credential of the request, in any letter case, is always `[REDACTED]`; a secret
 shorter than six characters counts only where it stands as a whole word, with no letter, digit, `_`
 or `-` beside it. A field name of your request is shown as its `field#N` alias in every text of the
-error, the code, the description and `validation`, in any letter case, wherever it stands as a whole
-word; spellings that differ only in letter case share one alias.
+error, the code, the description and `validation`, in any letter case (letter for letter, so `ß`
+does not match `SS`), wherever it stands as a whole word; spellings that differ only in letter case
+share one alias.
 
 Recognizing a code does not make it retryable. By default only the REST 3.0 load limits are retried,
 after the server's `Retry-After`:

@@ -6,7 +6,8 @@ credential can occupy the same slot. The context therefore replaces every name f
 request-local alias ``field#1``, ``field#2`` ... in first-appearance order, and never exposes the raw
 names: it has no serialization, its representation carries only a count, and pickling is refused.
 Bitrix field names ignore letter case and the server echoes them in its own, so a name is aliased in
-any letter case, and spellings that differ only in case share one alias.
+any letter case, letter for letter (``ß`` does not match ``SS``), and spellings that differ only in case
+share one alias.
 It is derived from one canonical request, is used only while rendering that request's errors and is
 never retained by an error, a report or a shared execution context.
 """
@@ -98,10 +99,9 @@ class DiagnosticContext:
             # Longest first, so a longer spelling wins over its own prefix at the same position.
             groups = sorted(range(len(spellings)), key=lambda index: (-len(spellings[index]), spellings[index]))
             names = "|".join(f"(?P<s{index}>{re.escape(spellings[index])})" for index in groups)
-            self._pattern = re.compile(
-                rf"(?<![{_RUN_CHARACTERS}])(?:{names})(?![{_RUN_CHARACTERS}])",
-                re.IGNORECASE,
-            )
+            # Only the names ignore case: under a global flag ``[A-Za-z]`` would also take the dotless i, the long
+            # s or the Kelvin sign, and a name beside one of them would stop standing as a whole token.
+            self._pattern = re.compile(rf"(?<![{_RUN_CHARACTERS}])(?i:{names})(?![{_RUN_CHARACTERS}])")
         self._aliases = aliases
         return aliases
 
