@@ -187,9 +187,8 @@ class ApiResponseError(B24ApiError):
         self.truncated = truncated
         safe_description = redactor.render_text(description, context=diagnostics) if description is not None else None
         rendered_code = self.wire_code
-        normalized = self._safe_codes["normalized_code"]
-        differs = rendered_code.casefold() != normalized.casefold()
-        normalized_suffix = f" (normalized: {normalized})" if differs else ""
+        differs = rendered_code.casefold() != safe_normalized.casefold()
+        normalized_suffix = f" (normalized: {safe_normalized})" if differs else ""
         if rendered_code and safe_description:
             message = f"API error [{rendered_code}]{normalized_suffix}: {safe_description}"
         elif rendered_code:
