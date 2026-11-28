@@ -19,7 +19,7 @@ import io
 import json
 import re
 import string
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -334,15 +334,17 @@ def test_credential_forms_are_absent_from_every_channel(template: str, token: st
     assert token not in _error_channels(_render_everywhere(text, codec=ProtocolCodec(), request=request))
 
 
+@pytest.mark.parametrize("echo", [str, str.swapcase, str.lower, str.upper], ids=["exact", "swapped", "lower", "upper"])
 @pytest.mark.parametrize("name", ["UF_CRM_1700000000123", "ufCrm5_1700000000123", "zz_zzzzzzzzzzzzzzzz", "TITLE"])
-def test_field_name_of_any_shape_renders_as_its_alias_in_every_channel(name: str) -> None:
+def test_field_name_of_any_shape_renders_as_its_alias_in_every_channel(name: str, echo: Callable[[str], str]) -> None:
     request = Request("crm.item.list", {"select": ["ID", name]}, route=RouteKind.BARE)
-    error = _render_everywhere(name, codec=ProtocolCodec(), request=request)
+    error = _render_everywhere(echo(name), codec=ProtocolCodec(), request=request)
     rendered = _error_channels(error)
 
     assert error.validation[0].field == "filter.field#2"
     assert "field#2" in rendered
-    assert re.search(rf"(?<![A-Za-z0-9_-]){re.escape(name)}(?![A-Za-z0-9_-])", rendered) is None
+    # Bitrix field names ignore letter case, so neither spelling survives in any channel.
+    assert re.search(rf"(?<![A-Za-z0-9_-]){re.escape(name)}(?![A-Za-z0-9_-])", rendered, re.IGNORECASE) is None
 
 
 def test_settings_token_equal_to_a_known_code_is_redacted_through_the_cli(monkeypatch: pytest.MonkeyPatch) -> None:

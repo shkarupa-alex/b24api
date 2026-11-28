@@ -260,8 +260,8 @@ def test_physical_batch_renders_each_command_through_its_own_request() -> None:
         return [str(item.error) for item in outcomes if isinstance(item, CommandFailure)]
 
     assert asyncio.run(run()) == [
-        "API error [ERROR_FIELD] (normalized: error_field): field#2 denied",
-        "API error [ERROR_FIELD] (normalized: error_field): field#1 denied",
+        "API error [ERROR_FIELD]: field#2 denied",
+        "API error [ERROR_FIELD]: field#1 denied",
     ]
 
 
@@ -340,6 +340,53 @@ def test_v3_list_filters_and_operator_prefixes_share_one_alias_map() -> None:
     assert classic.alias_text("STATUS !=STATUS >=ID") == "field#1 !=field#1 >=field#2"
 
 
+def test_a_field_name_is_aliased_in_any_ascii_letter_case_and_its_spellings_share_one_alias() -> None:
+    context = diagnostic_context(
+        Request(
+            "crm.item.list",
+            {"select": ["title", "ID", "TITLE", "Straße"], "order": {"id": "asc"}},
+            route=RouteKind.BARE,
+        ),
+    )
+
+    assert repr(context) == "DiagnosticContext(fields=3)"
+    assert context.alias_text("TITLE title Title id ID TITLES SUBTITLE") == (
+        "field#1 field#1 field#1 field#2 field#2 TITLES SUBTITLE"
+    )
+    # Only ASCII letters fold: the other characters of a name must match as declared.
+    assert context.alias_text("STRAßE straße STRASSE strasse") == "field#3 field#3 STRASSE strasse"
+
+
+@pytest.mark.parametrize("declared", ["TITLE", "title"])
+def test_a_classic_code_and_its_derived_forms_alias_a_field_name_alike(declared: str) -> None:
+    request = Request("crm.deal.list", {"select": [declared]}, route=RouteKind.BARE)
+    error = ProtocolCodec().error_from_http(
+        status_code=400,
+        body={"error": "TITLE", "error_description": "TITLE bad, title bad"},
+        diagnostics=diagnostic_context(request),
+    )
+
+    assert isinstance(error, ApiResponseError)
+    safe = error.to_safe_dict()
+    assert str(error) == "API error [field#1]: field#1 bad, field#1 bad"
+    assert error.wire_code == safe["original_code"] == safe["code"] == safe["normalized_code"] == "field#1"
+    assert "title" not in _channels(error).casefold()
+
+
+def test_a_v3_description_and_validation_alias_a_field_name_in_any_letter_case() -> None:
+    request = Request("crm.item.list", {"entityTypeId": 2, "select": ["title"]}, route=RouteKind.API_V3)
+    body = _v3_body(VALIDATION_ERROR_CODE, "Field TITLE is required, field title is required", "TITLE", "title")
+    error = ProtocolCodec().error_from_http(status_code=400, body=body, diagnostics=diagnostic_context(request))
+
+    assert isinstance(error, ApiResponseError)
+    assert error.description == "Field field#1 is required, field field#1 is required"
+    assert [(issue.field, issue.message) for issue in error.validation] == [
+        ("filter.field#1", "field#1 is invalid"),
+        ("filter.field#1", "field#1 is invalid"),
+    ]
+    assert "title" not in _channels(error).casefold()
+
+
 def test_diagnostic_context_never_serializes_raw_names() -> None:
     context = diagnostic_context(Request("x.list", {"select": [UNREGISTERED_CREDENTIAL]}, route=RouteKind.BARE))
 
@@ -366,8 +413,9 @@ def test_c11_foreign_response_token_is_covered_only_by_the_heuristic() -> None:
     assert foreign not in _channels(error)
 
 
-def test_alias_words_as_field_names_are_aliased_exactly_once() -> None:
-    request = Request("x.list", {"select": ["field", "REDACTED"]}, route=RouteKind.BARE)
+@pytest.mark.parametrize("names", [("field", "REDACTED"), ("FIELD", "redacted")])
+def test_alias_words_as_field_names_are_aliased_exactly_once(names: tuple[str, str]) -> None:
+    request = Request("x.list", {"select": list(names)}, route=RouteKind.BARE)
     error = ProtocolCodec().error_from_http(
         status_code=400,
         body={"error": "BAD", "error_description": "field and REDACTED", "echo": {"field": 1, USER_FIELD: 2}},

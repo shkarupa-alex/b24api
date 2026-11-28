@@ -5,6 +5,8 @@ credential can occupy the same slot. The context therefore replaces every name f
 (without its operator prefix), ``order``, ``fields`` and the string items of ``select`` with a
 request-local alias ``field#1``, ``field#2`` ... in first-appearance order, and never exposes the raw
 names: it has no serialization, its representation carries only a count, and pickling is refused.
+Bitrix field names ignore letter case and the server echoes them in its own, so a name is aliased in
+any ASCII letter case, and spellings that differ only in case share one alias.
 It is derived from one canonical request, is used only while rendering that request's errors and is
 never retained by an error, a report or a shared execution context.
 """
@@ -29,7 +31,7 @@ _MAX_SECRET_DEPTH = 32
 class DiagnosticContext:
     """Aliases and exact secrets of one canonical request, resolved on first use."""
 
-    __slots__ = ("_aliases", "_folded_pattern", "_headers", "_parameters", "_pattern", "_secrets")
+    __slots__ = ("_aliases", "_headers", "_parameters", "_pattern", "_secrets")
 
     def __init__(
         self,
@@ -42,7 +44,6 @@ class DiagnosticContext:
         self._headers = tuple(headers)
         self._aliases: dict[str, str] | None = None
         self._pattern: re.Pattern[str] | None = None
-        self._folded_pattern: re.Pattern[str] | None = None
         self._secrets: frozenset[str] = frozenset()
 
     def __repr__(self) -> str:
@@ -54,11 +55,11 @@ class DiagnosticContext:
         raise TypeError("DiagnosticContext cannot be serialized")
 
     def alias_text(self, text: str) -> str:
-        """Replace whole-token occurrences of declared field names with their aliases."""
+        """Replace whole-token occurrences of declared field names, in any letter case, with their aliases."""
         aliases = self._resolved()
         if self._pattern is None:
             return text
-        return self._pattern.sub(lambda match: aliases[match.group(0)], text)
+        return self._pattern.sub(lambda match: aliases[match.group(0).casefold()], text)
 
     def is_known_secret(self, value: str, *, ignore_case: bool = False) -> bool:
         """Report whether a whole value equals one of the request's own exact secrets."""
@@ -71,19 +72,6 @@ class DiagnosticContext:
         self._resolved()
         return contains_secret(text, self._secrets)
 
-    def aliases_text(self, text: str) -> bool:
-        """Report whether ``text`` holds a whole declared field name, ignoring letter case.
-
-        Rendering aliases only the exact spelling; Bitrix field names are case-insensitive, so this check
-        also reports a field name the server echoed in another letter case.
-        """
-        self._resolved()
-        if self._pattern is None:
-            return False
-        if self._folded_pattern is None:
-            self._folded_pattern = re.compile(self._pattern.pattern, re.IGNORECASE)
-        return self._folded_pattern.search(text) is not None
-
     def replace_secrets(self, text: str) -> str:
         """Replace the request's own exact secrets wherever they occur."""
         self._resolved()
@@ -95,14 +83,22 @@ class DiagnosticContext:
         secrets = [value for name, value in self._headers if name.casefold().replace("-", "_") in _SENSITIVE_NAMES]
         secrets.extend(_sensitive_values(self._parameters or {}, depth=0))
         self._secrets = secret_values(secrets)
+        # Keyed by the folded name. The pattern holds every declared spelling and folds ASCII letters only,
+        # so a match differs from the spelling it matched at most in ASCII letter case and folds to its key.
         aliases: dict[str, str] = {}
+        spellings: set[str] = set()
         for name in _field_names(self._parameters or {}):
             # An exact secret stays an exact secret: it is redacted, never merely aliased.
-            if name not in aliases and name not in self._secrets:
-                aliases[name] = f"field#{len(aliases) + 1}"
+            if name in self._secrets:
+                continue
+            spellings.add(name)
+            aliases.setdefault(name.casefold(), f"field#{len(aliases) + 1}")
         if aliases:
-            names = "|".join(re.escape(name) for name in sorted(aliases, key=len, reverse=True))
-            self._pattern = re.compile(rf"(?<![{_RUN_CHARACTERS}])(?:{names})(?![{_RUN_CHARACTERS}])")
+            names = "|".join(re.escape(name) for name in sorted(spellings, key=lambda name: (-len(name), name)))
+            self._pattern = re.compile(
+                rf"(?<![{_RUN_CHARACTERS}])(?:{names})(?![{_RUN_CHARACTERS}])",
+                re.IGNORECASE | re.ASCII,
+            )
         self._aliases = aliases
         return aliases
 

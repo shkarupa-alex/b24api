@@ -303,14 +303,49 @@ def test_a_lower_case_code_with_a_digit_keeps_the_free_text_redaction(code: str)
         ("NOTE_PRIVATE_FIELD", "note_private_field"),
     ],
 )
-def test_a_request_field_name_in_another_letter_case_is_never_shown(field: str, code: str) -> None:
+def test_a_request_field_name_in_another_letter_case_is_shown_as_its_alias(field: str, code: str) -> None:
     request = Request("note.list", {"select": [field]}, route=RouteKind.API_V3)
 
     error = _decode(code, diagnostics=diagnostic_context(request))
 
-    assert error.wire_code == REDACTED
+    assert error.wire_code == error.to_safe_dict()["code"] == error.to_safe_dict()["normalized_code"] == "field#1"
+    assert str(error) == "API error [field#1]: refused"
     assert code.casefold() not in _code_channels(error).casefold()
     assert field.casefold() not in _code_channels(error).casefold()
+
+
+def test_the_code_and_the_description_of_one_error_alias_a_field_name_alike() -> None:
+    request = Request("note.list", {"select": ["uf_crm_foo"]}, route=RouteKind.API_V3)
+    body = {"error": {"code": "UF_CRM_FOO", "message": "UF_CRM_FOO bad"}}
+
+    error = ProtocolCodec().error_from_http(status_code=400, body=body, diagnostics=diagnostic_context(request))
+
+    assert str(error) == "API error [field#1]: field#1 bad"
+
+
+def test_a_field_name_inside_a_longer_code_is_not_a_field_name() -> None:
+    request = Request("note.list", {"select": ["title"]}, route=RouteKind.API_V3)
+
+    assert _decode("TITLE_EMPTY_VALUE", diagnostics=diagnostic_context(request)).wire_code == "TITLE_EMPTY_VALUE"
+
+
+@pytest.mark.parametrize(
+    ("code", "shown"),
+    [
+        # A secret shorter than six characters hides a code only where it stands as a whole token.
+        ("ERROR_ABCDE", True),
+        ("ERROR.ABCDE", False),
+        ("ABCDE", False),
+        ("refused_error_abcde", True),
+    ],
+)
+def test_a_short_secret_hides_a_code_only_as_a_whole_token(code: str, *, shown: bool) -> None:
+    short = Redactor(known_secrets=frozenset({"abcde"}))
+    longer = Redactor(known_secrets=frozenset({"abcdef"}))
+
+    assert render_code(code, redactor=short, v3_envelope=True) == (code if shown else REDACTED)
+    # A secret of six characters or more hides the code wherever it stands, in any letter case.
+    assert render_code(f"{code}F", redactor=longer, v3_envelope=True) == REDACTED
 
 
 def test_registered_and_request_secrets_beat_the_shape() -> None:

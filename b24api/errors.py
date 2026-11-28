@@ -112,14 +112,33 @@ class EnvelopeContractError(HTTPGatewayError, ProtocolError):
 
 @dataclass(frozen=True, slots=True)
 class ValidationIssue:
-    """One redacted V3 validation location and message; ``field`` is None when the server names no field."""
+    """One V3 validation location and message; ``field`` is None when the server names no field.
+
+    Both texts are free text, rendered as an error description is (see ``ApiResponseError``).
+    """
 
     field: str | None
     message: str
 
 
 class ApiResponseError(B24ApiError):
-    """Structured Bitrix REST error with committed `.code` semantics."""
+    """Structured Bitrix REST error with committed ``.code`` semantics.
+
+    The message reads ``API error [<code>] (normalized: <normalized>): <description>``, with the rendered
+    ``wire_code`` and ``normalized_code``. The suffix appears only when the two differ other than in letter
+    case, which for a classic code means only surrounding whitespace the normalized form dropped. Without
+    a description the message ends after the code; without a code it is ``API error: <description>``.
+
+    Every text is rendered once, through the request's diagnostic context when there is one. A code goes
+    through ``render_code``: hidden whole when it holds a secret in any letter case, shown when it is a
+    known REST 3.0 code or a REST 3.0 envelope code of the V3 shape (as its ``field#N`` alias when it is a
+    request field name), and otherwise rendered as free text. The description and every ``validation``
+    field and message are free text, rendered by ``Redactor.render_text``: exact secrets (one shorter than
+    six characters only as a whole token) and credential-bearing forms such as webhook URLs and bearer
+    tokens become ``[REDACTED]``; a request field name standing as a whole token, in any letter case,
+    becomes its ``field#N`` alias; and a run of 16 or more letters, digits, ``_`` and ``-`` holding both a
+    letter and a digit, other than a 40- or 64-digit hexadecimal hash, becomes ``[REDACTED]``.
+    """
 
     def __init__(  # noqa: PLR0913
         self,
@@ -138,14 +157,19 @@ class ApiResponseError(B24ApiError):
         redactor: Redactor = DEFAULT_REDACTOR,
         diagnostics: DiagnosticContext | None = None,
     ) -> None:
-        """Keep raw codes as attributes; render codes, message and evidence once for every output channel."""
+        """Keep raw codes as attributes; render codes, message and evidence once for every output channel.
+
+        ``code_is_exact`` marks the ``error.code`` of a REST 3.0 envelope: its normalized form is the code
+        as sent, and only it may be recognized by the V3 shape. A classic code is normalized to its stripped,
+        case-folded spelling.
+        """
         self.original_code = code
         self.code = str(code).lower()
         self.normalized_code = str(code) if code_is_exact else str(code).strip().casefold()
         # Only a REST 3.0 envelope's ``error.code`` may be recognized by its shape, and only as it came on the
-        # wire. Its derived forms follow that one decision: a shown code is shown lower-cased too (the secret
-        # and field checks ignore case), and a hidden or aliased one is rendered exactly as the wire code was,
-        # since a second, case-sensitive pass over another spelling could miss what the first one hid.
+        # wire: the lower-cased spelling can lose the shape (``bitrix_rest_v3_...`` holds a digit). Its derived
+        # forms follow that one decision: a shown code is shown lower-cased too (the secret and field checks
+        # ignore case), and a hidden or aliased one is rendered exactly as the wire code was.
         self.wire_code = render_code(code, redactor=redactor, context=diagnostics, v3_envelope=code_is_exact)
         if code_is_exact:
             shown = self.wire_code == str(code)
@@ -164,7 +188,8 @@ class ApiResponseError(B24ApiError):
         safe_description = redactor.render_text(description, context=diagnostics) if description is not None else None
         rendered_code = self.wire_code
         normalized = self._safe_codes["normalized_code"]
-        normalized_suffix = f" (normalized: {normalized})" if rendered_code != normalized else ""
+        differs = rendered_code.casefold() != normalized.casefold()
+        normalized_suffix = f" (normalized: {normalized})" if differs else ""
         if rendered_code and safe_description:
             message = f"API error [{rendered_code}]{normalized_suffix}: {safe_description}"
         elif rendered_code:
