@@ -131,18 +131,20 @@ class ApiResponseError(B24ApiError):
     description the message ends after the code; without a code it is ``API error: <description>``, and
     ``API error`` alone when there is neither.
 
-    Every text is rendered once, through the request's diagnostic context when there is one. The wire code
-    goes through ``render_code``: hidden whole when it holds a secret in any letter case, shown when it is
-    a known REST 3.0 code or a REST 3.0 envelope code of the V3 shape (as its ``field#N`` alias when it is
-    a request field name), and otherwise rendered as free text. The safe ``code`` and ``normalized_code``
-    follow that one decision: they are the lower-cased and normalized code when the wire code is shown as
-    it came, and the rendered wire code otherwise. The description is free text, rendered by
-    ``Redactor.render_text``: exact secrets (one shorter than six characters only as a whole token) and
-    credential-bearing forms such as webhook URLs and bearer tokens become ``[REDACTED]``; a request field
-    name standing as a whole token, in any letter case, becomes its ``field#N`` alias; and a run of 16 or
-    more letters, digits, ``_`` and ``-`` holding both a letter and a digit, other than a 40- or 64-digit
-    hexadecimal hash, becomes ``[REDACTED]``. ``validation`` is stored as given: the protocol codec
-    renders its texts the same way.
+    Every text is rendered once, through the request's diagnostic context when there is one. A token below
+    is a run of ASCII letters, digits, ``_`` and ``-``. The wire code goes through ``render_code``: hidden
+    whole when it holds a secret in any letter case (one shorter than six characters only as a whole
+    token), shown when it is a known REST 3.0 code or a REST 3.0 envelope code of the V3 shape (as its
+    ``field#N`` alias when it is a request field name), and otherwise rendered as free text. The safe
+    ``code`` and ``normalized_code`` follow that one decision: they are the lower-cased and normalized code
+    when the wire code is shown as it came and neither of them names a request field, and the rendered
+    wire code otherwise. The description is free text, rendered by ``Redactor.render_text``: exact secrets
+    (one shorter than six characters only as a whole token) and credential-bearing forms such as webhook
+    URLs and bearer tokens become ``[REDACTED]``; a request field name standing as a whole token, in any
+    letter case, becomes its ``field#N`` alias; and a token of 16 or more characters holding both a letter
+    and a digit, other than a 40- or 64-digit hexadecimal hash, becomes ``[REDACTED]`` unless a word
+    character outside ASCII touches it. ``validation`` is stored as given: the protocol codec renders its
+    texts the same way.
     """
 
     def __init__(  # noqa: PLR0913
@@ -173,12 +175,24 @@ class ApiResponseError(B24ApiError):
         self.normalized_code = str(code) if code_is_exact else str(code).strip().casefold()
         # Only a REST 3.0 envelope's ``error.code`` may be recognized by its shape, and only as it came on the
         # wire: the lower-cased spelling can lose the shape (``bitrix_rest_v3_...`` holds a digit). In every
-        # channel the derived forms follow the one decision made on the wire code: a shown code is shown
-        # lower-cased and normalized too, carrying nothing the shown code does not, and a hidden or aliased
-        # one is rendered exactly as the wire code was. Rendering a derived spelling on its own could split
-        # what one error shows, since lower-casing can merge or rename letters the rules look at.
-        self.wire_code = render_code(code, redactor=redactor, context=diagnostics, v3_envelope=code_is_exact)
-        shown = self.wire_code == str(code)
+        # channel the derived forms follow one decision: a code shown as it came is shown lower-cased and
+        # normalized too, and any other is rendered in every form exactly as the wire code was. Rendering a
+        # derived spelling on its own could split what one error shows, since lower-casing can merge or rename
+        # letters the rules look at.
+        # The protocol codec renders a REST 3.0 code before it cuts an overlong one; rendering it again would
+        # re-alias its aliases and relabel what it hid.
+        rendered = isinstance(code, SafeText)
+        self.wire_code = (
+            str(code)
+            if rendered
+            else render_code(code, redactor=redactor, context=diagnostics, v3_envelope=code_is_exact)
+        )
+        # The secret check ignores letter case, but lower-casing and folding can spell a field name the wire code
+        # does not (``ß`` folds to ``ss``): a code is shown only when none of its forms names a field.
+        names_no_field = diagnostics is None or all(
+            diagnostics.alias_text(form) == form for form in (self.code, self.normalized_code)
+        )
+        shown = not rendered and self.wire_code == str(code) and names_no_field
         safe_code = self.code if shown else self.wire_code
         safe_normalized = self.normalized_code if shown else self.wire_code
         self._safe_codes = {

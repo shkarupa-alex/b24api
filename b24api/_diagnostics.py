@@ -6,8 +6,8 @@ credential can occupy the same slot. The context therefore replaces every name f
 request-local alias ``field#1``, ``field#2`` ... in first-appearance order, and never exposes the raw
 names: it has no serialization, its representation carries only a count, and pickling is refused.
 Bitrix field names ignore letter case and the server echoes them in its own, so a name is aliased in
-any letter case, letter for letter (``ß`` does not match ``SS``), and spellings that differ only in case
-share one alias.
+any letter case, letter for letter (``ß`` does not match ``SS``), and spellings that match each other this
+way, such as ``TITLE`` and ``title``, share one alias.
 It is derived from one canonical request, is used only while rendering that request's errors and is
 never retained by an error, a report or a shared execution context.
 """
@@ -17,7 +17,15 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import NoReturn, cast
 
-from b24api.redaction import DEFAULT_SENSITIVE_KEYS, contains_secret, is_secret, replace_secrets, secret_values
+from b24api.redaction import (
+    DEFAULT_SENSITIVE_KEYS,
+    REDACTED,
+    TRUNCATED,
+    contains_secret,
+    is_secret,
+    replace_secrets,
+    secret_values,
+)
 
 _ALIASED_PARAMETERS = frozenset({"filter", "order", "fields", "select"})
 _SENSITIVE_NAMES = frozenset(name.casefold().replace("-", "_") for name in DEFAULT_SENSITIVE_KEYS)
@@ -25,6 +33,8 @@ _OPERATOR_PREFIX = re.compile(r"^[^A-Za-z0-9_]+")
 _HAS_ALPHANUMERIC = re.compile(r"[A-Za-z0-9]")
 # The bare-credential heuristic treats this class as one token; an alias never splits such a run.
 _RUN_CHARACTERS = "A-Za-z0-9_-"
+# The marks rendering puts in place of what it hid; a field named ``redacted`` must not relabel one.
+_MARKS = rf"{re.escape(REDACTED[:-1])}(?:#[0-9]+)?\]|{re.escape(TRUNCATED)}"
 _V3_CONDITION_MINIMUM = 2
 _MAX_SECRET_DEPTH = 32
 
@@ -60,8 +70,11 @@ class DiagnosticContext:
         aliases = self._resolved()
         if self._pattern is None:
             return text
-        # Every alternative of the pattern is one declared spelling's named group.
-        return self._pattern.sub(lambda match: aliases[cast("str", match.lastgroup)], text)
+        # Every alternative of the pattern is a mark, kept as it is, or one declared spelling's named group.
+        return self._pattern.sub(
+            lambda match: match.group(0) if match.lastgroup == "mark" else aliases[cast("str", match.lastgroup)],
+            text,
+        )
 
     def is_known_secret(self, value: str, *, ignore_case: bool = False) -> bool:
         """Report whether a whole value equals one of the request's own exact secrets."""
@@ -89,21 +102,33 @@ class DiagnosticContext:
         spellings = list(
             dict.fromkeys(name for name in _field_names(self._parameters or {}) if name not in self._secrets)
         )
-        # Spellings that fold alike share one alias. The pattern ignores letter case as ``re`` does, letter for
-        # letter, so the alias of an echo comes from the group of the spelling it matched, never from folding it.
+        # A spelling the pattern would match as an earlier one shares that one's alias. The pattern ignores letter
+        # case as ``re`` does, letter for letter, so the alias of an echo comes from the group of the spelling it
+        # matched, never from folding it.
         numbers: dict[str, str] = {}
         for name in spellings:
-            numbers.setdefault(name.casefold(), f"field#{len(numbers) + 1}")
-        aliases = {f"s{index}": numbers[name.casefold()] for index, name in enumerate(spellings)}
+            shared = next((alias for other, alias in numbers.items() if _same_name(other, name)), None)
+            numbers[name] = shared or f"field#{len(set(numbers.values())) + 1}"
+        aliases = {f"s{index}": numbers[name] for index, name in enumerate(spellings)}
         if aliases:
             # Longest first, so a longer spelling wins over its own prefix at the same position.
             groups = sorted(range(len(spellings)), key=lambda index: (-len(spellings[index]), spellings[index]))
             names = "|".join(f"(?P<s{index}>{re.escape(spellings[index])})" for index in groups)
             # Only the names ignore case: under a global flag ``[A-Za-z]`` would also take the dotless i, the long
             # s or the Kelvin sign, and a name beside one of them would stop standing as a whole token.
-            self._pattern = re.compile(rf"(?<![{_RUN_CHARACTERS}])(?i:{names})(?![{_RUN_CHARACTERS}])")
+            self._pattern = re.compile(
+                rf"(?P<mark>{_MARKS})|(?<![{_RUN_CHARACTERS}])(?i:{names})(?![{_RUN_CHARACTERS}])"
+            )
         self._aliases = aliases
         return aliases
+
+
+def _same_name(first: str, second: str) -> bool:
+    """Report whether either spelling matches the other as the alias pattern matches a name, ignoring case."""
+    return any(
+        re.fullmatch(re.escape(pattern), text, re.IGNORECASE) is not None
+        for pattern, text in ((first, second), (second, first))
+    )
 
 
 def _field_names(parameters: Mapping[str, object]) -> Iterable[str]:

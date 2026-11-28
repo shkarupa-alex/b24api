@@ -19,10 +19,17 @@
   only in letter case.** `API error [ACCESS_DENIED] (normalized: access_denied): Access denied` now
   reads `API error [ACCESS_DENIED]: Access denied`; the suffix stays for a code the normalized form
   stripped of surrounding whitespace. The `normalized_code` attribute is unchanged.
-- **A classic code's safe `code` and `normalized_code` follow its wire code.** They are its lower-cased
-  and normalized spellings when the wire code is shown as it came, and the rendered wire code
-  otherwise, as for a REST 3.0 code. Before, each spelling was rendered on its own, so lower-casing
-  could make one of them `[REDACTED]` or a different text than the code shown beside it.
+- **A code's safe `code` and `normalized_code` follow its wire code.** They are its lower-cased and
+  normalized spellings when the wire code is shown as it came and neither spelling names a request
+  field, and the rendered wire code otherwise: with `strasse` declared, the code `STRAßE` folds to
+  `strasse`, so every form shows `STRAßE` as sent. Before, each spelling of a classic code was
+  rendered on its own, so lower-casing could make one of them `[REDACTED]` or a different text than
+  the code shown beside it.
+- **A mark of hidden text is never taken for a field name.** With a field named `redacted` or
+  `truncated` declared, `[REDACTED]`, `[REDACTED#N]` and `[TRUNCATED]` stay as they are; they read
+  `[field#1]` before when the field was spelled as the mark is. A REST 3.0 code over 256 characters
+  is also rendered only once now: the codec renders it before the cut, and the error no longer
+  renders the cut text again.
 - **An error with neither a code nor a description reads `API error`.** It read `API error: None`.
 
 ## Actions outside a JSON or form POST
@@ -1930,7 +1937,8 @@ reference queue spends physical requests and how it reports a failed or lost com
   (such as `BITRIX_REST_V3_EXCEPTION_ACCESSDENIEDEXCEPTION`) rendered as `[REDACTED]`. Code that matched
   `[REDACTED]` to detect a REST 3.0 failure should match the code instead. A structured code that
   contains a registered or request secret in any letter case is now `[REDACTED]` as a whole; a secret
-  shorter than six characters counts only where it stands as a whole word.
+  shorter than six characters counts only where it stands as a whole word, with no ASCII letter,
+  digit, `_` or `-` beside it.
 - **Two REST 3.0 load limits are retried.** `RetryPolicy.transient_api_codes` now also lists
   `BITRIX_REST_V3_EXCEPTION_RATELIMITEXCEPTION` and
   `BITRIX_REST_V3_EXCEPTION_LIMITER_QUERYTIMELIMITEXCEPTION`, and

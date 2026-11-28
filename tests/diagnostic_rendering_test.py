@@ -413,6 +413,65 @@ def test_a_shown_classic_code_shows_its_derived_forms_even_when_lower_casing_cha
     assert (safe["code"], safe["normalized_code"]) == ("abcdefghijklmno1ß", "abcdefghijklmno1ss")
 
 
+@pytest.mark.parametrize(("declared", "code"), [("k3yss", "K3Yß"), ("strasse", "STRAßE"), ("file", "\ufb01LE")])
+def test_a_code_whose_folded_form_spells_a_field_name_shows_only_its_wire_spelling(declared: str, code: str) -> None:
+    request = Request("x.list", {"select": [declared]}, route=RouteKind.BARE)
+    error = ProtocolCodec().error_from_http(
+        status_code=400,
+        body={"error": code, "error_description": "bad"},
+        diagnostics=diagnostic_context(request),
+    )
+
+    assert isinstance(error, ApiResponseError)
+    safe = error.to_safe_dict()
+    assert error.wire_code == safe["code"] == safe["normalized_code"] == code
+    assert str(error) == f"API error [{code}]: bad"
+    assert declared not in _channels(error)
+
+
+def test_spellings_share_an_alias_exactly_when_the_pattern_matches_one_as_the_other() -> None:
+    context = diagnostic_context(
+        Request("x.list", {"select": ["\u0131d", "id", "Straße", "STRASSE"]}, route=RouteKind.BARE),
+    )
+
+    assert repr(context) == "DiagnosticContext(fields=3)"
+    assert context.alias_text("\u0131d ID id") == "field#1 field#1 field#1"
+    assert context.alias_text("Straße STRASSE") == "field#2 field#3"
+
+
+@pytest.mark.parametrize(
+    ("declared", "code", "start"),
+    [
+        ("redacted", f"https://a.bitrix24.ru/rest/1/{WEBHOOK_CREDENTIAL}/ ", "[REDACTED] x x"),
+        ("FIELD", "field ", "field#1 x x"),
+    ],
+)
+def test_an_overlong_v3_code_is_rendered_once(declared: str, code: str, start: str) -> None:
+    request = Request("x.list", {"select": [declared]}, route=RouteKind.API_V3)
+    body = _v3_body(code + "x " * 140, "bad")
+    error = ProtocolCodec().error_from_http(status_code=400, body=body, diagnostics=diagnostic_context(request))
+
+    assert isinstance(error, ApiResponseError)
+    assert error.truncated
+    assert error.wire_code.startswith(start)
+    assert error.to_safe_dict()["code"] == error.to_safe_dict()["normalized_code"] == error.wire_code
+
+
+def test_a_mark_of_hidden_text_is_never_taken_for_a_field_name() -> None:
+    request = Request("x.list", {"select": ["redacted", "TRUNCATED"]}, route=RouteKind.BARE)
+    description = f"see https://a.bitrix24.ru/rest/1/{WEBHOOK_CREDENTIAL}/ for redacted and truncated"
+    error = ProtocolCodec().error_from_http(
+        status_code=400,
+        body={"error": "BAD", "error_description": description, "echo": {USER_FIELD: 1, OTHER_USER_FIELD: 2}},
+        diagnostics=diagnostic_context(request),
+    )
+
+    assert isinstance(error, ApiResponseError)
+    assert error.description == "see [REDACTED] for field#1 and field#2"
+    assert error.evidence.body_preview is not None
+    assert '"echo":{"[REDACTED#1]":1,"[REDACTED#2]":2}' in error.evidence.body_preview
+
+
 def test_an_error_with_neither_code_nor_description_says_so() -> None:
     assert str(ApiResponseError(code="", description=None)) == "API error"
 
